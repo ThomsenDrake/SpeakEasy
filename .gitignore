@@ -1,0 +1,6 @@
+# Never commit environment files (workspaces receive their own copies)
+.env
+.env.local
+
+# Rust build output
+/target/
