@@ -17,7 +17,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # custom-protocol: serve the embedded frontend (ui/dist) from
 # tauri://localhost in every build instead of expecting a dev server.
-tauri = { version = "2", features = ["custom-protocol"] }
+# tray-icon: menu-bar icon with Show/Quit (the gateway must keep running
+# when its window is hidden; the tray is how the human reopens/quits it).
+tauri = { version = "2", features = ["custom-protocol", "tray-icon"] }
 ureq = { version = "3", features = ["json"] }
 
 [build-dependencies]

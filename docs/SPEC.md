@@ -141,9 +141,12 @@ Public API is fully declared in the stub. Implement:
   `None`; `SlackSend` fields from `chat.postMessage` + `chat.getPermalink`;
   `{ok:false,error}` → `SlackError`; `from_env` reads token file.
 
-### `src/mcp.rs` — MCP over stdio
+### `src/mcp.rs` — MCP JSON-RPC server (stdio and socket)
 
-- Newline-delimited JSON-RPC 2.0. Read lines from `input`; dispatch:
+- Newline-delimited JSON-RPC 2.0. `run(gateway, input: impl BufRead, output:
+  impl Write)` serves any byte stream; it is used for the instance's own
+  stdio and for every socket connection from a bridge
+  (`src/instance.rs`). Read lines from `input`; dispatch:
   - `initialize` → result `{protocolVersion: <client's requested version, or "2025-06-18">, capabilities: {tools: {listChanged: false}}, serverInfo: {name: "slack-approval-gateway", version: env!("CARGO_PKG_VERSION")}}`
   - `notifications/initialized` and any other `notifications/*` → no response
   - `ping` → `{}`
@@ -189,6 +192,30 @@ Public API is fully declared in the stub. Implement:
   content get correctly matched decisions (no mixing); a NEW `Gateway` on
   the same state dir (simulated restart) still returns `cooldown_blocked`.
 
+### `src/instance.rs` — single-instance coordination and stdio bridges
+
+Every coding agent spawns the binary over MCP stdio, but the popup, the
+Slack client, and the pending-request queue must live in exactly one
+process per state dir:
+
+- `connect_existing(state_dir) -> Option<UnixStream>`: connect to
+  `<state_dir>/gateway.sock`; `None` means no live instance.
+- `acquire(state_dir) -> Result<(InstanceGuard, UnixListener), AcquireError>`:
+  atomically take `<state_dir>/gateway.lock` (`create_new`; a lock whose
+  socket refuses connections for ~2s is stale and is stolen, so a crashed
+  instance never blocks the next start), remove a stale socket file, and
+  bind the listener. `AcquireError::AlreadyRunning` means a live instance
+  exists — the caller bridges instead. The state-dir path is rejected when
+  it cannot fit in `sun_path` (~104 bytes on macOS).
+- `serve_connections(gateway, listener)`: accept loop; each connection is
+  served by `mcp::run` on its own thread (one agent waiting for a human
+  never blocks another).
+- `run_bridge(stream) -> !`: byte-transparent pump between the process's
+  stdio and the instance socket; exits when the instance closes the
+  connection. stdout carries protocol bytes only.
+- `InstanceGuard` drops by removing the lock and socket files (best effort;
+  a crash leaves them and the next starter steals the lock).
+
 ### `src/ui.rs` — Tauri webview bridge (the approval popup)
 
 The human-facing popup is the webview frontend in `ui/` — React 19 +
@@ -211,8 +238,13 @@ template; components are imported via the `#components/...` path aliases).
 - Tauri commands invoked by the webview: `submit_decision(request_id,
   decision)` (first decision wins; repeats and unknown IDs are ignored),
   `ui_ready` (flushes the outbox — the frontend awaits its `listen()`
-  registration before invoking this so no event is lost), and
-  `get_active_cooldowns`.
+  registration before invoking this so no event is lost),
+  `get_active_cooldowns`, `hide_window` (the webview calls this once its
+  queue has drained after a decision), and `quit_app` (tray Quit).
+- `UiState::reveal_window`: when a request is delivered (emitted or
+  queued), the hidden main window is shown and focused, so a request
+  arriving at any time surfaces the popup. `mark_webview_ready` reveals the
+  window when it flushed queued requests.
 - The frontend (`ui/src/App.tsx`) renders one request at a time with the
   design-system components (`Button`, `Typography`, `Badge`, `Card`,
   `Textarea`): the exact proposed message, the Slack destination (with a
@@ -223,9 +255,15 @@ template; components are imported via the `#components/...` path aliases).
   cooldowns, and the caption "Closing this window never approves a message.
   If the app quits, pending requests fail and the agent is told nothing was
   sent."
-- Closing the window exits the app (Tauri default: last window close
-  exits); pending reply senders are dropped, so blocked
-  `request_decision` calls return `Err` — never an approval.
+- Closing the window only **hides** it (`CloseRequested` is intercepted:
+  `window.hide()` + `api.prevent_close()`); the gateway process keeps
+  serving MCP for every agent. Quitting happens only via the tray menu's
+  **Quit gateway** (`quit_app` → `app.exit(0)`) or a signal; pending reply
+  senders are then dropped, so blocked `request_decision` calls return
+  `Err` — never an approval. A Dock click / `open` with no visible window
+  (`RunEvent::Reopen`) shows the window again.
+- A menu-bar tray icon (Tauri `tray-icon` feature) offers **Show approval
+  window** / **Quit gateway**; a left click on the icon shows the window.
 - Tauri 2 gates `listen`/`invoke` behind **capabilities**:
   `capabilities/default.json` grants `core:default` to the `main` window.
   Without it the webview renders but no IPC reaches the backend (a blank
@@ -235,20 +273,39 @@ template; components are imported via the `#components/...` path aliases).
   `tauri://localhost` — no dev server is needed to run the binary. (Without
   it, Tauri expects a dev server at `devUrl` and the webview stays blank.)
 
-### `src/main.rs` (already complete — do not modify)
+### `src/main.rs` — run modes, tray, window lifecycle
 
 Wires state dir (`SLACK_GATEWAY_STATE_DIR` or `~/.slack-approval-gateway`),
-Slack client, provider, MCP server, and UI. `--cli` selects the terminal
-fallback provider. GUI mode builds the Tauri app (managed `UiState`,
-`submit_decision`/`ui_ready`/`get_active_cooldowns` commands, MCP server on
-a background thread) and, after the event loop ends, waits for any
-in-flight approved send to finish before exiting.
+Slack client, provider, MCP server, and UI. Three run modes:
 
-## Build and test
+- `--cli`: headless. Becomes the instance (lock + socket), builds the
+  gateway with the terminal fallback provider, serves the socket, and runs
+  MCP on stdio. Used by the smoke test and for SSH hosts.
+- `--serve`: service mode (LaunchAgent). Becomes the instance, builds the
+  Tauri app, serves the socket, but runs no MCP on stdio.
+- default (spawned by an agent over stdio): if an instance answers on the
+  socket, bridge to it (`instance::run_bridge`, never returns); otherwise
+  become the instance (lost startup races bridge instead). The instance
+  serves MCP on its own stdio (unless `--serve`) plus the socket.
+
+GUI mode builds the Tauri app (managed `UiState`, commands
+`submit_decision`/`ui_ready`/`get_active_cooldowns`/`hide_window`/
+`quit_app`, MCP server on a background thread), installs the tray icon in
+`setup`, hides the window on close, and shows it on `RunEvent::Reopen`
+(macOS). After the event loop ends, the app waits for any in-flight
+approved send to finish before exiting. The window is created hidden
+(`"visible": false` in `tauri.conf.json`) and revealed per request.
+
+## Build, install, and test
 
 - Rust toolchain (cargo 1.98+) and Node 24+ are installed. The frontend
   must be built before `cargo build` (Tauri embeds `ui/dist`):
   `cd ui && npm install && npm run build`.
+- `scripts/install.sh` installs the app into every detected coding agent on
+  this Mac and starts the LaunchAgent service (`--dry-run`, `--enforce`,
+  `--uninstall` flags; see README §0). `scripts/agent_config.py` is the
+  per-agent config editor it uses (idempotent, `.bak-sag` backups);
+  `scripts/test_agent_config.py` tests it.
 - First builds compile Tauri/wry and take several minutes; that's expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.
 - `cargo test` must pass (core unit tests, slack client tests, MCP e2e

@@ -4,15 +4,19 @@
 //! Mistral `@mistral/ui` design system). This module is the bridge: it
 //! receives decision requests from MCP worker threads, forwards them to the
 //! webview as `approval-request` events, and resolves them when the webview
-//! invokes `submit_decision`. Closing the window exits the app; pending
-//! requests then fail with an error and are never approved.
+//! invokes `submit_decision`. Closing the window only hides it — the
+//! gateway process keeps serving MCP (it is a long-running single instance;
+//! see `src/instance.rs`); the tray icon or a Dock click reopens the window,
+//! and only the tray's Quit item stops the app. Quitting drops the pending
+//! reply senders, so blocked `request_decision` calls return `Err` — they
+//! are never approved.
 
 use crate::core::{Decision, DecisionProvider, Gateway, MessageRequest, ProviderError};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::Sender, Arc, Mutex, PoisonError};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// The human's decision as submitted by the webview
 /// (`{"type":"approve"}` / `{"type":"deny"}` / `{"type":"feedback","feedback":"…"}`).
@@ -71,14 +75,52 @@ impl UiState {
             .insert(id, tx);
     }
 
+    /// Bring the (hidden) approval window to the front. The window exists
+    /// from app start; a request arriving at any time must surface it.
+    fn reveal_window(&self) {
+        let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+        match app.as_ref() {
+            Some(app) => match app.get_webview_window("main") {
+                Some(window) => {
+                    let was_visible = window.is_visible().unwrap_or(false);
+                    let show = window.show();
+                    let focus = window.set_focus();
+                    let now_visible = window.is_visible().unwrap_or(false);
+                    eprintln!(
+                        "slack-approval-gateway: reveal window: was_visible={was_visible} \
+                         show={show:?} focus={focus:?} now_visible={now_visible}"
+                    );
+                }
+                None => eprintln!(
+                    "slack-approval-gateway: reveal window: no window with label 'main'"
+                ),
+            },
+            None => eprintln!("slack-approval-gateway: reveal window: no app handle yet"),
+        }
+    }
+
     /// Deliver a request to the webview, or queue it until the webview is ready.
     fn deliver(&self, request: &MessageRequest) {
         if self.webview_ready.load(Ordering::Relaxed) {
-            if let Some(app) = self.app.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
-                eprintln!("slack-approval-gateway: emitting approval-request {}", request.id);
-                if let Err(e) = app.emit("approval-request", request) {
-                    eprintln!("slack-approval-gateway: cannot deliver request to UI: {e}");
+            // Scope the app-handle borrow: reveal_window locks it again.
+            let delivered = {
+                let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+                match app.as_ref() {
+                    Some(app) => {
+                        eprintln!("slack-approval-gateway: emitting approval-request {}", request.id);
+                        match app.emit("approval-request", request) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!("slack-approval-gateway: cannot deliver request to UI: {e}");
+                                false
+                            }
+                        }
+                    }
+                    None => false,
                 }
+            };
+            if delivered {
+                self.reveal_window();
                 return;
             }
         }
@@ -87,22 +129,34 @@ impl UiState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(request.clone());
+        self.reveal_window();
     }
 
     /// The webview signals it is listening; flush queued requests.
     fn mark_webview_ready(&self) {
         eprintln!("slack-approval-gateway: webview ready");
         self.webview_ready.store(true, Ordering::Relaxed);
-        let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(app) = app.as_ref() {
-            let queued: Vec<MessageRequest> =
-                std::mem::take(&mut *self.outbox.lock().unwrap_or_else(PoisonError::into_inner));
-            for request in queued {
-                eprintln!("slack-approval-gateway: flushing queued request {}", request.id);
-                if let Err(e) = app.emit("approval-request", &request) {
-                    eprintln!("slack-approval-gateway: cannot deliver request to UI: {e}");
+        // Scope the app-handle borrow: reveal_window locks it again.
+        let flushed_any = {
+            let app = self.app.lock().unwrap_or_else(PoisonError::into_inner);
+            match app.as_ref() {
+                Some(app) => {
+                    let queued: Vec<MessageRequest> = std::mem::take(
+                        &mut *self.outbox.lock().unwrap_or_else(PoisonError::into_inner),
+                    );
+                    for request in &queued {
+                        eprintln!("slack-approval-gateway: flushing queued request {}", request.id);
+                        if let Err(e) = app.emit("approval-request", request) {
+                            eprintln!("slack-approval-gateway: cannot deliver request to UI: {e}");
+                        }
+                    }
+                    !queued.is_empty()
                 }
+                None => false,
             }
+        };
+        if flushed_any {
+            self.reveal_window();
         }
     }
 
@@ -175,6 +229,21 @@ pub fn ui_ready(state: State<'_, Arc<UiState>>) {
 #[tauri::command]
 pub fn get_active_cooldowns(state: State<'_, Arc<UiState>>) -> Vec<(String, String, u64)> {
     state.active_cooldowns()
+}
+
+/// Hide the approval window (the webview calls this once its queue has
+/// drained after a decision). Hiding is not quitting: the gateway keeps
+/// serving MCP, and the next request (or the tray icon) shows it again.
+#[tauri::command]
+pub fn hide_window(window: tauri::Window) {
+    let _ = window.hide();
+}
+
+/// Quit the gateway (tray menu / webview). Pending requests fail in the
+/// provider — nothing pending is ever approved.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 #[cfg(test)]

@@ -281,6 +281,12 @@ export default function App() {
       .finally(() => {
         setQueue((q) => q.slice(1));
         setDeciding(false);
+        // The popup appears per request batch: once the queue has drained,
+        // hide the window (hiding never quits the gateway; the next request
+        // or the menu-bar icon brings it back).
+        if (queue.length <= 1) {
+          invoke("hide_window").catch(() => {});
+        }
         invoke<Cooldown[]>("get_active_cooldowns")
           .then(setCooldowns)
           .catch(() => {});
@@ -318,8 +324,10 @@ export default function App() {
 
       <footer className="space-y-1 border-t border-default px-6 py-3">
         <TypographyP size="xs" variant="hint">
-          Closing this window never approves a message. If the app quits,
-          pending requests fail and the agent is told nothing was sent.
+          Closing this window hides it and never approves a message; the
+          gateway keeps running (menu-bar icon to reopen or quit). If the
+          gateway quits, pending requests fail and the agent is told nothing
+          was sent.
         </TypographyP>
         {cooldowns.length > 0 && (
           <TypographyP size="xs" variant="warning">

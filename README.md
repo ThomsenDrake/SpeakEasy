@@ -66,6 +66,77 @@ Semantics:
 
 ## Setup
 
+### 0. One-command install into every agent (recommended)
+
+```sh
+bash scripts/install.sh                       # optional: --token xoxb-...
+```
+
+This installs the gateway on this Mac end to end:
+
+1. Builds the frontend and the release binary.
+2. Installs the binary to `~/.local/bin/slack-approval-gateway`.
+3. Creates `~/.slack-approval-gateway/` (mode 700) and writes the bot token
+   to `slack_token` (mode 600) — the only place the token lives. Without
+   `--token`/`SLACK_BOT_TOKEN` a placeholder is written; sends then fail
+   until you install a real token (`scripts/install.sh --token xoxb-...`,
+   the service restarts and reads the file at startup).
+4. Installs a LaunchAgent (`com.speakeasy.slack-approval-gateway`) that
+   starts the single gateway instance at login (`--serve`: UI + MCP socket,
+   no agent on stdio). Logs: `~/.slack-approval-gateway/gateway.log`.
+5. Registers the MCP server `slack-approval-gateway` in every detected
+   coding agent (table below) and drops a managed instruction block ("send
+   Slack only through the gateway") into each agent's instruction file.
+6. Audits the exclusivity boundary (below) and prints findings.
+
+Flags: `--dry-run`, `--enforce`, `--uninstall [--purge]`, `--skip-build`,
+`--token xoxb-...`, `--state-dir DIR`. Every modified config file is backed
+up once to `<file>.bak-sag`; `--uninstall` restores them.
+
+| Agent | Detected via | Config written |
+|---|---|---|
+| Claude Code | `claude` | `~/.claude.json` (user scope) + `~/.claude/CLAUDE.md` |
+| pdev (paradev) | `pdev` | `~/.paradev/agent/settings.json` + `AGENTS.md` |
+| Codex | `codex` | `~/.codex/config.toml` + `~/.codex/AGENTS.md` |
+| OpenCode | `opencode` | `~/.config/opencode/opencode.json` + `AGENTS.md` |
+| Mistral Vibe | `vibe` | `~/.vibe/config.toml` + `~/.vibe/AGENTS.md` |
+| goose | `goose` | `~/.config/goose/config.yaml` + `.goosehints` |
+| pi | `pi` | `~/.pi/agent/settings.json` + `AGENTS.md` |
+| Gemini CLI | `~/.gemini` | `~/.gemini/settings.json` + `GEMINI.md` |
+| Copilot CLI | `~/.copilot` | `~/.copilot/mcp-config.json` + `copilot-instructions.md` |
+| Zed | `zed` | `~/.config/zed/settings.json` + `rules/slack-gateway.md` |
+| Amp | `amp` | `~/.config/amp/settings.json` |
+| Hermes Agent | `hermes` | `~/.hermes/config.yaml` + `AGENTS.md` |
+
+Superset workspaces run these same agent CLIs as this user, so they pick up
+the registrations automatically — no per-workspace setup. Devin's CLI (when
+present) has no known user-level MCP config; register it manually.
+
+### Single instance, many agents
+
+Every agent spawns the binary over MCP stdio, but there is exactly one
+gateway *instance* per state dir: the first process takes `gateway.lock`
+and listens on `gateway.sock` (a Unix socket in the state dir); every later
+process becomes a byte-transparent *bridge* between the agent's stdio and
+that socket (`src/instance.rs`). So there is one popup owner, one Slack
+client, one pending-request queue, and one set of cooldowns/dedupe records
+(shared on disk in any case). The LaunchAgent instance runs with `--serve`
+(UI + socket, no stdio MCP); an instance started by an agent serves both
+its own stdio and the socket. A crashed instance leaves a stale lock/socket;
+the next starter detects it (the socket refuses connections) and takes
+over.
+
+### Window lifecycle
+
+The window starts hidden. A request arriving at any time shows and focuses
+it; once the queue drains after a decision the webview hides it again. A
+menu-bar tray icon offers **Show approval window** / **Quit gateway** (a
+left click on the icon also shows the window), and a Dock click reopens it.
+Closing the window only hides it — the gateway keeps serving MCP for every
+agent, and closing never approves anything. Only the tray's Quit (or
+`pkill -x slack-approval-gateway`) stops the app; pending requests then
+fail and the agents are told nothing was sent.
+
 ### 1. Slack authentication
 
 1. Create a Slack app at <https://api.slack.com/apps> (or use an existing
@@ -98,27 +169,39 @@ cd ui && npm install && npm run build && cd ..
 
 cargo build --release
 ./target/release/slack-approval-gateway          # GUI mode (default)
+./target/release/slack-approval-gateway --serve  # service mode (LaunchAgent)
 ./target/release/slack-approval-gateway --cli    # terminal approval (headless/SSH)
 ```
 
-- **GUI mode**: a Tauri webview popup appears for each request, built with
-  the **Mistral design system (`@mistral/ui`)** — React 19 + Tailwind 4,
-  with the DS vendored under `ui/shared/` (from Mistral's
+With `scripts/install.sh` done, the app is already running as a login
+service; you normally never launch it by hand.
+
+- **GUI mode (default)**: spawned by an agent over MCP stdio. If an
+  instance is already running (the login service), the process bridges to
+  it; otherwise it becomes the instance. The Tauri webview popup is built
+  with the **Mistral design system (`@mistral/ui`)** — React 19 +
+  Tailwind 4, with the DS vendored under `ui/shared/` (from Mistral's
   `product-prototypes` template). The MCP server runs on a background
-  thread speaking newline-delimited JSON-RPC on stdio. stdout carries
+  thread speaking newline-delimited JSON-RPC on stdio, and the instance
+  also serves MCP on `gateway.sock` for bridged agents. stdout carries
   protocol only; diagnostics go to stderr. The binary is self-contained:
   the UI is embedded (Tauri `custom-protocol` feature), so no dev server is
   needed at runtime.
+- **Service mode (`--serve`)**: like GUI mode but with no MCP on stdio —
+  used by the LaunchAgent so the single instance starts at login.
 - **Development**: after changing `ui/`, run `npm run build` in `ui/` and
   rebuild the binary; `npm run dev` in `ui/` serves the frontend with hot
   reload for iterating on components.
 - **CLI mode**: approvals happen on the controlling terminal
   (`a` approve, `d` deny, `f <feedback>`). Concurrent prompts are
-  serialized so an answer always reaches the right request.
+  serialized so an answer always reaches the right request. `--cli` also
+  becomes the instance and serves the socket (used by the smoke test).
 
 ### 3. Agent integration
 
-Configure each participating agent's MCP client with a stdio server, e.g.:
+`scripts/install.sh` registers the MCP server in every agent (table in
+§0). Manually, each participating agent's MCP client gets a stdio server,
+e.g.:
 
 ```json
 {
@@ -131,35 +214,59 @@ Configure each participating agent's MCP client with a stdio server, e.g.:
 }
 ```
 
-The gateway must be running before the agent starts (agents spawn it as a
-child process over stdio). Agents call `request_slack_message` with the
-fields above and receive one of the verdicts.
+The per-agent config key/shape differs (see the table in §0 and
+`scripts/agent_config.py`); `scripts/install.sh` handles all of them.
+Agents call `request_slack_message` with the fields above and receive one
+of the verdicts. They do not need the gateway pre-running: the first spawn
+becomes the instance, later spawns bridge to it.
 
 ## Enforcement boundaries (exclusive sending path)
 
-The gateway is the **only** component that holds Slack credentials and the
-only path that sends:
+The gateway is the **only** component that holds the bot token and the only
+intended path that sends:
 
-- Agents receive **no** Slack token, no Slack MCP server, and no
-  `chat:write`-capable API access. Their only way to reach Slack is this
-  gateway's single approval-gated tool.
-- Configure the agent harness's tool permissions to exclude direct HTTP /
-  web / browser-automation tools (or run agents without network egress
-  except the gateway process).
+- Agents receive **no** bot token and no Slack MCP server. Their only way
+  to send is the gateway's single approval-gated tool. `scripts/install.sh`
+  also writes an instruction block into every agent's instruction file:
+  "send Slack only through `request_slack_message`; no Slack MCP servers,
+  curl, webhooks, SDKs, CLIs, scripts, or the browser".
+- `scripts/install.sh` **audits** this boundary on every run: it reports
+  direct Slack MCP servers and Slack tokens found in agent configs, checks
+  the state-dir/token-file permissions, and checks the legacy hook guard.
+  `scripts/install.sh --enforce` additionally **removes direct Slack MCP
+  servers** from agent configs (Claude Code, Codex, OpenCode, and any other
+  detected JSON/TOML config; originals restored from `.bak-sag` by
+  `--uninstall`). Removing them also removes agents' Slack *read* access
+  via those servers — that is the price of exclusivity; the tokens remain
+  in the `.bak-sag` backups, so rotate them in Slack if you want them gone
+  for good.
+- A **legacy hook guard** (`~/.config/agent-guards/`, if installed) is the
+  deny-by-default backstop for every *other* route: it intercepts tool
+  calls that would write to Slack (curl, browser automation, SDKs) and
+  blocks them unless you approve them in its dialog. The installer checks
+  it (`install.py doctor`) and reports its status. Keep it installed: it
+  is what stands between an agent and a direct Slack write when the agent
+  does not go through the gateway.
 - Prefer running agents as a **separate OS user** that cannot read the
-  gateway's state directory (which may contain `slack_token`). An agent
+  gateway's state directory (which contains `slack_token`). An agent
   running as the same user could read the token file directly.
-- MCP is stdio, so agents must run on the same machine as the gateway (or
-  reach it over a transport you trust).
-- Keep the token file `chmod 600`; prefer the env var over the file when
-  the gateway is launched by a process manager.
+- MCP is stdio (plus the local Unix socket for bridges), so agents must run
+  on the same machine as the gateway.
+- Keep the token file `chmod 600` (the installer does this).
 
 ### Environment limitations (honest list)
 
 - The gateway gates **agent-initiated sends that go through its MCP tool**.
-  It cannot stop an agent that already possesses the bot token, has
-  unrestricted network access, or can drive a browser — the mitigations
-  above reduce, but on a single-user machine cannot fully eliminate, this.
+  It cannot stop an agent that already possesses a Slack token (e.g. user
+  session tokens `xoxc-`/`xoxd-` left in agent configs — the audit lists
+  them), has unrestricted network access, or can drive a browser. The
+  mitigations above (no bot token for agents, instruction blocks, the
+  legacy hook guard, `--enforce`) reduce, but on a single-user machine
+  cannot fully eliminate, this.
+- The Hermes agent's native Slack *platform* (`platform_toolsets.slack` in
+  `~/.hermes/config.yaml`) is Hermes's own messaging channel, not a
+  coding-agent send path; the audit reports it, and the installer does not
+  touch it. Remove it there if you want Hermes gated too.
 - Purpose blocking is a **heuristic**: destination + normalized
   message-content similarity (character-level Levenshtein ratio ≥ 0.85, or
   token-set Sørensen–Dice ≥ 0.7). It is not a semantic guarantee. Known gaps:
@@ -180,33 +287,43 @@ only path that sends:
 ```sh
 cd ui && npm install && npm run build && cd ..   # frontend (required once)
 cargo build --release    # first build compiles Tauri/wry; takes minutes
-cargo test               # 55 lib tests + 13 MCP e2e tests + 12 Slack client tests
+cargo test               # 59 lib + 13 MCP e2e + 3 instance-socket + 12 Slack tests
 cargo test -- --ignored  # also the 15s HTTP timeout test
-python3 scripts/smoke_test.py   # drives the real binary end to end (mock Slack + pty)
+python3 scripts/smoke_test.py        # drives the real binary (mock Slack + pty + bridges)
+python3 scripts/test_agent_config.py # installer config-edit helper tests
+bash scripts/install.sh --dry-run    # preview the agent install
 ```
 
 `docs/SPEC.md` is the module contract (`core` = gateway/cooldowns/dedupe,
-`slack` = the only credential holder, `mcp` = stdio JSON-RPC server,
-`ui` = the Tauri webview bridge). GUI behavior is verified by build + spec
-review plus the IPC bridge unit tests; the decision flows are covered by
-the test suite and the smoke script.
+`slack` = the only credential holder, `mcp` = JSON-RPC server,
+`instance` = single-instance coordination + stdio bridges, `ui` = the Tauri
+webview bridge). GUI behavior is verified by build + spec review plus the
+IPC bridge unit tests; the decision flows are covered by the test suite,
+the smoke script (which also exercises the bridge path against a live
+instance), and a manual run of the installed service.
 
 ## Layout
 
 ```
-├── src/core.rs    gateway: validation, purpose fingerprinting, persisted
-│                  deny cooldowns, persisted sent-record dedupe, decision flow
-├── src/slack.rs   Slack Web API client (only place credentials exist)
-├── src/mcp.rs     MCP stdio server (one tool: request_slack_message)
-├── src/ui.rs      Tauri webview bridge (decision provider + IPC commands)
-├── src/main.rs    wiring, state dir, --cli fallback provider
-├── ui/            the approval popup frontend (React + Tailwind 4 +
-│   │              the vendored Mistral @mistral/ui design system)
+├── src/core.rs       gateway: validation, purpose fingerprinting, persisted
+│                     deny cooldowns, persisted sent-record dedupe, decision flow
+├── src/slack.rs      Slack Web API client (only place credentials exist)
+├── src/mcp.rs        MCP JSON-RPC server (one tool: request_slack_message)
+├── src/instance.rs   single-instance coordination: gateway.lock/gateway.sock,
+│                     stdio<->socket bridges, stale-lock recovery
+├── src/ui.rs         Tauri webview bridge (decision provider + IPC commands)
+├── src/main.rs       wiring, run modes (--cli/--serve/default), tray, window lifecycle
+├── ui/               the approval popup frontend (React + Tailwind 4 +
+│   │                 the vendored Mistral @mistral/ui design system)
 │   ├── src/App.tsx        approval popup (DS components)
 │   └── shared/            vendored @mistral/ui components + design tokens
-├── tests/         unit/integration/e2e tests (mock Slack server, scripted humans)
-├── scripts/smoke_test.py  end-to-end test of the real binary
-├── docs/SPEC.md   behavioral + module contract
+├── tests/            unit/integration/e2e tests (mock Slack, scripted humans,
+│                     socket-level instance tests)
+├── scripts/install.sh         one-command install into every agent + LaunchAgent
+├── scripts/agent_config.py    per-agent MCP config editor (backup + idempotent)
+├── scripts/test_agent_config.py   tests for the config editor
+├── scripts/smoke_test.py      end-to-end test of the real binary (incl. bridges)
+├── docs/SPEC.md      behavioral + module contract
 ├── tauri.conf.json, capabilities/, icons/, build.rs   Tauri shell
 └── README.md
 ```
