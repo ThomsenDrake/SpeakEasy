@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+# install.sh — install the Slack Approval Gateway into every coding agent on
+# this Mac, and keep the gateway itself running as a login service.
+#
+# What it does:
+#   1. Builds the app (frontend + release binary).
+#   2. Installs the binary to ~/.local/bin/slack-approval-gateway.
+#   3. Sets up the state dir and the Slack bot token file (chmod 600). The
+#      gateway is the only component that ever sees the token.
+#   4. Installs a LaunchAgent so the single gateway instance starts at login
+#      (--serve: UI + MCP socket, no agent on stdio). Agent-spawned copies
+#      of the binary bridge to this instance over the state-dir socket, so
+#      there is exactly one popup owner, one Slack client, and one queue.
+#   5. Registers the MCP server `slack-approval-gateway` in every detected
+#      coding agent (Claude Code, pdev/paradev, Codex, OpenCode, Vibe, goose,
+#      pi, Gemini CLI, Copilot CLI, Zed, Amp, Hermes).
+#   6. Drops a managed instruction block into each agent's instruction file:
+#      "send Slack only through the gateway's request_slack_message tool".
+#   7. Audits the exclusivity boundary: direct Slack MCP servers, Slack
+#      tokens in agent configs, and the legacy hook guard. With --enforce it
+#      removes direct Slack MCP servers from agent configs (backups kept).
+#
+# Every modified config file is backed up once to <file>.bak-sag.
+#
+# Usage:
+#   scripts/install.sh [--dry-run] [--enforce] [--uninstall] [--purge]
+#                      [--skip-build] [--token xoxb-...] [--state-dir DIR]
+#
+#   --dry-run     print what would happen, change nothing
+#   --enforce     also remove direct Slack MCP servers from agent configs
+#                 (agents then cannot send except through the gateway;
+#                 restores with: install.sh --uninstall)
+#   --uninstall   remove the MCP registrations, instruction blocks, the
+#                 LaunchAgent, and the installed binary (state dir kept)
+#   --purge       with --uninstall: also delete the state dir (cooldowns,
+#                 sent records, token file)
+#   --skip-build  reuse the existing target/release binary
+#   --token       Slack bot token (xoxb-...). Stored only in
+#                 <state-dir>/slack_token (chmod 600). Without it a
+#                 placeholder is written and sends fail until you set a real
+#                 token:  scripts/install.sh --token xoxb-...
+#   --state-dir   state dir (default ~/.slack-approval-gateway)
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN_NAME="slack-approval-gateway"
+SERVER_NAME="slack-approval-gateway"
+HOME_DIR="${HOME:?no HOME}"
+DEFAULT_STATE_DIR="$HOME_DIR/.slack-approval-gateway"
+INSTALL_BIN="$HOME_DIR/.local/bin/$BIN_NAME"
+PLIST_LABEL="com.speakeasy.slack-approval-gateway"
+PLIST_PATH="$HOME_DIR/Library/LaunchAgents/$PLIST_LABEL.plist"
+AGENT_CONFIG="$ROOT/scripts/agent_config.py"
+PY="${PYTHON:-python3}"
+
+DRY_RUN=0
+ENFORCE=0
+UNINSTALL=0
+PURGE=0
+SKIP_BUILD=0
+TOKEN_ARG=""
+STATE_DIR="$DEFAULT_STATE_DIR"
+
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    --token) TOKEN_ARG="$arg" ;;
+    --state-dir) STATE_DIR="$arg" ;;
+  esac
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --enforce) ENFORCE=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
+    --skip-build) SKIP_BUILD=1 ;;
+    --token|--state-dir) : ;;  # value consumed on the next iteration
+    --token=*) TOKEN_ARG="${arg#--token=}" ;;
+    --state-dir=*) STATE_DIR="${arg#--state-dir=}" ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
+  esac
+  prev="$arg"
+done
+
+say() { printf '%s\n' "$*"; }
+hr() { say ""; say "────────────────────────────────────────────────────────────"; }
+run() {
+  if [ "$DRY_RUN" = 1 ]; then say "  [dry-run] $*"; else "$@"; fi
+}
+run_ok() { # command that may legitimately fail
+  if [ "$DRY_RUN" = 1 ]; then say "  [dry-run] $*"; else "$@" || true; fi
+}
+ac() { # agent_config.py mutation (respects --dry-run)
+  if [ "$DRY_RUN" = 1 ]; then say "  [dry-run] agent_config $*"; else "$PY" "$AGENT_CONFIG" "$@"; fi
+}
+has() { # has <file> [name] — read-only check
+  "$PY" "$AGENT_CONFIG" has "$1" "${2:-$SERVER_NAME}" 2>/dev/null
+}
+backup_once() { # back up a config file before the first modification
+  local f="$1"
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  [dry-run] backup $f -> $f.bak-sag"
+  elif [ -f "$f" ] && [ ! -f "$f.bak-sag" ]; then
+    cp -p "$f" "$f.bak-sag"
+  fi
+}
+
+# registered agents, as "name<TAB>config-file" rows, verified at the end
+REGISTERED_FILE="$(mktemp 2>/dev/null || echo /tmp/sag-install-registered.$$)"
+trap 'rm -f "$REGISTERED_FILE"' EXIT
+note_registered() { # note_registered <name> <config-file>
+  printf '%s\t%s\n' "$1" "$2" >> "$REGISTERED_FILE"
+  say "  [ok]        $1 — $2"
+}
+note_registered_existing() {
+  printf '%s\t%s\n' "$1" "$2" >> "$REGISTERED_FILE"
+  say "  [ok]        $1 (already registered) — $2"
+}
+note_skipped() { say "  [skip]      $1"; }
+
+# --------------------------------------------------------------------------- #
+hr
+say "Slack Approval Gateway — install"
+hr
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  say "This installer targets macOS (LaunchAgent autostart). The gateway"
+  say "binary itself builds and runs on Linux; register the MCP server in"
+  say "your agents manually (see README.md)."
+  exit 1
+fi
+for tool in cargo npm "$PY"; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    say "missing required tool: $tool" >&2
+    exit 1
+  fi
+done
+
+# --------------------------------------------------------------------------- #
+# uninstall
+# --------------------------------------------------------------------------- #
+if [ "$UNINSTALL" = 1 ]; then
+  hr
+  say "Uninstalling"
+  hr
+  run_ok pkill -x "$BIN_NAME"
+  run_ok launchctl bootout "gui/$(id -u)/$PLIST_LABEL"
+  run rm -f "$PLIST_PATH"
+  run_ok claude mcp remove --scope user "$SERVER_NAME"
+  run_ok codex mcp remove "$SERVER_NAME"
+  run_ok vibe mcp remove "$SERVER_NAME"
+  ac remove-json pi "$HOME_DIR/.paradev/agent/settings.json"
+  ac remove-json opencode "$HOME_DIR/.config/opencode/opencode.json"
+  ac remove-json gemini "$HOME_DIR/.gemini/settings.json"
+  ac remove-json copilot "$HOME_DIR/.copilot/mcp-config.json"
+  ac remove-json amp "$HOME_DIR/.config/amp/settings.json"
+  ac remove-json pi "$HOME_DIR/.pi/agent/settings.json"
+  ac remove-zed "$HOME_DIR/.config/zed/settings.json"
+  ac remove-goose "$HOME_DIR/.config/goose/config.yaml"
+  ac remove-hermes "$HOME_DIR/.hermes/config.yaml"
+  ac remove-codex "$HOME_DIR/.codex/config.toml"
+  for f in "$HOME_DIR/.claude/CLAUDE.md" "$HOME_DIR/.codex/AGENTS.md" \
+           "$HOME_DIR/.config/opencode/AGENTS.md" "$HOME_DIR/.vibe/AGENTS.md" \
+           "$HOME_DIR/.config/goose/.goosehints" "$HOME_DIR/.pi/agent/AGENTS.md" \
+           "$HOME_DIR/.paradev/agent/AGENTS.md" "$HOME_DIR/.gemini/GEMINI.md" \
+           "$HOME_DIR/.copilot/copilot-instructions.md" "$HOME_DIR/.hermes/AGENTS.md"; do
+    ac instruction-remove "$f"
+  done
+  run rm -f "$HOME_DIR/.config/zed/rules/slack-gateway.md"
+  run rm -f "$INSTALL_BIN"
+  if [ "$PURGE" = 1 ]; then
+    run rm -rf "$STATE_DIR"
+  else
+    say "Kept state dir $STATE_DIR (cooldowns, sent records, token file)."
+    say "Delete it manually with: rm -rf $STATE_DIR"
+  fi
+  say "Uninstalled. Agent configs were restored from their .bak-sag backups"
+  say "where one existed."
+  exit 0
+fi
+
+# --------------------------------------------------------------------------- #
+# 1. build
+# --------------------------------------------------------------------------- #
+hr
+say "1. Build"
+hr
+if [ "$SKIP_BUILD" = 1 ]; then
+  say "  skipping build (--skip-build)"
+else
+  if [ "$DRY_RUN" = 0 ]; then
+    if [ ! -d "$ROOT/ui/node_modules" ]; then
+      say "  npm install (ui/)"
+      (cd "$ROOT/ui" && npm install --no-audit --no-fund)
+    fi
+    say "  npm run build (ui/)"
+    (cd "$ROOT/ui" && npm run build)
+    say "  cargo build --release"
+    (cd "$ROOT" && cargo build --release)
+  else
+    say "  [dry-run] cd ui && npm install && npm run build"
+    say "  [dry-run] cargo build --release"
+  fi
+fi
+BINARY="$ROOT/target/release/$BIN_NAME"
+if [ ! -x "$BINARY" ]; then
+  say "release binary missing: $BINARY (run without --skip-build)" >&2
+  exit 1
+fi
+
+# --------------------------------------------------------------------------- #
+# 2. install binary
+# --------------------------------------------------------------------------- #
+hr
+say "2. Install binary"
+hr
+run mkdir -p "$HOME_DIR/.local/bin"
+run install -m 0755 "$BINARY" "$INSTALL_BIN"
+say "  installed: $INSTALL_BIN"
+
+# --------------------------------------------------------------------------- #
+# 3. state dir + token
+# --------------------------------------------------------------------------- #
+hr
+say "3. State dir and Slack token"
+hr
+run mkdir -p "$STATE_DIR"
+if [ "$DRY_RUN" = 0 ]; then chmod 700 "$STATE_DIR"; fi
+TOKEN_FILE="$STATE_DIR/slack_token"
+TOKEN="$TOKEN_ARG"
+if [ -z "$TOKEN" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then TOKEN="$SLACK_BOT_TOKEN"; fi
+if [ -n "$TOKEN" ]; then
+  if [ "$DRY_RUN" = 0 ]; then
+    umask 077
+    printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+  else
+    say "  [dry-run] write $TOKEN_FILE (chmod 600)"
+  fi
+  say "  wrote $TOKEN_FILE (chmod 600) — the only place the token lives"
+elif [ -f "$TOKEN_FILE" ]; then
+  say "  keeping existing $TOKEN_FILE"
+else
+  if [ "$DRY_RUN" = 0 ]; then
+    umask 077
+    printf '%s\n' "xoxb-placeholder-set-a-real-token" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+  else
+    say "  [dry-run] write placeholder $TOKEN_FILE"
+  fi
+  say "  WARNING: no token given (--token xoxb-... or SLACK_BOT_TOKEN)."
+  say "  Wrote a placeholder to $TOKEN_FILE — approval popups work, but"
+  say "  sends fail until you install a real bot token:"
+  say "    scripts/install.sh --token xoxb-your-bot-token"
+  say "  (the service restarts automatically; it reads the file at startup)"
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. LaunchAgent (single always-on instance)
+# --------------------------------------------------------------------------- #
+hr
+say "4. Login service (single gateway instance)"
+hr
+if [ "$DRY_RUN" = 0 ]; then
+  mkdir -p "$HOME_DIR/Library/LaunchAgents"
+  umask 022
+  cat > "$PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$INSTALL_BIN</string><string>--serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$STATE_DIR/gateway.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/gateway.log</string>
+</dict>
+</plist>
+EOF
+else
+  say "  [dry-run] write $PLIST_PATH (ProgramArguments: $INSTALL_BIN --serve)"
+fi
+say "  restarting any running gateway so the new binary takes over"
+run_ok pkill -x "$BIN_NAME"
+sleep 1
+run_ok launchctl bootout "gui/$(id -u)/$PLIST_LABEL"
+run launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" || run_ok true
+run_ok launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL"
+if [ "$DRY_RUN" = 0 ]; then
+  for _ in $(seq 1 50); do
+    if [ -S "$STATE_DIR/gateway.sock" ]; then break; fi
+    sleep 0.2
+  done
+fi
+if [ -S "$STATE_DIR/gateway.sock" ]; then
+  PID="$(launchctl print "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null | sed -n 's/.*pid = \([0-9]*\).*/\1/p' | head -1)"
+  say "  service running (pid ${PID:-?}); MCP socket: $STATE_DIR/gateway.sock"
+else
+  say "  WARNING: service socket not up yet; check:"
+  say "    launchctl print gui/$(id -u)/$PLIST_LABEL   and   $STATE_DIR/gateway.log"
+fi
+
+# --------------------------------------------------------------------------- #
+# 5. register the MCP server in every detected agent
+# --------------------------------------------------------------------------- #
+hr
+say "5. Register the MCP server in coding agents"
+hr
+
+# --- Claude Code (user scope so every project gets it)
+if command -v claude >/dev/null 2>&1; then
+  CFG="$HOME_DIR/.claude.json"
+  if has "$CFG"; then
+    note_registered_existing claude "$CFG"
+  else
+    backup_once "$CFG"
+    if [ "$DRY_RUN" = 0 ]; then
+      if ! claude mcp add --scope user --transport stdio "$SERVER_NAME" -- "$INSTALL_BIN" >/dev/null 2>&1; then
+        say "  (claude mcp add failed; editing .claude.json directly)"
+        "$PY" "$AGENT_CONFIG" add-json claude "$CFG" "$INSTALL_BIN"
+      fi
+    else
+      say "  [dry-run] claude mcp add --scope user --transport stdio $SERVER_NAME -- $INSTALL_BIN"
+    fi
+    note_registered claude "$CFG"
+  fi
+else
+  note_skipped "claude (not installed)"
+fi
+
+# --- pdev / paradev (pi-style settings)
+if command -v pdev >/dev/null 2>&1 || [ -d "$HOME_DIR/.paradev" ]; then
+  CFG="$HOME_DIR/.paradev/agent/settings.json"
+  if has "$CFG"; then
+    note_registered_existing pdev "$CFG"
+  else
+    ac add-json pi "$CFG" "$INSTALL_BIN"
+    note_registered pdev "$CFG"
+  fi
+else
+  note_skipped "pdev (not installed)"
+fi
+
+# --- Codex
+if command -v codex >/dev/null 2>&1; then
+  CFG="$HOME_DIR/.codex/config.toml"
+  if has "$CFG"; then
+    note_registered_existing codex "$CFG"
+  else
+    backup_once "$CFG"
+    if [ "$DRY_RUN" = 0 ]; then
+      if ! codex mcp add "$SERVER_NAME" -- "$INSTALL_BIN" >/dev/null 2>&1; then
+        say "  (codex mcp add failed; appending to config.toml)"
+        "$PY" "$AGENT_CONFIG" add-codex "$CFG" "$INSTALL_BIN"
+      fi
+    else
+      say "  [dry-run] codex mcp add $SERVER_NAME -- $INSTALL_BIN"
+    fi
+    note_registered codex "$CFG"
+  fi
+else
+  note_skipped "codex (not installed)"
+fi
+
+# --- OpenCode
+if command -v opencode >/dev/null 2>&1 || [ -f "$HOME_DIR/.config/opencode/opencode.json" ]; then
+  CFG="$HOME_DIR/.config/opencode/opencode.json"
+  if has "$CFG"; then
+    note_registered_existing opencode "$CFG"
+  else
+    ac add-json opencode "$CFG" "$INSTALL_BIN"
+    note_registered opencode "$CFG"
+  fi
+else
+  note_skipped "opencode (not installed)"
+fi
+
+# --- Mistral Vibe
+if command -v vibe >/dev/null 2>&1; then
+  CFG="$HOME_DIR/.vibe/config.toml"
+  if has "$CFG"; then
+    note_registered_existing vibe "$CFG"
+  else
+    backup_once "$CFG"
+    if [ "$DRY_RUN" = 0 ]; then
+      if ! vibe mcp add "$SERVER_NAME" --transport stdio --command "$INSTALL_BIN" >/dev/null 2>&1; then
+        say "  WARNING: vibe mcp add failed; edit $CFG by hand (see README.md)"
+      fi
+    else
+      say "  [dry-run] vibe mcp add $SERVER_NAME --transport stdio --command $INSTALL_BIN"
+    fi
+    note_registered vibe "$CFG"
+  fi
+else
+  note_skipped "vibe (not installed)"
+fi
+
+# --- goose
+if command -v goose >/dev/null 2>&1 || [ -f "$HOME_DIR/.config/goose/config.yaml" ]; then
+  CFG="$HOME_DIR/.config/goose/config.yaml"
+  if has "$CFG"; then
+    note_registered_existing goose "$CFG"
+  else
+    ac add-goose "$CFG" "$INSTALL_BIN"
+    note_registered goose "$CFG"
+  fi
+else
+  note_skipped "goose (not installed)"
+fi
+
+# --- pi
+if command -v pi >/dev/null 2>&1 || [ -f "$HOME_DIR/.pi/agent/settings.json" ]; then
+  CFG="$HOME_DIR/.pi/agent/settings.json"
+  if has "$CFG"; then
+    note_registered_existing pi "$CFG"
+  else
+    ac add-json pi "$CFG" "$INSTALL_BIN"
+    note_registered pi "$CFG"
+  fi
+else
+  note_skipped "pi (not installed)"
+fi
+
+# --- Gemini CLI (config is honored even when the CLI is not on PATH yet)
+if [ -d "$HOME_DIR/.gemini" ]; then
+  CFG="$HOME_DIR/.gemini/settings.json"
+  if has "$CFG"; then
+    note_registered_existing gemini "$CFG"
+  else
+    ac add-json gemini "$CFG" "$INSTALL_BIN"
+    if command -v gemini >/dev/null 2>&1 && gemini --version >/dev/null 2>&1; then
+      note_registered gemini "$CFG"
+    else
+      say "  [ok]        gemini (config written; CLI not currently on PATH) — $CFG"
+      printf '%s\t%s\n' gemini "$CFG" >> "$REGISTERED_FILE"
+    fi
+  fi
+else
+  note_skipped "gemini (not installed)"
+fi
+
+# --- GitHub Copilot CLI
+if [ -d "$HOME_DIR/.copilot" ]; then
+  CFG="$HOME_DIR/.copilot/mcp-config.json"
+  if has "$CFG"; then
+    note_registered_existing copilot "$CFG"
+  else
+    ac add-json copilot "$CFG" "$INSTALL_BIN"
+    note_registered copilot "$CFG"
+  fi
+else
+  note_skipped "copilot (not installed)"
+fi
+
+# --- Zed
+if command -v zed >/dev/null 2>&1 || [ -d "$HOME_DIR/.config/zed" ]; then
+  CFG="$HOME_DIR/.config/zed/settings.json"
+  if has "$CFG"; then
+    note_registered_existing zed "$CFG"
+  else
+    ac add-zed "$CFG" "$INSTALL_BIN"
+    note_registered zed "$CFG"
+  fi
+else
+  note_skipped "zed (not installed)"
+fi
+
+# --- Amp
+if command -v amp >/dev/null 2>&1 || [ -f "$HOME_DIR/.config/amp/settings.json" ]; then
+  CFG="$HOME_DIR/.config/amp/settings.json"
+  if has "$CFG"; then
+    note_registered_existing amp "$CFG"
+  else
+    ac add-json amp "$CFG" "$INSTALL_BIN"
+    note_registered amp "$CFG"
+  fi
+else
+  note_skipped "amp (not installed)"
+fi
+
+# --- Hermes Agent
+if command -v hermes >/dev/null 2>&1 || [ -d "$HOME_DIR/.hermes" ]; then
+  CFG="$HOME_DIR/.hermes/config.yaml"
+  if has "$CFG"; then
+    note_registered_existing hermes "$CFG"
+  else
+    ac add-hermes "$CFG" "$INSTALL_BIN"
+    note_registered hermes "$CFG"
+  fi
+else
+  note_skipped "hermes (not installed)"
+fi
+
+# --- Devin CLI (no known user-level MCP config location; noted only)
+if command -v devin >/dev/null 2>&1 && devin --version >/dev/null 2>&1; then
+  note_skipped "devin (detected; no known MCP config — register manually, see README)"
+else
+  note_skipped "devin (not installed)"
+fi
+
+say ""
+say "  Superset workspaces run these same agent CLIs as this user, so they"
+say "  pick up the registrations above automatically — no per-workspace setup."
+
+# --------------------------------------------------------------------------- #
+# 6. instruction blocks ("send only through the gateway")
+# --------------------------------------------------------------------------- #
+hr
+say "6. Agent instruction blocks"
+hr
+add_instruction() {
+  ac instruction-add "$1"
+}
+if [ -f "$HOME_DIR/.claude.json" ] || [ -d "$HOME_DIR/.claude" ]; then
+  add_instruction "$HOME_DIR/.claude/CLAUDE.md"
+fi
+if [ -f "$HOME_DIR/.codex/config.toml" ]; then
+  add_instruction "$HOME_DIR/.codex/AGENTS.md"
+fi
+if [ -f "$HOME_DIR/.config/opencode/opencode.json" ]; then
+  add_instruction "$HOME_DIR/.config/opencode/AGENTS.md"
+fi
+if [ -f "$HOME_DIR/.vibe/config.toml" ]; then
+  add_instruction "$HOME_DIR/.vibe/AGENTS.md"
+fi
+if [ -f "$HOME_DIR/.config/goose/config.yaml" ]; then
+  add_instruction "$HOME_DIR/.config/goose/.goosehints"
+fi
+if [ -f "$HOME_DIR/.pi/agent/settings.json" ]; then
+  add_instruction "$HOME_DIR/.pi/agent/AGENTS.md"
+fi
+if [ -f "$HOME_DIR/.paradev/agent/settings.json" ]; then
+  add_instruction "$HOME_DIR/.paradev/agent/AGENTS.md"
+fi
+if [ -f "$HOME_DIR/.gemini/settings.json" ]; then
+  add_instruction "$HOME_DIR/.gemini/GEMINI.md"
+fi
+if [ -f "$HOME_DIR/.copilot/mcp-config.json" ]; then
+  add_instruction "$HOME_DIR/.copilot/copilot-instructions.md"
+fi
+if [ -f "$HOME_DIR/.hermes/config.yaml" ]; then
+  add_instruction "$HOME_DIR/.hermes/AGENTS.md"
+fi
+if [ -f "$HOME_DIR/.config/zed/settings.json" ]; then
+  run mkdir -p "$HOME_DIR/.config/zed/rules"
+  add_instruction "$HOME_DIR/.config/zed/rules/slack-gateway.md"
+fi
+
+# --------------------------------------------------------------------------- #
+# 7. exclusivity audit (+ optional enforcement)
+# --------------------------------------------------------------------------- #
+hr
+say "7. Enforcement audit (exclusive sending path)"
+hr
+AUDIT_FILES=(
+  "$HOME_DIR/.claude.json"
+  "$HOME_DIR/.codex/config.toml"
+  "$HOME_DIR/.config/opencode/opencode.json"
+  "$HOME_DIR/.vibe/config.toml"
+  "$HOME_DIR/.config/goose/config.yaml"
+  "$HOME_DIR/.pi/agent/settings.json"
+  "$HOME_DIR/.paradev/agent/settings.json"
+  "$HOME_DIR/.gemini/settings.json"
+  "$HOME_DIR/.copilot/mcp-config.json"
+  "$HOME_DIR/.config/zed/settings.json"
+  "$HOME_DIR/.config/amp/settings.json"
+  "$HOME_DIR/.hermes/config.yaml"
+)
+AUDIT_JSON="$("$PY" "$AGENT_CONFIG" audit "${AUDIT_FILES[@]}" 2>/dev/null || echo '[]')"
+GAPS="$("$PY" - "$AUDIT_JSON" <<'EOF'
+import json, sys
+for f in json.loads(sys.argv[1]):
+    for name in f["direct_slack_servers"]:
+        print(json.dumps([f["file"], name]))
+EOF
+)"
+TOKENS="$("$PY" - "$AUDIT_JSON" <<'EOF'
+import json, sys
+for f in json.loads(sys.argv[1]):
+    for tok in f["slack_tokens"]:
+        print(json.dumps([f["file"], tok]))
+EOF
+)"
+
+if [ -n "$GAPS" ]; then
+  say "  Direct Slack MCP servers found in agent configs (agents could send"
+  say "  without the gateway):"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    "$PY" -c 'import json,sys; p,n=json.loads(sys.argv[1]); print(f"    - {p}  (server: {n})")' "$line"
+  done <<< "$GAPS"
+else
+  say "  No direct Slack MCP servers in agent configs."
+fi
+if [ -n "$TOKENS" ]; then
+  say "  Slack tokens found in agent configs (masked):"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    "$PY" -c 'import json,sys; p,t=json.loads(sys.argv[1]); print(f"    - {p}  ({t})")' "$line"
+  done <<< "$TOKENS"
+  say "  (these belong to direct Slack MCP servers; --enforce removes the"
+  say "   server entries but cannot scrub every copy — rotate the tokens in"
+  say "   Slack if you want them gone for good)"
+fi
+
+if [ -f "$HOME_DIR/.config/agent-guards/install.py" ]; then
+  if "$PY" "$HOME_DIR/.config/agent-guards/install.py" doctor >/dev/null 2>&1; then
+    say "  Legacy hook guard (~/.config/agent-guards): installed and healthy."
+    say "  It stays as the backstop that blocks direct Slack writes (curl,"
+    say "  browser, SDKs) unless you approve them in its dialog."
+  else
+    say "  Legacy hook guard found but 'install.py doctor' failed — run:"
+    say "    python3 ~/.config/agent-guards/install.py doctor"
+  fi
+else
+  say "  No legacy hook guard found. Direct Slack writes by agents (curl,"
+  say "  browser automation) are then only covered by agent instructions."
+fi
+
+if [ "$ENFORCE" = 1 ]; then
+  if [ -z "$GAPS" ]; then
+    say "  --enforce: nothing to remove (no direct Slack MCP servers found)."
+  else
+    say ""
+    say "  --enforce: removing direct Slack MCP servers from agent configs"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      "$PY" - "$line" "$AGENT_CONFIG" <<'EOF'
+import json, os, subprocess, sys
+path, name = json.loads(sys.argv[1])
+helper = sys.argv[2]
+base = os.path.basename(path)
+if base == ".claude.json":
+    style = "claude"
+elif base == "opencode.json":
+    style = "opencode"
+elif base == "mcp-config.json":
+    style = "copilot"
+elif base == "settings.json" and "amp" in path:
+    style = "amp"
+elif base == "settings.json" and (".pi/" in path or ".paradev/" in path):
+    style = "pi"
+elif base == "settings.json" and ".gemini/" in path:
+    style = "gemini"
+elif base == "config.toml":
+    style = "codex"
+else:
+    style = None
+if style is None:
+    print(f"    [skip]    {path} (server: {name}) — no automatic removal; edit by hand")
+elif style == "codex":
+    r = subprocess.run([sys.executable, helper, "remove-codex-entry", path, name],
+                       capture_output=True, text=True)
+    print(f"    [removed] {path} (server: {name}): {r.stdout.strip()}")
+else:
+    r = subprocess.run([sys.executable, helper, "remove-entry", style, path, name],
+                       capture_output=True, text=True)
+    print(f"    [removed] {path} (server: {name}): {r.stdout.strip()}")
+EOF
+    done <<< "$GAPS"
+    say "  Backups of the originals: <file>.bak-sag (restore: install.sh --uninstall)"
+  fi
+fi
+
+if [ "$DRY_RUN" = 0 ]; then
+  DIR_MODE="$(stat -f '%Lp' "$STATE_DIR" 2>/dev/null || echo '?')"
+  TOK_MODE="$(stat -f '%Lp' "$TOKEN_FILE" 2>/dev/null || echo '?')"
+  say "  state dir $STATE_DIR (mode $DIR_MODE), token file mode $TOK_MODE (want 600)"
+fi
+
+# --------------------------------------------------------------------------- #
+# 8. self-test: MCP handshake through a real spawned bridge
+# --------------------------------------------------------------------------- #
+hr
+say "8. Self-test (MCP handshake through a spawned process)"
+hr
+if [ "$DRY_RUN" = 1 ]; then
+  say "  [dry-run] skipped"
+elif [ -S "$STATE_DIR/gateway.sock" ]; then
+  SELF_TEST="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-self-test","version":"0"}}}' \
+    | timeout 15 "$INSTALL_BIN" 2>/dev/null | head -1 || true)"
+  if printf '%s' "$SELF_TEST" | grep -q '"slack-approval-gateway"'; then
+    say "  PASS: a spawned process bridged to the running instance and completed"
+    say "        the MCP initialize handshake."
+  else
+    say "  WARN: self-test did not get a handshake reply. Service log:"
+    say "        $STATE_DIR/gateway.log"
+  fi
+else
+  say "  skipped (service socket not up)"
+fi
+
+# --------------------------------------------------------------------------- #
+# verify + summary
+# --------------------------------------------------------------------------- #
+hr
+say "Verify registrations"
+hr
+if [ "$DRY_RUN" = 1 ]; then
+  say "  [dry-run] skipped"
+else
+  MISSING=0
+  while IFS=$'\t' read -r name cfg; do
+    if has "$cfg"; then
+      say "  VERIFIED    $name ($cfg)"
+    else
+      say "  MISSING     $name ($cfg)"
+      MISSING=1
+    fi
+  done < "$REGISTERED_FILE"
+  if [ "$MISSING" = 1 ]; then
+    say "  (some registrations failed; see the output above)"
+  fi
+fi
+
+hr
+say "Summary"
+hr
+say "  Binary:     $INSTALL_BIN"
+say "  Service:    $PLIST_LABEL (launchctl; logs in $STATE_DIR/gateway.log)"
+say "  State dir:  $STATE_DIR (cooldowns, sent records, token, socket)"
+say ""
+say "Next steps:"
+say "  1. Set a real Slack bot token if you have not:"
+say "       scripts/install.sh --token xoxb-your-bot-token"
+say "     (the service restarts and reads the file at startup)"
+say "  2. Restart your agents (or start a new session) so they pick up the"
+say "     new MCP server; then ask any agent to send a Slack message."
+say "  3. The popup appears, the gateway sends only what you approve, and"
+say "     closing the popup never sends anything."
+say ""
+say "  Uninstall: scripts/install.sh --uninstall"
+say "  Enforce exclusivity (remove direct Slack MCP servers from agents):"
+say "     scripts/install.sh --enforce"

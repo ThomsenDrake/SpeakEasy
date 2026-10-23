@@ -9,8 +9,12 @@ Runs `slack-approval-gateway --cli` with:
 
 Covers: MCP handshake, tools/list, approve (exact send + permalink),
 duplicate retry (no resend), deny (cooldown), reworded retry during cooldown
-(blocked, no prompt), feedback (no send), and two concurrent requests whose
-prompts are answered in order (CLI mutex: answers reach the right requests).
+(blocked, no prompt), feedback (no send), two concurrent requests whose
+prompts are answered in order (CLI mutex: answers reach the right requests),
+and the single-instance bridge: extra agent processes (no --cli) connect to
+the running instance over the state-dir socket and their MCP sessions are
+served by that one instance (same popup owner, same Slack client, shared
+dedupe/cooldowns).
 """
 import fcntl
 import http.server
@@ -298,6 +302,119 @@ try:
                    if p == "/chat.postMessage" and b.get("text") == "Concurrent request alpha"]
     check("alpha was the message actually sent", len(alpha_posts) == 1)
 
+    # 7b. bridge: a second agent process (default mode, no --cli) must not
+    # start its own instance — it bridges to the running one over the
+    # state-dir socket and its MCP session is served by that instance.
+    bridges = []
+
+    def spawn_bridge():
+        bp = subprocess.Popen(
+            [BINARY],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env,
+        )
+        bridges.append(bp)
+        responses_b = {}
+        lock_b = threading.Lock()
+
+        def reader_b():
+            for raw in bp.stdout:
+                line = raw.decode(errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "id" in msg:
+                    with lock_b:
+                        responses_b[msg["id"]] = msg
+
+        threading.Thread(target=reader_b, daemon=True).start()
+        return bp, responses_b, lock_b
+
+    def make_bridge_rpc(bp, responses_b, lock_b):
+        def brpc(id_, method, params=None):
+            msg = {"jsonrpc": "2.0", "id": id_, "method": method}
+            if params is not None:
+                msg["params"] = params
+            bp.stdin.write((json.dumps(msg) + "\n").encode())
+            bp.stdin.flush()
+
+        def wait_b(id_, timeout=30):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                with lock_b:
+                    if id_ in responses_b:
+                        return responses_b[id_]
+                if bp.poll() is not None:
+                    raise AssertionError(f"bridge exited early (code {bp.returncode})")
+                time.sleep(0.05)
+            raise AssertionError(f"timeout waiting for bridge response id={id_}")
+
+        return brpc, wait_b
+
+    def bridge_tool_call(brpc, id_, message):
+        brpc(id_, "tools/call", {"name": "request_slack_message", "arguments": {
+            "message": message,
+            "destination": "#general",
+            "reason": "smoke test (bridged)",
+            "agent": "smoke-agent-2",
+            "conversation": {
+                "title": "Smoke test conversation",
+                "id_or_link": "smoke-bridge",
+                "summary": "A second agent process bridged to the instance.",
+            },
+        }})
+
+    bridge1, bresp1, block1 = spawn_bridge()
+    brpc1, wait_b1 = make_bridge_rpc(bridge1, bresp1, block1)
+    brpc1(101, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                              "clientInfo": {"name": "smoke-bridge", "version": "0"}})
+    r = wait_b1(101)
+    check("bridge: initialize answered by the running instance",
+          r.get("result", {}).get("serverInfo", {}).get("name") == "slack-approval-gateway",
+          json.dumps(r)[:200])
+
+    posts_before = post_count()
+    bridge_tool_call(brpc1, 102, "Bridged request one")
+    wait_tty("Bridged request one")
+    answer("a")
+    r = wait_b1(102)
+    v = verdict(r)
+    check("bridge: approve through the bridge sends via the instance",
+          v.get("status") == "sent" and post_count() == posts_before + 1,
+          json.dumps(v))
+
+    # a second bridge at the same time: concurrent bridged agents
+    bridge2, bresp2, block2 = spawn_bridge()
+    brpc2, wait_b2 = make_bridge_rpc(bridge2, bresp2, block2)
+    brpc2(201, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                              "clientInfo": {"name": "smoke-bridge-2", "version": "0"}})
+    wait_b2(201)
+    bridge_tool_call(brpc2, 202, "Bridged request two")
+    wait_tty("Bridged request two")
+    answer("f bridged feedback")
+    r = wait_b2(202)
+    v = verdict(r)
+    check("bridge: second concurrent bridge gets its own verdict",
+          v.get("status") == "feedback" and v.get("feedback") == "bridged feedback"
+          and post_count() == posts_before + 1,
+          json.dumps(v))
+
+    # closing an agent's stdio ends its bridge cleanly (the instance lives on)
+    bridge1.stdin.close()
+    bridge1.wait(timeout=15)
+    check("bridge exits cleanly when the agent closes stdio", bridge1.returncode == 0,
+          f"code={bridge1.returncode}")
+    bridge2.stdin.close()
+    bridge2.wait(timeout=15)
+    check("second bridge exits cleanly too", bridge2.returncode == 0,
+          f"code={bridge2.returncode}")
+    bridge_err = bridge1.stderr.read().decode(errors="replace")
+    check("bridge logged that it bridged (did not start a second instance)",
+          "bridging MCP stdio" in bridge_err, bridge_err[-300:])
+
     # 8. persistence across restart: cooldown survives a new process
     proc.stdin.close()
     proc.wait(timeout=15)
@@ -392,7 +509,7 @@ try:
         sys.exit(1)
     print("SMOKE TEST PASSED: all checks green")
 finally:
-    for p in (proc,):
+    for p in [proc] + bridges:
         if p.poll() is None:
             p.kill()
     server.shutdown()
