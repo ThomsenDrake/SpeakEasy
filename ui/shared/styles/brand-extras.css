@@ -1,0 +1,17 @@
+/* Tailwind v4 utilities for the few raw-HSL brand tokens base.css defines.
+   Tailwind v4 only auto-generates utilities from --background-color-* / --text-color-* etc.,
+   not from arbitrary HSL components. We expose the brand bits here. */
+
+@theme {
+  --color-brand-orange: hsl(17 96% 52%);
+  --color-brand-orange-bg: hsl(14 86.2% 94.3%);
+  --color-success: hsl(142.1 70.6% 45.3%);
+  --color-warning: hsl(38 92% 50%);
+
+  --background-color-brand-orange: var(--color-brand-orange);
+  --background-color-brand-orange-soft: var(--color-brand-orange-bg);
+  --background-color-success-soft: hsl(142.1 76.2% 36.3% / 0.10);
+  --background-color-warning-soft: hsl(38 92% 50% / 0.10);
+
+  --text-color-brand-orange: var(--color-brand-orange);
+}

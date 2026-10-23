@@ -189,55 +189,70 @@ Public API is fully declared in the stub. Implement:
   content get correctly matched decisions (no mixing); a NEW `Gateway` on
   the same state dir (simulated restart) still returns `cooldown_blocked`.
 
-### `src/ui.rs` — egui/eframe popup
+### `src/ui.rs` — Tauri webview bridge (the approval popup)
 
-- `UiDecisionProvider::channel()`: mpsc channel pair.
-- `request_decision`: create a single-use `mpsc` channel, send
-  `(request.clone(), tx)` into the mpsc, block on `rx.recv()`. If the send
-  fails or the UI side is dropped (app exiting), return
-  `Err(ProviderError("gateway UI is not available; no decision was made"))`.
-  A single-use channel guarantees exactly one decision per request;
-  repeated UI clicks cannot produce a second decision.
-- `run_ui(rx)`: `eframe::run_native` with a single window
-  ("Slack Approval Gateway", ~640x600, resizable). The app keeps a
-  `VecDeque<PendingRequest>` and shows one popup at a time:
-  - Header: request ID, requesting agent, received time.
-  - "Proposed message (exact text)": the verbatim message, wrapped,
-    selectable, monospace.
-  - "Destination (Slack)": destination plus thread timestamp if present.
-    Add a caption clarifying this is the Slack destination — NOT the agent
-    conversation.
-  - "Reason": the reason.
-  - "Originating agent conversation (context only — not a Slack thread)":
-    title, ID/link, summary.
-  - Buttons: **Approve**, **Deny**, **Give feedback**. Give feedback reveals
-    a multiline text edit and a **Submit feedback** button (enabled only
-    when the text is non-empty).
-  - Status line: "N request(s) waiting" and any active cooldowns.
-  - Caption: "Closing this window never approves a message. If the app
-    quits, pending requests fail and the agent is told nothing was sent."
-- On any decision: `Option::take` the current popup (so double-clicks are
-  impossible), send the decision through the reply channel (ignore send errors),
-  show the next queued request.
-- Closing the window exits the app; pending reply senders are dropped, so
-  blocked `request_decision` calls return `Err` — never an approval.
-- Verify with `cargo build` (GUI runtime testing needs a display; the e2e
-  tests cover the decision flow through the core).
+The human-facing popup is the webview frontend in `ui/` — React 19 +
+Tailwind 4 + the **Mistral design system (`@mistral/ui`)**, vendored under
+`ui/shared/` (copied from `mistralai/product-prototypes`' self-contained
+template; components are imported via the `#components/...` path aliases).
+`src/ui.rs` is the Rust↔webview bridge:
+
+- `UiState`: pending-request map (`request_id -> Sender<Result<Decision,
+  ProviderError>>`), an outbox of requests for a not-yet-ready webview,
+  the webview-ready flag, the `AppHandle`, and the gateway (for the
+  cooldown status line).
+- `TauriDecisionProvider::request_decision`: register the request, deliver
+  it to the webview (emit `approval-request`, or queue it in the outbox if
+  the webview is not ready), then block on the single-use reply channel.
+  If the app exits, the sender is dropped and the request fails with
+  `ProviderError` — it is never approved. A single-use channel guarantees
+  exactly one decision per request; repeated UI clicks cannot produce a
+  second decision.
+- Tauri commands invoked by the webview: `submit_decision(request_id,
+  decision)` (first decision wins; repeats and unknown IDs are ignored),
+  `ui_ready` (flushes the outbox — the frontend awaits its `listen()`
+  registration before invoking this so no event is lost), and
+  `get_active_cooldowns`.
+- The frontend (`ui/src/App.tsx`) renders one request at a time with the
+  design-system components (`Button`, `Typography`, `Badge`, `Card`,
+  `Textarea`): the exact proposed message, the Slack destination (with a
+  caption distinguishing it from the agent conversation), the reason, the
+  originating agent conversation (context only — not a Slack thread), the
+  three actions **Approve** / **Deny** / **Give feedback** (feedback text
+  entry enabled only when non-empty), a "N waiting" badge, active deny
+  cooldowns, and the caption "Closing this window never approves a message.
+  If the app quits, pending requests fail and the agent is told nothing was
+  sent."
+- Closing the window exits the app (Tauri default: last window close
+  exits); pending reply senders are dropped, so blocked
+  `request_decision` calls return `Err` — never an approval.
+- Tauri 2 gates `listen`/`invoke` behind **capabilities**:
+  `capabilities/default.json` grants `core:default` to the `main` window.
+  Without it the webview renders but no IPC reaches the backend (a blank
+  queue that never becomes ready).
+- The `tauri` dependency enables the **`custom-protocol`** feature, so
+  every build (debug and release) embeds `ui/dist` and serves it from
+  `tauri://localhost` — no dev server is needed to run the binary. (Without
+  it, Tauri expects a dev server at `devUrl` and the webview stays blank.)
 
 ### `src/main.rs` (already complete — do not modify)
 
 Wires state dir (`SLACK_GATEWAY_STATE_DIR` or `~/.slack-approval-gateway`),
 Slack client, provider, MCP server, and UI. `--cli` selects the terminal
-fallback provider.
+fallback provider. GUI mode builds the Tauri app (managed `UiState`,
+`submit_decision`/`ui_ready`/`get_active_cooldowns` commands, MCP server on
+a background thread) and, after the event loop ends, waits for any
+in-flight approved send to finish before exiting.
 
 ## Build and test
 
-- Rust toolchain is installed (cargo 1.98+). First build compiles eframe/wgpu
-  and can take several minutes; that's expected.
-- `cargo build` must succeed with zero errors.
-- `cargo test` must pass (your module's tests; other modules may still be
-  stubs — do not add tests that exercise other modules' `unimplemented!()`
-  bodies).
+- Rust toolchain (cargo 1.98+) and Node 24+ are installed. The frontend
+  must be built before `cargo build` (Tauri embeds `ui/dist`):
+  `cd ui && npm install && npm run build`.
+- First builds compile Tauri/wry and take several minutes; that's expected.
+- `cargo build` / `cargo build --release` must succeed with zero errors.
+- `cargo test` must pass (core unit tests, slack client tests, MCP e2e
+  tests, and the `UiState` bridge tests).
 - Do not add dependencies beyond those in Cargo.toml unless strictly
   necessary; if you must, keep them minimal and say so in your summary.
 

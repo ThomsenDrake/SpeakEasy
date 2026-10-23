@@ -60,7 +60,7 @@ Semantics:
 ## Requirements
 
 - macOS (developed and tested on macOS arm64; Linux should work)
-- Rust 1.98+ (`rustup`)
+- Rust 1.98+ (`rustup`), Node 24+ (`npm`)
 - A Slack bot token
 - Agents that can run an MCP stdio server on the same machine
 
@@ -93,14 +93,25 @@ Optional environment variables:
 ### 2. Launching the app
 
 ```sh
+# Build the frontend once (Tauri embeds ui/dist into the binary)
+cd ui && npm install && npm run build && cd ..
+
 cargo build --release
 ./target/release/slack-approval-gateway          # GUI mode (default)
 ./target/release/slack-approval-gateway --cli    # terminal approval (headless/SSH)
 ```
 
-- **GUI mode**: an egui popup appears for each request; the MCP server runs
-  on a background thread speaking newline-delimited JSON-RPC on stdio.
-  stdout carries protocol only; diagnostics go to stderr.
+- **GUI mode**: a Tauri webview popup appears for each request, built with
+  the **Mistral design system (`@mistral/ui`)** — React 19 + Tailwind 4,
+  with the DS vendored under `ui/shared/` (from Mistral's
+  `product-prototypes` template). The MCP server runs on a background
+  thread speaking newline-delimited JSON-RPC on stdio. stdout carries
+  protocol only; diagnostics go to stderr. The binary is self-contained:
+  the UI is embedded (Tauri `custom-protocol` feature), so no dev server is
+  needed at runtime.
+- **Development**: after changing `ui/`, run `npm run build` in `ui/` and
+  rebuild the binary; `npm run dev` in `ui/` serves the frontend with hot
+  reload for iterating on components.
 - **CLI mode**: approvals happen on the controlling terminal
   (`a` approve, `d` deny, `f <feedback>`). Concurrent prompts are
   serialized so an answer always reaches the right request.
@@ -167,16 +178,18 @@ only path that sends:
 ## Development
 
 ```sh
-cargo build          # first build compiles eframe/wgpu; takes minutes
-cargo test           # 52 core unit tests + 13 MCP e2e tests + 12 Slack client tests
-cargo test -- --ignored   # also the 15s HTTP timeout test
+cd ui && npm install && npm run build && cd ..   # frontend (required once)
+cargo build --release    # first build compiles Tauri/wry; takes minutes
+cargo test               # 55 lib tests + 13 MCP e2e tests + 12 Slack client tests
+cargo test -- --ignored  # also the 15s HTTP timeout test
 python3 scripts/smoke_test.py   # drives the real binary end to end (mock Slack + pty)
 ```
 
 `docs/SPEC.md` is the module contract (`core` = gateway/cooldowns/dedupe,
 `slack` = the only credential holder, `mcp` = stdio JSON-RPC server,
-`ui` = the egui popup). GUI behavior is verified by build + spec review;
-the decision flows are covered by the test suite and the smoke script.
+`ui` = the Tauri webview bridge). GUI behavior is verified by build + spec
+review plus the IPC bridge unit tests; the decision flows are covered by
+the test suite and the smoke script.
 
 ## Layout
 
@@ -185,9 +198,15 @@ the decision flows are covered by the test suite and the smoke script.
 │                  deny cooldowns, persisted sent-record dedupe, decision flow
 ├── src/slack.rs   Slack Web API client (only place credentials exist)
 ├── src/mcp.rs     MCP stdio server (one tool: request_slack_message)
-├── src/ui.rs      egui/eframe approval popup
+├── src/ui.rs      Tauri webview bridge (decision provider + IPC commands)
 ├── src/main.rs    wiring, state dir, --cli fallback provider
+├── ui/            the approval popup frontend (React + Tailwind 4 +
+│   │              the vendored Mistral @mistral/ui design system)
+│   ├── src/App.tsx        approval popup (DS components)
+│   └── shared/            vendored @mistral/ui components + design tokens
 ├── tests/         unit/integration/e2e tests (mock Slack server, scripted humans)
 ├── scripts/smoke_test.py  end-to-end test of the real binary
-└── docs/SPEC.md   behavioral + module contract
+├── docs/SPEC.md   behavioral + module contract
+├── tauri.conf.json, capabilities/, icons/, build.rs   Tauri shell
+└── README.md
 ```
