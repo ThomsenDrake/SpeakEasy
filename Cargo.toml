@@ -1,0 +1,30 @@
+[package]
+name = "slack-approval-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop approval gateway for agent-initiated Slack messages, exposed to agents as an MCP tool"
+
+[lib]
+name = "slack_approval_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "slack-approval-gateway"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# default-features off only to drop the "clipboard" feature (arboard ->
+# clipboard-win), which keeps the dependency tree lightweight; everything
+# else matches eframe's defaults.
+eframe = { version = "0.37", default-features = false, features = [
+  "accesskit",
+  "default_fonts",
+  "links",
+  "system_fonts",
+  "web_screen_reader",
+  "wgpu",
+  "x11",
+] }
+ureq = { version = "3", features = ["json"] }
