@@ -9,7 +9,7 @@ use slack_approval_gateway::core::{
 use slack_approval_gateway::mcp;
 use slack_approval_gateway::slack::UreqSlackClient;
 use slack_approval_gateway::ui::{self, UiDecisionProvider};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,8 +27,15 @@ fn state_dir() -> PathBuf {
 /// controlling terminal. Never used when the GUI is available.
 struct CliDecisionProvider;
 
+/// Serializes CLI prompts: concurrent `tools/call` workers share /dev/tty,
+/// and a typed answer must never be attributed to the wrong request.
+static CLI_PROMPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl DecisionProvider for CliDecisionProvider {
     fn request_decision(&self, request: &MessageRequest) -> Result<Decision, ProviderError> {
+        let _guard = CLI_PROMPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let r = &request.incoming;
         let mut tty_w = std::fs::OpenOptions::new()
             .write(true)
@@ -118,7 +125,10 @@ fn main() {
 
     if cli_mode {
         let gateway = Arc::new(build_gateway(Arc::new(CliDecisionProvider), &dir));
-        serve_mcp(gateway);
+        serve_mcp(Arc::clone(&gateway));
+        // stdin reached EOF; let any approved send finish and be recorded
+        // before the process exits.
+        gateway.wait_until_no_send_in_progress();
         return;
     }
 
@@ -127,7 +137,11 @@ fn main() {
     let gateway = Arc::new(build_gateway(Arc::new(provider), &dir));
     let mcp_gateway = Arc::clone(&gateway);
     std::thread::spawn(move || serve_mcp(mcp_gateway));
-    if let Err(e) = ui::run_ui(rx) {
+    let ui_result = ui::run_ui_with_cooldowns(rx, Arc::clone(&gateway));
+    // The window was closed: pending requests fail in the provider (never
+    // approved). Let any approved send finish and be recorded before exit.
+    gateway.wait_until_no_send_in_progress();
+    if let Err(e) = ui_result {
         eprintln!("slack-approval-gateway: UI error: {e}");
         std::process::exit(1);
     }
