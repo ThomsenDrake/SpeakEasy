@@ -8,7 +8,7 @@ use slack_approval_gateway::core::{
 };
 use slack_approval_gateway::mcp;
 use slack_approval_gateway::slack::UreqSlackClient;
-use slack_approval_gateway::ui::{self, UiDecisionProvider};
+use slack_approval_gateway::ui;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -132,16 +132,32 @@ fn main() {
         return;
     }
 
-    // GUI mode: MCP server on a background thread, popup on the main thread.
-    let (provider, rx) = UiDecisionProvider::channel();
-    let gateway = Arc::new(build_gateway(Arc::new(provider), &dir));
+    // GUI mode: MCP server on a background thread, Tauri webview (the approval
+    // popup, built with the Mistral design system) on the main thread.
+    let ui_state = Arc::new(ui::UiState::new());
+    let provider = Arc::new(ui::TauriDecisionProvider::new(Arc::clone(&ui_state)));
+    let gateway = Arc::new(build_gateway(provider, &dir));
+    ui_state.set_gateway(Arc::clone(&gateway));
     let mcp_gateway = Arc::clone(&gateway);
     std::thread::spawn(move || serve_mcp(mcp_gateway));
-    let ui_result = ui::run_ui_with_cooldowns(rx, Arc::clone(&gateway));
-    // The window was closed: pending requests fail in the provider (never
-    // approved). Let any approved send finish and be recorded before exit.
+    let ui_state_for_setup = Arc::clone(&ui_state);
+    let result = tauri::Builder::default()
+        .manage(ui_state)
+        .setup(move |app| {
+            ui_state_for_setup.set_app(app.handle().clone());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            ui::submit_decision,
+            ui::ui_ready,
+            ui::get_active_cooldowns
+        ])
+        .run(tauri::generate_context!());
+    // The window was closed and the app is exiting: pending requests fail in
+    // the provider (never approved). Let any approved send finish and be
+    // recorded before the process exits.
     gateway.wait_until_no_send_in_progress();
-    if let Err(e) = ui_result {
+    if let Err(e) = result {
         eprintln!("slack-approval-gateway: UI error: {e}");
         std::process::exit(1);
     }

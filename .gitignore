@@ -4,3 +4,10 @@
 
 # Rust build output
 /target/
+
+# Frontend build output and dependencies
+/ui/node_modules/
+/ui/dist/
+
+# Tauri generated schemas
+/gen/

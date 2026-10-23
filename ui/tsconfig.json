@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "allowImportingTsExtensions": true,
+    "baseUrl": ".",
+    "paths": {
+      "#components/*": ["./shared/ui/components/*"],
+      "#utils/*": ["./shared/ui/utils/*"],
+      "#hooks/*": ["./shared/ui/hooks/*"],
+      "#branding/*": ["./shared/ui/branding/*"],
+      "@ui/*": ["./shared/ui/*"]
+    }
+  },
+  "include": ["src", "vite.config.ts"]
+}

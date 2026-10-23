@@ -78,7 +78,7 @@ pub struct ConversationContext {
 }
 
 /// A message request as submitted by an agent (before the gateway assigns an ID).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IncomingRequest {
     /// The exact proposed message text. Sent verbatim on approval.
     pub message: String,
@@ -95,7 +95,7 @@ pub struct IncomingRequest {
 }
 
 /// A message request with its gateway-assigned ID, shown to the human.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageRequest {
     pub id: String,
     pub incoming: IncomingRequest,
