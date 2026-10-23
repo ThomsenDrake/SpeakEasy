@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::fs::{self, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -200,6 +200,10 @@ pub struct Gateway {
     /// Serializes the check-and-send critical section so two identical
     /// concurrently approved requests cannot both send.
     send_lock: Mutex<()>,
+    /// Number of approved requests currently between the human's decision
+    /// and the end of the send critical section. Used by
+    /// [`Gateway::wait_until_no_send_in_progress`] at shutdown.
+    approvals_in_flight: AtomicUsize,
     state_dir: PathBuf,
 }
 
@@ -252,8 +256,24 @@ impl Gateway {
             provider,
             state: Mutex::new(state),
             send_lock: Mutex::new(()),
+            approvals_in_flight: AtomicUsize::new(0),
             state_dir,
         })
+    }
+
+    /// Block until no approved send is in progress. Shutdown aid: a send
+    /// holds `send_lock` for its whole critical section (dedupe re-check,
+    /// Slack POST, record, persist), and `approvals_in_flight` covers the
+    /// short window between the human's decision and acquiring that lock.
+    /// A request still awaiting a human decision is not sending anything,
+    /// so this never waits on the popup. Returns once no send can be
+    /// mid-flight; callers should invoke it before exiting the process.
+    pub fn wait_until_no_send_in_progress(&self) {
+        while self.approvals_in_flight.load(Ordering::Relaxed) > 0
+            || self.send_lock.try_lock().is_err()
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Handle one agent request end to end. See `docs/SPEC.md` for the exact
@@ -348,6 +368,13 @@ impl Gateway {
     /// filesystem without locking support falls back to in-process
     /// protection.
     fn send_approved(&self, req: &IncomingRequest, hash: String) -> RequestVerdict {
+        self.approvals_in_flight.fetch_add(1, Ordering::Relaxed);
+        let result = self.send_approved_locked(req, hash);
+        self.approvals_in_flight.fetch_sub(1, Ordering::Relaxed);
+        result
+    }
+
+    fn send_approved_locked(&self, req: &IncomingRequest, hash: String) -> RequestVerdict {
         let _send_guard = self
             .send_lock
             .lock()
@@ -749,14 +776,20 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
 }
 
 /// Token-set (Jaccard) similarity between two already-normalized strings.
+/// Token-set similarity between two already-normalized strings,
+/// `0.0..=1.0`. Sørensen–Dice over the token sets
+/// (`2 * |A ∩ B| / (|A| + |B|)`): unlike Jaccard it stays high when a
+/// rewording swaps one or two words in a short message ("please review"
+/// -> "kindly review"), which is exactly the retry shape a deny cooldown
+/// must catch.
 pub fn token_similarity(a: &str, b: &str) -> f64 {
     let a: HashSet<&str> = a.split_whitespace().collect();
     let b: HashSet<&str> = b.split_whitespace().collect();
-    let union = a.union(&b).count();
-    if union == 0 {
+    let total = a.len() + b.len();
+    if total == 0 {
         return 1.0;
     }
-    a.intersection(&b).count() as f64 / union as f64
+    2.0 * a.intersection(&b).count() as f64 / total as f64
 }
 
 /// True when two proposed messages should be treated as the same underlying
@@ -1165,12 +1198,15 @@ mod tests {
     }
 
     #[test]
-    fn token_similarity_is_jaccard_over_token_sets() {
-        assert_eq!(token_similarity("a b c", "b c d"), 0.5);
+    fn token_similarity_is_sorensen_dice_over_token_sets() {
+        assert_eq!(token_similarity("a b c", "b c d"), 2.0 / 3.0);
         assert_eq!(token_similarity("a a b", "b a"), 1.0);
         assert_eq!(token_similarity("a b", "c d"), 0.0);
         assert_eq!(token_similarity("", ""), 1.0);
         assert_eq!(token_similarity("a", ""), 0.0);
+        // A one-word rewording of a short message stays above the threshold.
+        assert!(token_similarity("deploy finished please review",
+                                "deploy finished kindly review") >= TOKEN_SIMILARITY_THRESHOLD);
     }
 
     #[test]

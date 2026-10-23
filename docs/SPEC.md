@@ -54,7 +54,9 @@ Public API is fully declared in the stub. Implement:
 - `similarity`: Levenshtein-based ratio `1 - dist/max(len)` on the two
   normalized strings. Cap compared length at 1000 chars per side (compare
   prefixes) so it stays fast on pathological input.
-- `token_similarity`: Jaccard over whitespace-token sets.
+- `token_similarity`: Sørensen–Dice over whitespace-token sets
+  (`2 * |A ∩ B| / (|A| + |B|)`), so a one-word rewording of a short message
+  stays above the threshold.
 - `same_purpose(a, b)`: true iff `a == b`, or `similarity >= 0.85`, or
   `token_similarity >= 0.7`.
 - `message_hash`: stable hex hash (e.g. `std::collections::hash_map::DefaultHasher`)
