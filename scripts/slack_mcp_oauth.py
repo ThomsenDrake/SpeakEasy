@@ -193,7 +193,7 @@ def main():
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(
-                b"<html><body><h2>Slack approval gateway: authorized.</h2>"
+                b"<html><body><h2>SpeakEasy: authorized.</h2>"
                 b"<p>You can close this window and return to the terminal.</p></body></html>"
             )
 

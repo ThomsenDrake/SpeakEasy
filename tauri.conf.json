@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.dev/config/2",
-  "productName": "Slack Approval Gateway",
+  "productName": "SpeakEasy",
   "version": "0.1.0",
   "identifier": "ai.mistral.slack-approval-gateway",
   "build": {
@@ -10,7 +10,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Slack Approval Gateway",
+        "title": "SpeakEasy",
         "width": 720,
         "height": 780,
         "minWidth": 520,

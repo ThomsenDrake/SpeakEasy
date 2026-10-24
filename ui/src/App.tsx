@@ -308,8 +308,8 @@ export default function App() {
   useEffect(() => {
     document.title =
       queue.length > 0
-        ? `Slack Approval Gateway — ${queue.length} pending`
-        : "Slack Approval Gateway";
+        ? `SpeakEasy — ${queue.length} pending`
+        : "SpeakEasy";
   }, [queue.length]);
 
   const decide = (decision: DecisionPayload) => {
@@ -362,7 +362,7 @@ export default function App() {
             preset="fade-in-blur"
             className="font-display font-strong font-m"
           >
-            Slack Approval Gateway
+            SpeakEasy
           </TextEffect>
         </Row>
         {queue.length > 0 && (
@@ -396,10 +396,10 @@ export default function App() {
 
       <Column as="footer" borderTop paddingX="24" paddingY="12" gap="4">
         <Text variant="body-default-xs" onBackground="neutral-medium">
-          Closing this window hides it and never approves a message; the
-          gateway keeps running (menu-bar icon to reopen or quit). If the
-          gateway quits, pending requests fail and the agent is told nothing
-          was sent.
+          Closing this window hides it and never approves a message;
+          SpeakEasy keeps running (menu-bar icon to reopen or quit). If
+          SpeakEasy quits, pending requests fail and the agent is told
+          nothing was sent.
         </Text>
         {cooldowns.length > 0 && (
           <Row gap="8" vertical="center">
