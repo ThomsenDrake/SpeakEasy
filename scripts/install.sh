@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# install.sh — install the Slack Approval Gateway into every coding agent on
-# this Mac, and keep the gateway itself running as a login service.
+# install.sh — install SpeakEasy (the Slack approval gateway) into every
+# coding agent on this Mac, and keep the gateway itself running as a login
+# service.
 #
 # What it does:
 #   1. Builds the app (frontend + release binary).
@@ -186,7 +187,7 @@ note_skipped() { say "  [skip]      $1"; }
 
 # --------------------------------------------------------------------------- #
 hr
-say "Slack Approval Gateway — install"
+say "SpeakEasy — install"
 hr
 
 if [ "$(uname -s)" != "Darwin" ]; then

@@ -154,12 +154,12 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         app,
         &[
             &MenuItem::with_id(app, "sag-show", "Show approval window", true, None::<&str>)?,
-            &MenuItem::with_id(app, "sag-quit", "Quit gateway", true, None::<&str>)?,
+            &MenuItem::with_id(app, "sag-quit", "Quit SpeakEasy", true, None::<&str>)?,
         ],
     )?;
     let mut builder = TrayIconBuilder::with_id("slack-approval-gateway")
         .menu(&menu)
-        .tooltip("Slack Approval Gateway")
+        .tooltip("SpeakEasy")
         .icon_as_template(true)
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {

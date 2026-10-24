@@ -204,7 +204,7 @@ fn tool_definition() -> Value {
     json!({
         "name": TOOL_NAME,
         "description": "Request human approval to send a Slack message. Nothing is sent until a \
-            human explicitly approves this exact request in the Slack Approval Gateway desktop \
+            human explicitly approves this exact request in the SpeakEasy desktop \
             popup; only then is the exact `message` sent to the exact `destination` (and \
             `thread_ts`, if given). Any change to the content or destination needs a new request \
             and a fresh approval. The call blocks until the human decides. The result is a JSON \

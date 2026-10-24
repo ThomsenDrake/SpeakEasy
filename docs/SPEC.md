@@ -1,4 +1,4 @@
-# Slack Approval Gateway — Implementation Spec
+# SpeakEasy (Slack Approval Gateway) — Implementation Spec
 
 A small local desktop app (Rust) that is the **approval gateway for
 agent-initiated Slack messages**. Agents call one MCP tool,

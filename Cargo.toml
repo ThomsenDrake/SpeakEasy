@@ -2,7 +2,7 @@
 name = "slack-approval-gateway"
 version = "0.1.0"
 edition = "2021"
-description = "Desktop approval gateway for agent-initiated Slack messages, exposed to agents as an MCP tool"
+description = "SpeakEasy: desktop approval gateway for agent-initiated Slack messages, exposed to agents as an MCP tool"
 
 [lib]
 name = "slack_approval_gateway"
