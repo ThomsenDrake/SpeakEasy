@@ -166,6 +166,72 @@ impl std::fmt::Debug for UreqSlackClient {
     }
 }
 
+impl UreqSlackClient {
+    /// `Drake Thomsen (@drake.thomsen)` out of a `users.info` user object.
+    fn user_display(user: &Value) -> Option<String> {
+        let real_name = user.get("real_name").and_then(Value::as_str);
+        let display_name = user
+            .pointer("/profile/display_name")
+            .and_then(Value::as_str);
+        let handle = user.get("name").and_then(Value::as_str);
+        let name = [real_name, display_name, handle]
+            .into_iter()
+            .flatten()
+            .find(|s| !s.is_empty())?;
+        let handle = handle.filter(|h| *h != name);
+        Some(match handle {
+            Some(h) => format!("{name} (@{h})"),
+            None => name.to_string(),
+        })
+    }
+
+    /// `users.info` for a user ID; `None` (with a stderr note) on any failure.
+    fn user_display_by_id(&self, user_id: &str) -> Option<String> {
+        let reply = self
+            .call("users.info", &json!({ "user": user_id }), &[])
+            .map_err(|e| {
+                eprintln!("slack-approval-gateway: users.info failed ({}); showing the raw destination", e.0);
+                e
+            })
+            .ok()?;
+        if !is_ok(&reply) {
+            eprintln!(
+                "slack-approval-gateway: users.info failed ({}); showing the raw destination",
+                error_code(&reply)
+            );
+            return None;
+        }
+        reply.get("user").and_then(Self::user_display)
+    }
+
+    /// `conversations.info` for a channel/group/DM ID: `#name` for
+    /// channels, the DM partner's `Name (@handle)` for DMs. `None` on any
+    /// failure.
+    fn channel_display_by_id(&self, channel_id: &str) -> Option<String> {
+        let reply = self
+            .call("conversations.info", &json!({ "channel": channel_id }), &[])
+            .map_err(|e| {
+                eprintln!("slack-approval-gateway: conversations.info failed ({}); showing the raw destination", e.0);
+                e
+            })
+            .ok()?;
+        if !is_ok(&reply) {
+            eprintln!(
+                "slack-approval-gateway: conversations.info failed ({}); showing the raw destination",
+                error_code(&reply)
+            );
+            return None;
+        }
+        let channel = reply.get("channel")?;
+        if channel.get("is_im").and_then(Value::as_bool) == Some(true) {
+            let user_id = channel.get("user").and_then(Value::as_str)?;
+            return self.user_display_by_id(user_id);
+        }
+        let name = channel.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+        Some(format!("#{name}"))
+    }
+}
+
 impl SlackClient for UreqSlackClient {
     /// `chat.postMessage` with the exact `text` to the exact `destination`,
     /// optionally as a reply in thread `thread_ts`. Resolves a permalink via
@@ -206,6 +272,25 @@ impl SlackClient for UreqSlackClient {
             ts,
             permalink,
         })
+    }
+
+    /// Best-effort display name for the approval popup: `U…` user IDs via
+    /// `users.info`, `C…`/`G…`/`D…` channel IDs via `conversations.info`
+    /// (DMs resolve to the partner's name). `#name`/`@name` destinations
+    /// are already readable and return `None`. Needs the `users:read` and
+    /// `channels:read`/`groups:read`/`im:read` scopes; without them the
+    /// lookups fail and the raw destination is shown.
+    fn resolve_destination(&self, destination: &str) -> Option<String> {
+        let d = destination.trim();
+        if d.len() < 2 || d.starts_with('#') || d.starts_with('@') {
+            return None;
+        }
+        let (kind, _) = d.split_at(1);
+        match kind {
+            "U" => self.user_display_by_id(d),
+            "C" | "G" | "D" => self.channel_display_by_id(d),
+            _ => None,
+        }
     }
 }
 

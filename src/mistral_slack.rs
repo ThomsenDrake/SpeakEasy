@@ -207,6 +207,51 @@ impl MistralConnectorSlackClient {
         read_reply(response, "POST", path)
     }
 
+    /// Call any connector tool with the given arguments and return the
+    /// parsed reply (the caller decides how to treat `isError` metadata).
+    fn call_tool(&self, tool: &str, arguments: Map<String, Value>) -> Result<Value, SlackError> {
+        self.post(
+            &format!("/v1/connectors/{}/tools/{}/call", self.connector, tool),
+            &Value::Object(json_arguments(arguments)),
+        )
+    }
+
+    /// `Drake Thomsen (@drake.thomsen)` out of a `slack_read_user_profile`
+    /// reply (`{"result": "…\nReal Name: …\nUsername: …"}`).
+    fn resolve_user(&self, user_id: &str) -> Option<String> {
+        let mut arguments = Map::new();
+        arguments.insert("user_id".to_string(), Value::String(user_id.to_string()));
+        let reply = self.call_tool("slack_read_user_profile", arguments).ok()?;
+        let result = json_text(&reply)
+            .and_then(|v| v.get("result").and_then(Value::as_str).map(str::to_string))?;
+        let real_name = field_line(&result, "Real Name");
+        let display_name = field_line(&result, "Display Name");
+        let username = field_line(&result, "Username");
+        let name = real_name.or(display_name).or_else(|| username.clone())?;
+        let handle = username.filter(|u| *u != name);
+        Some(match handle {
+            Some(u) => format!("{name} (@{u})"),
+            None => name,
+        })
+    }
+
+    /// `#name` out of a `slack_read_channel` reply, whose first line is
+    /// `Channel: #name (C…)` (or `Channel: DM (D…)`, which is not resolved).
+    fn resolve_channel(&self, channel_id: &str) -> Option<String> {
+        let mut arguments = Map::new();
+        arguments.insert("channel_id".to_string(), Value::String(channel_id.to_string()));
+        arguments.insert("limit".to_string(), Value::from(1));
+        let reply = self.call_tool("slack_read_channel", arguments).ok()?;
+        let messages = json_text(&reply)
+            .and_then(|v| v.get("messages").and_then(Value::as_str).map(str::to_string))?;
+        let first = messages.lines().next()?;
+        let rest = first.strip_prefix("Channel:")?.trim();
+        if rest.starts_with('#') {
+            return Some(rest.split_whitespace().next()?.to_string());
+        }
+        None
+    }
+
     /// The connector's tool list (`GET /v1/connectors/{connector}/tools`).
     fn list_tools(&self) -> Result<Vec<Value>, SlackError> {
         let reply = self.get(
@@ -347,10 +392,7 @@ impl SlackClient for MistralConnectorSlackClient {
                 }
             }
         }
-        let reply = self.post(
-            &format!("/v1/connectors/{}/tools/{}/call", self.connector, tool.name),
-            &Value::Object(json_arguments(arguments)),
-        )?;
+        let reply = self.call_tool(&tool.name, arguments)?;
         // The reply is an MCP CallToolResult: `content` blocks plus metadata
         // (`mcp_meta.isError` / `structuredContent`).
         let meta = reply.get("metadata").and_then(|m| m.get("mcp_meta"));
@@ -375,6 +417,24 @@ impl SlackClient for MistralConnectorSlackClient {
             ts: outcome.ts.unwrap_or_default(),
             permalink,
         })
+    }
+
+    /// Best-effort display name for the approval popup: `U…` user IDs via
+    /// `slack_read_user_profile`, `C…`/`G…` channel IDs via
+    /// `slack_read_channel` (its reply opens with `Channel: #name (ID)`).
+    /// `#name`/`@name` destinations and `D…` DM IDs return `None` (the
+    /// connector has no DM-partner lookup). Any failure returns `None`.
+    fn resolve_destination(&self, destination: &str) -> Option<String> {
+        let d = destination.trim();
+        if d.len() < 2 || d.starts_with('#') || d.starts_with('@') {
+            return None;
+        }
+        let (kind, _) = d.split_at(1);
+        match kind {
+            "U" => self.resolve_user(d),
+            "C" | "G" => self.resolve_channel(d),
+            _ => None,
+        }
     }
 }
 
@@ -515,6 +575,25 @@ fn string_field(obj: &Map<String, Value>, keys: &[&str]) -> Option<String> {
         .find_map(|k| obj.get(*k))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// A tool reply's first text block parsed as JSON (the slack connector
+/// wraps its results in a JSON string: `{"result": …}` / `{"messages": …}`).
+fn json_text(reply: &Value) -> Option<Value> {
+    let text = text_blocks(reply).into_iter().next()?;
+    serde_json::from_str(text).ok()
+}
+
+/// The trimmed value of a `Key: value` line in a formatted tool result.
+fn field_line(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix(key)?
+                .strip_prefix(':')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// The first `https://…` URL in `text` that points at a Slack archive.

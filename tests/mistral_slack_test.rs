@@ -343,6 +343,65 @@ fn new_strips_trailing_slash_and_debug_redacts_key() {
     assert!(!debug.contains(TEST_MISTRAL_KEY), "Debug output leaked the key: {debug}");
 }
 
+#[test]
+fn resolve_destination_resolves_user_and_channel_ids() {
+    let mock = MockMistralServer::start();
+    mock.set_tool_reply_for(
+        "slack_read_user_profile",
+        json!({ "content": [{ "type": "text", "text":
+            "{\"result\":\"User ID: U0DRAKE\\nUsername: drake.thomsen\\nDisplay Name: Drake\\nReal Name: Drake Thomsen\\n\"}"
+        }]}),
+    );
+    mock.set_tool_reply_for(
+        "slack_read_channel",
+        json!({ "content": [{ "type": "text", "text":
+            "{\"messages\":\"Channel: #eng (C0ENG)\\n\\n=== Message from someone ===\"}"
+        }]}),
+    );
+    let client = mock.client();
+
+    // User ID -> "Real Name (@username)" via slack_read_user_profile.
+    assert_eq!(
+        client.resolve_destination("U0DRAKE"),
+        Some("Drake Thomsen (@drake.thomsen)".to_string())
+    );
+    let calls = mock.tool_calls();
+    assert_eq!(
+        calls[0].path,
+        "/v1/connectors/slack/tools/slack_read_user_profile/call"
+    );
+    assert_eq!(calls[0].body, json!({ "arguments": { "user_id": "U0DRAKE" } }));
+    assert_eq!(calls[0].authorization.as_deref(), Some("Bearer mistral-test-key"));
+
+    // Channel ID -> "#name" via slack_read_channel.
+    assert_eq!(client.resolve_destination("C0ENG"), Some("#eng".to_string()));
+    let calls = mock.tool_calls();
+    assert_eq!(
+        calls[1].path,
+        "/v1/connectors/slack/tools/slack_read_channel/call"
+    );
+    assert_eq!(
+        calls[1].body,
+        json!({ "arguments": { "channel_id": "C0ENG", "limit": 1 } })
+    );
+
+    // Names and DM IDs are not resolved, and make no tool call.
+    let before = mock.requests().len();
+    assert_eq!(client.resolve_destination("#eng"), None);
+    assert_eq!(client.resolve_destination("@drake"), None);
+    assert_eq!(client.resolve_destination("D0DRAKE"), None);
+    assert_eq!(mock.requests().len(), before);
+}
+
+#[test]
+fn resolve_destination_returns_none_when_the_tool_fails() {
+    let mock = MockMistralServer::start();
+    mock.set_call_error(Some((500, "boom")));
+    let client = mock.client();
+    assert_eq!(client.resolve_destination("U0DRAKE"), None);
+    assert_eq!(client.resolve_destination("C0ENG"), None);
+}
+
 /// Restores the given environment variables when dropped (even on panic).
 struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 

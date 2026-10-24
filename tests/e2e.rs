@@ -431,6 +431,39 @@ fn approve_sends_exact_message_to_exact_destination_and_thread() {
 }
 
 #[test]
+fn popup_request_carries_resolved_destination_display_but_sends_the_raw_id() {
+    let mock = mock_slack();
+    let provider = Arc::new(ScriptedProvider::new([Decision::Approve, Decision::Approve]));
+    let dir = StateDir::new("e2e-display");
+    let mut client = McpClient::start(gateway(&mock, provider.clone(), &dir));
+    client.initialize();
+
+    // A user ID: the popup sees the resolved display name, the send uses
+    // the exact raw ID.
+    let payload = client.call_tool(args("dm test", "U0DRAKE", None));
+    assert_eq!(payload["status"], "sent", "{payload}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].destination_display.as_deref(),
+        Some("Drake Thomsen (@drake.thomsen)")
+    );
+    assert_eq!(requests[0].incoming.destination, "U0DRAKE");
+    let posts = mock.requests_to("/chat.postMessage");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body_str("channel"), Some("U0DRAKE"));
+
+    // A #name destination is already readable: no display override.
+    let payload = client.call_tool(args("channel test", "#eng", None));
+    assert_eq!(payload["status"], "sent", "{payload}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].destination_display, None);
+
+    client.finish();
+}
+
+#[test]
 fn deny_blocks_reworded_retry_to_same_destination_without_prompt() {
     let mock = mock_slack();
     let provider = Arc::new(ScriptedProvider::new([Decision::Deny]));

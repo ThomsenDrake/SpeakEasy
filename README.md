@@ -30,6 +30,14 @@ destination** (where the message would go) from the **originating agent
 conversation** (context only, not a Slack thread), and offers three actions:
 **Approve**, **Deny**, **Give feedback**.
 
+When the destination is a Slack ID (`U…`, `C…`, `G…`, `D…`), the popup shows
+the resolved **display name** next to the raw ID (e.g.
+`Drake Thomsen (@drake.thomsen)` `U09CV6A19EH`, or `#eng` `C0123`) — the
+gateway resolves it best-effort (direct transport: `users.info` /
+`conversations.info`; connector transport: the connector's
+`slack_read_user_profile` / `slack_read_channel` tools). The raw ID is what
+gets sent; resolution is display-only and never changes the destination.
+
 Return values to the agent:
 
 | `status` | Meaning |
@@ -147,7 +155,11 @@ fail and the agents are told nothing was sent.
    workspace bot).
 2. Under **OAuth & Permissions**, add bot token scopes:
    `chat:write` and `chat:write.public` (`chat.getPermalink` needs no extra
-   scope).
+   scope). For the popup to show **display names for Slack IDs** (e.g.
+   `U09CV6A19EH` → `Drake Thomsen (@drake.thomsen)`, `C0123` → `#eng`), also
+   add `users:read` and `channels:read` (plus `groups:read`/`im:read` for
+   private channels and DMs). Resolution is best-effort: without these
+   scopes the popup shows the raw ID.
 3. Install the app to your workspace and invite the bot to every channel it
    may post to (`/invite @your-bot`).
 4. Give the token to the gateway — **never to the agents** — in one of two

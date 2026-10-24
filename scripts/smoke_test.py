@@ -59,6 +59,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             resp = {"ok": True, "channel": "C123", "ts": "1700000000.000100"}
         elif path == "/chat.getPermalink":
             resp = {"ok": True, "permalink": "https://mock.slack.com/archives/C123/p1700000000000100"}
+        elif path == "/users.info":
+            if body.get("user") == "U0DRAKE":
+                resp = {"ok": True, "user": {"name": "drake.thomsen",
+                                             "real_name": "Drake Thomsen",
+                                             "profile": {"display_name": "Drake"}}}
+            else:
+                resp = {"ok": False, "error": "user_not_found"}
+        elif path == "/conversations.info":
+            if body.get("channel") == "C0ENG":
+                resp = {"ok": True, "channel": {"id": "C0ENG", "name": "eng", "is_im": False}}
+            else:
+                resp = {"ok": False, "error": "channel_not_found"}
         elif path.startswith("/v1/connectors/") and path.endswith("/call"):
             # MCP CallToolResult shaped like the real slack connector: a JSON
             # string inside the text block.
@@ -704,6 +716,111 @@ try:
 
     proc3.stdin.close()
     proc3.wait(timeout=15)
+
+    # 8c. destination display names: a request to a Slack user ID shows the
+    # resolved display name in the prompt, while the send still carries the
+    # exact raw ID.
+    master4, slave4 = pty.openpty()
+
+    def make_ctty4():
+        os.setsid()
+        fcntl.ioctl(slave4, 0x20007461, 0)
+
+    proc4 = subprocess.Popen(
+        [BINARY, "--cli"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, pass_fds=(slave4,), preexec_fn=make_ctty4,
+    )
+    spawned.append(proc4)
+    os.close(slave4)
+    tty_out4 = bytearray()
+
+    def tty_reader4():
+        while True:
+            try:
+                chunk = os.read(master4, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            tty_out4.extend(chunk)
+
+    threading.Thread(target=tty_reader4, daemon=True).start()
+    responses4 = {}
+    resp4_lock = threading.Lock()
+
+    def stdout_reader4():
+        for raw in proc4.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg:
+                with resp4_lock:
+                    responses4[msg["id"]] = msg
+
+    threading.Thread(target=stdout_reader4, daemon=True).start()
+
+    def rpc4(id_, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": id_, "method": method}
+        if params is not None:
+            msg["params"] = params
+        proc4.stdin.write((json.dumps(msg) + "\n").encode())
+        proc4.stdin.flush()
+
+    def wait_response4(id_, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with resp4_lock:
+                if id_ in responses4:
+                    return responses4[id_]
+            time.sleep(0.05)
+        raise AssertionError(f"timeout waiting for response id={id_} (display)")
+
+    def wait_tty4(pattern, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pattern.encode() in tty_out4:
+                return
+            time.sleep(0.05)
+        raise AssertionError(
+            f"timeout waiting for tty pattern {pattern!r}; tty tail: {bytes(tty_out4[-1500:])!r}"
+        )
+
+    def answer4(text):
+        os.write(master4, (text + "\n").encode())
+
+    rpc4(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "smoke-display", "version": "0"}})
+    wait_response4(1)
+    posts_before_disp = post_count()
+    rpc4(2, "tools/call", {"name": "request_slack_message", "arguments": {
+        "message": "Display name resolution test",
+        "destination": "U0DRAKE",
+        "reason": "smoke test (destination display)",
+        "agent": "smoke-agent",
+        "conversation": {"title": "Smoke test conversation", "id_or_link": "smoke-disp",
+                         "summary": "Verifying Slack ID resolution in the prompt."},
+    }})
+    wait_tty4("Destination:   Drake Thomsen (@drake.thomsen) (U0DRAKE)")
+    answer4("a")
+    r = wait_response4(2)
+    v = verdict(r)
+    check("display names: prompt shows the resolved name next to the raw ID",
+          v.get("status") == "sent",
+          json.dumps(v))
+    posts = [b for p, _, b in server.requests
+             if p == "/chat.postMessage" and b.get("text") == "Display name resolution test"]
+    check("display names: the send still carries the exact raw Slack ID",
+          len(posts) == 1 and posts[0].get("channel") == "U0DRAKE"
+          and post_count() == posts_before_disp + 1,
+          f"posts={post_count()}")
+
+    proc4.stdin.close()
+    proc4.wait(timeout=15)
 
     # 9. invalid params -> JSON-RPC error
     print()

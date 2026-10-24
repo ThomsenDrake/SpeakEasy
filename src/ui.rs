@@ -267,6 +267,7 @@ mod tests {
                 },
             },
             received_at: 0,
+            destination_display: None,
         }
     }
 
