@@ -219,9 +219,14 @@ process per state dir:
 ### `src/ui.rs` — Tauri webview bridge (the approval popup)
 
 The human-facing popup is the webview frontend in `ui/` — React 19 +
-Tailwind 4 + the **Mistral design system (`@mistral/ui`)**, vendored under
-`ui/shared/` (copied from `mistralai/product-prototypes`' self-contained
-template; components are imported via the `#components/...` path aliases).
+Tailwind 4 + the OSS **Once UI** design system (`@once-ui-system/core`;
+its tokens and utility layer are imported in `ui/src/styles/globals.css`)
+and animated primitives vendored from **Motion Primitives** under
+`ui/src/components/motion-primitives/` (added with
+`npx motion-primitives add <name>`; they import `cn` from `@/lib/utils`).
+The theme (the `data-theme`/`data-brand`/… attributes on `<html>`) is
+applied in `ui/src/main.tsx`, because the Tauri CSP forbids inline
+scripts.
 `src/ui.rs` is the Rust↔webview bridge:
 
 - `UiState`: pending-request map (`request_id -> Sender<Result<Decision,

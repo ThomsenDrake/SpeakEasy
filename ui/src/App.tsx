@@ -1,31 +1,20 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  Check,
-  Hash,
-  Inbox,
-  MessagesSquare,
-  MessageSquareText,
-  Slack,
-  X,
-} from "lucide-react";
+import { Hash, MessagesSquare, Slack } from "lucide-react";
 
-import { Badge, BadgeIcon } from "#components/ds/badge/badge.tsx";
-import { Button, ButtonLeadIcon } from "#components/ds/button/button.tsx";
-import {
-  Typography,
-  TypographyH2,
-  TypographyP,
-} from "#components/ds/typography/typography.tsx";
-import {
-  Card,
-  CardContent,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "#components/ui/card.tsx";
-import { Textarea } from "#components/ui/textarea.tsx";
+import { Button } from "@once-ui-system/core/components/Button";
+import { Column } from "@once-ui-system/core/components/Column";
+import { Icon } from "@once-ui-system/core/components/Icon";
+import { Row } from "@once-ui-system/core/components/Row";
+import { StatusIndicator } from "@once-ui-system/core/components/StatusIndicator";
+import { Tag } from "@once-ui-system/core/components/Tag";
+import { Text } from "@once-ui-system/core/components/Text";
+import { Textarea } from "@once-ui-system/core/components/Textarea";
+
+import { AnimatedNumber } from "@/components/motion-primitives/animated-number";
+import { Spotlight } from "@/components/motion-primitives/spotlight";
+import { TextEffect } from "@/components/motion-primitives/text-effect";
 
 // Mirrors the Rust types in src/core.rs (MessageRequest / IncomingRequest /
 // ConversationContext), serialized over Tauri events.
@@ -55,6 +44,32 @@ type DecisionPayload =
 
 type Cooldown = [destination: string, excerpt: string, remainingSecs: number];
 
+// `?demo` seeds a sample request so the popup can be inspected in a plain
+// browser (`vite preview`, optionally with `&theme=dark`) without a running
+// gateway. It is inert inside the Tauri app, where the URL has no query.
+const DEMO = new URLSearchParams(window.location.search).has("demo");
+
+const demoRequest: MessageRequest = {
+  id: "demo-0001",
+  incoming: {
+    message:
+      "Heads-up: gateway v0.3 finished deploying — 12/12 checks green. Rolling out to the remaining workspaces now.",
+    destination: "#eng-deploys",
+    thread_ts: "1729612800.123456",
+    reason:
+      "The team asked for deploy notifications in this channel; the canary passed and the runbook says to announce.",
+    agent: "claude-code",
+    conversation: {
+      title: "Ship gateway v0.3",
+      id_or_link:
+        "https://app.superset.sh/workspaces/speakeasy/tasks/deploy-gateway-v03",
+      summary:
+        "Agent finished the release checklist (build, tests, smoke test, changelog) and asks to announce the deploy in #eng-deploys.",
+    },
+  },
+  received_at: Math.floor(Date.now() / 1000),
+};
+
 function Section({
   label,
   hint,
@@ -62,20 +77,20 @@ function Section({
 }: {
   label: string;
   hint?: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
-    <div className="space-y-1.5">
-      <TypographyP size="xs" weight="medium" variant="subtle">
+    <Column gap="8">
+      <Text variant="label-default-xs" onBackground="neutral-medium">
         {label}
-      </TypographyP>
+      </Text>
       {children}
       {hint && (
-        <TypographyP size="xs" variant="hint">
+        <Text variant="body-default-xs" onBackground="neutral-medium">
           {hint}
-        </TypographyP>
+        </Text>
       )}
-    </div>
+    </Column>
   );
 }
 
@@ -93,144 +108,148 @@ function RequestCard({
   const { incoming } = request;
 
   return (
-    <Card className="mx-auto w-full max-w-2xl">
-      <CardHeader>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <CardTitle>
-            <TypographyH2 size="lg" weight="semibold">
-              Message approval request
-            </TypographyH2>
-          </CardTitle>
-          <Badge variant="purple" shape="pill">
-            {incoming.agent}
-          </Badge>
-        </div>
-        <TypographyP size="xs" variant="muted">
-          Request {request.id} · received{" "}
-          {new Date(request.received_at * 1000).toLocaleTimeString()}
-        </TypographyP>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        <Section label="Proposed message (exact text)">
-          <Typography
-            tag="div"
-            size="sm"
-            className="whitespace-pre-wrap break-words rounded-md border border-default bg-subtle px-3 py-2 font-mono"
+    <Column background="surface" border radius="l" padding="24" gap="20">
+      <Spotlight size={260} />
+      <Row horizontal="between" vertical="start" gap="16" wrap>
+        <Column gap="4">
+          <Text variant="display-strong-s" as="h2">
+            Message approval request
+          </Text>
+          <Text variant="body-default-xs" onBackground="neutral-medium">
+            Request {request.id} · received{" "}
+            {new Date(request.received_at * 1000).toLocaleTimeString()}
+          </Text>
+        </Column>
+        <Tag scheme="brand" prefixIcon="person" label={incoming.agent} />
+      </Row>
+
+      <Section label="Proposed message (exact text)">
+        <Column background="page" border radius="m" padding="12">
+          <Text
+            variant="code-default-s"
+            style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
           >
             {incoming.message}
-          </Typography>
-        </Section>
+          </Text>
+        </Column>
+      </Section>
 
-        <Section
-          label="Destination (Slack)"
-          hint="Where the message would be sent — this is not the agent conversation."
-        >
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="blue">
-              <BadgeIcon icon={Hash} />
-              {incoming.destination}
-            </Badge>
-            {incoming.thread_ts && (
-              <Badge variant="neutral">thread {incoming.thread_ts}</Badge>
-            )}
-          </div>
-        </Section>
+      <Section
+        label="Destination (Slack)"
+        hint="Where the message would be sent — this is not the agent conversation."
+      >
+        <Row gap="8" vertical="center" wrap>
+          <Row gap="4" vertical="center" onBackground="info-medium">
+            <Hash size={14} aria-hidden />
+            <Tag scheme="info" label={incoming.destination} />
+          </Row>
+          {incoming.thread_ts && (
+            <Tag
+              scheme="neutral"
+              size="s"
+              label={`thread ${incoming.thread_ts}`}
+            />
+          )}
+        </Row>
+      </Section>
 
-        <Section label="Reason">
-          <TypographyP size="sm">{incoming.reason}</TypographyP>
-        </Section>
+      <Section label="Reason">
+        <Text variant="body-default-s">{incoming.reason}</Text>
+      </Section>
 
-        <Section
-          label="Originating agent conversation"
-          hint="Context only — not a Slack thread."
-        >
-          <div className="space-y-1 rounded-md border border-default bg-card-subtle p-3">
-            <div className="flex items-center gap-2">
-              <MessagesSquare className="size-4 shrink-0 text-icon-subtle" />
-              <TypographyP size="sm" weight="semibold">
-                {incoming.conversation.title}
-              </TypographyP>
-            </div>
-            <TypographyP
-              size="xs"
-              variant="subtle"
-              className="break-all font-mono"
-            >
-              {incoming.conversation.id_or_link}
-            </TypographyP>
-            <TypographyP size="sm" variant="muted">
-              {incoming.conversation.summary}
-            </TypographyP>
-          </div>
-        </Section>
-      </CardContent>
-      <CardFooter className="flex-col items-stretch gap-3">
+      <Section
+        label="Originating agent conversation"
+        hint="Context only — not a Slack thread."
+      >
+        <Column background="page" border radius="m" padding="16" gap="8">
+          <Row gap="8" vertical="center" onBackground="neutral-strong">
+            <MessagesSquare size={16} aria-hidden />
+            <Text variant="body-strong-s">{incoming.conversation.title}</Text>
+          </Row>
+          <Text
+            variant="code-default-xs"
+            onBackground="neutral-medium"
+            style={{ overflowWrap: "anywhere" }}
+          >
+            {incoming.conversation.id_or_link}
+          </Text>
+          <Text variant="body-default-s" onBackground="neutral-medium">
+            {incoming.conversation.summary}
+          </Text>
+        </Column>
+      </Section>
+
+      <Column gap="12">
         {feedbackMode && (
-          <div className="space-y-2">
+          <Column gap="8">
             <Textarea
+              id="feedback"
+              label="Feedback for the requesting agent"
+              placeholder="Tell the agent what to change…"
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
-              placeholder="Tell the requesting agent what to change…"
-              className="min-h-[80px]"
+              disabled={deciding}
+              focusRing
             />
-            <Button
-              variant="secondary"
-              size="sm"
-              isDisabled={!feedback.trim() || deciding}
-              onClick={() =>
-                onDecide({ type: "feedback", feedback: feedback.trim() })
-              }
-            >
-              <ButtonLeadIcon icon={MessageSquareText} />
-              Submit feedback
-            </Button>
-          </div>
+            <Row horizontal="end">
+              <Button
+                variant="secondary"
+                size="s"
+                prefixIcon="chat"
+                label="Submit feedback"
+                disabled={deciding || !feedback.trim()}
+                onClick={() =>
+                  onDecide({ type: "feedback", feedback: feedback.trim() })
+                }
+              />
+            </Row>
+          </Column>
         )}
-        <div className="flex flex-wrap items-center justify-end gap-2">
+        <Row horizontal="end" gap="8" wrap>
           <Button
-            variant="soft"
-            isDisabled={deciding}
+            variant="secondary"
+            size="s"
+            prefixIcon="chat"
+            label="Give feedback"
+            disabled={deciding}
             onClick={() => setFeedbackMode((v) => !v)}
-          >
-            <ButtonLeadIcon icon={MessageSquareText} />
-            Give feedback
-          </Button>
+          />
           <Button
-            variant="destructive"
-            isDisabled={deciding}
+            variant="danger"
+            size="s"
+            prefixIcon="close"
+            label="Deny"
+            disabled={deciding}
             onClick={() => onDecide({ type: "deny" })}
-          >
-            <ButtonLeadIcon icon={X} />
-            Deny
-          </Button>
+          />
           <Button
             variant="primary"
-            isDisabled={deciding}
+            size="s"
+            prefixIcon="check"
+            label="Approve"
+            disabled={deciding}
             onClick={() => onDecide({ type: "approve" })}
-          >
-            <ButtonLeadIcon icon={Check} />
-            Approve
-          </Button>
-        </div>
-      </CardFooter>
-    </Card>
+          />
+        </Row>
+      </Column>
+    </Column>
   );
 }
 
 function EmptyState() {
   return (
-    <Card className="mx-auto w-full max-w-2xl">
-      <CardContent className="flex flex-col items-center gap-3 py-16 text-center">
-        <Inbox className="size-8 text-icon-muted" />
-        <TypographyP size="lg" weight="medium">
-          Waiting for agent requests
-        </TypographyP>
-        <TypographyP size="sm" variant="muted">
-          When an agent asks to send a Slack message, it appears here for your
-          approval.
-        </TypographyP>
-      </CardContent>
-    </Card>
+    <Column background="surface" border radius="l" padding="48" center gap="12">
+      <Icon name="inbox" size="l" onBackground="neutral-medium" />
+      <Text variant="body-strong-m">Waiting for agent requests</Text>
+      <Text
+        variant="body-default-s"
+        onBackground="neutral-medium"
+        align="center"
+      >
+        When an agent asks to send a Slack message, it appears here for your
+        approval.
+      </Text>
+    </Column>
   );
 }
 
@@ -259,11 +278,20 @@ export default function App() {
       invoke<Cooldown[]>("get_active_cooldowns")
         .then(setCooldowns)
         .catch(() => {});
-    })();
+    })().catch(() => {
+      // Outside Tauri (vite preview) there is no IPC; the demo seed below
+      // stands in for live requests.
+    });
     return () => {
       cancelled = true;
       unlisten?.();
     };
+  }, []);
+
+  useEffect(() => {
+    if (!DEMO) return;
+    setQueue([demoRequest]);
+    setCooldowns([["#eng-deploys", "Heads-up: gateway v0.3…", 7 * 60 + 23]]);
   }, []);
 
   useEffect(() => {
@@ -294,53 +322,89 @@ export default function App() {
   };
 
   return (
-    <div className="flex min-h-screen flex-col bg-default text-default">
-      <header className="flex items-center justify-between gap-2 border-b border-default px-6 py-4">
-        <div className="flex items-center gap-2">
-          <Slack className="size-5 text-icon-default" />
-          <TypographyH2 size="lg" weight="semibold">
-            Slack Approval Gateway
-          </TypographyH2>
-        </div>
-        {queue.length > 0 && (
-          <Badge variant="orange" shape="pill">
-            {queue.length} waiting
-          </Badge>
-        )}
-      </header>
-
-      <main className="flex-1 overflow-y-auto p-6">
-        {current ? (
-          <RequestCard
-            key={current.id}
-            request={current}
-            deciding={deciding}
-            onDecide={decide}
+    <Column
+      fillWidth
+      fillHeight
+      background="page"
+      onBackground="neutral-strong"
+      overflow="hidden"
+    >
+      <Row
+        as="header"
+        horizontal="between"
+        vertical="center"
+        gap="16"
+        paddingX="24"
+        paddingY="16"
+        borderBottom
+        wrap
+      >
+        <Row gap="8" vertical="center">
+          <Slack
+            size={20}
+            aria-hidden
+            style={{ color: "var(--brand-on-background-strong)" }}
           />
-        ) : (
-          <EmptyState />
+          <TextEffect
+            as="h2"
+            per="word"
+            preset="fade-in-blur"
+            className="font-display font-strong font-m"
+          >
+            Slack Approval Gateway
+          </TextEffect>
+        </Row>
+        {queue.length > 0 && (
+          <Tag scheme="warning">
+            <AnimatedNumber value={queue.length} /> waiting
+          </Tag>
         )}
-      </main>
+      </Row>
 
-      <footer className="space-y-1 border-t border-default px-6 py-3">
-        <TypographyP size="xs" variant="hint">
+      <Column
+        as="main"
+        flex="1"
+        fillWidth
+        overflowY="auto"
+        horizontal="center"
+        padding="24"
+      >
+        <Column fillWidth maxWidth="l">
+          {current ? (
+            <RequestCard
+              key={current.id}
+              request={current}
+              deciding={deciding}
+              onDecide={decide}
+            />
+          ) : (
+            <EmptyState />
+          )}
+        </Column>
+      </Column>
+
+      <Column as="footer" borderTop paddingX="24" paddingY="12" gap="4">
+        <Text variant="body-default-xs" onBackground="neutral-medium">
           Closing this window hides it and never approves a message; the
           gateway keeps running (menu-bar icon to reopen or quit). If the
           gateway quits, pending requests fail and the agent is told nothing
           was sent.
-        </TypographyP>
+        </Text>
         {cooldowns.length > 0 && (
-          <TypographyP size="xs" variant="warning">
-            Deny cooldowns active:{" "}
-            {cooldowns
-              .map(
-                ([destination, , remaining]) =>
-                  `${destination} (${Math.ceil(remaining / 60)} min left)`,
-              )
-              .join(", ")}
-          </TypographyP>
+          <Row gap="8" vertical="center">
+            <StatusIndicator size="s" color="warning" />
+            <Text variant="body-default-xs" onBackground="warning-medium">
+              Deny cooldowns active:{" "}
+              {cooldowns
+                .map(
+                  ([destination, , remaining]) =>
+                    `${destination} (${Math.ceil(remaining / 60)} min left)`,
+                )
+                .join(", ")}
+            </Text>
+          </Row>
         )}
-      </footer>
-    </div>
+      </Column>
+    </Column>
   );
 }
