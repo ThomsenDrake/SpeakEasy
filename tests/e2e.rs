@@ -1,10 +1,12 @@
 //! End-to-end tests: JSON-RPC over a Unix socket pair -> `mcp::run` ->
-//! `Gateway` (scripted human decisions) -> real `UreqSlackClient` -> mock
-//! Slack Web API.
+//! `Gateway` (scripted human decisions) -> real `SlackMcpClient` -> mock
+//! Slack MCP server.
 
 mod common;
 
-use common::{mock_channel_id, temp_state_dir, MockSlackServer, ScriptedProvider, TEST_TOKEN};
+use common::{
+    mock_channel_id, temp_state_dir, MockSlackMcpServer, ScriptedProvider, TEST_SLACK_MCP_TOKEN,
+};
 use serde_json::{json, Value};
 use slack_approval_gateway::core::{
     Decision, DecisionProvider, Gateway, MessageRequest, ProviderError, COOLDOWN_SECS,
@@ -31,11 +33,11 @@ const COOLDOWN_NOTE: &str =
 // Harness
 // ---------------------------------------------------------------------------
 
-/// Start a mock Slack API. If a proxy is configured, first make sure
+/// Start a mock Slack MCP server. If a proxy is configured, first make sure
 /// requests to the mock bypass it (the client reads the proxy variables when
 /// it is built). Every test calls this before building any client, so the
 /// one-time environment change happens before anything reads it.
-fn mock_slack() -> MockSlackServer {
+fn mock_slack() -> MockSlackMcpServer {
     static BYPASS_PROXY: Once = Once::new();
     BYPASS_PROXY.call_once(|| {
         let proxy_vars = [
@@ -56,17 +58,22 @@ fn mock_slack() -> MockSlackServer {
             }
         }
     });
-    MockSlackServer::start()
+    MockSlackMcpServer::start()
 }
 
 /// A gateway that sends through a real client pointed at `mock`.
 fn gateway(
-    mock: &MockSlackServer,
+    mock: &MockSlackMcpServer,
     provider: Arc<dyn DecisionProvider>,
     dir: &Path,
 ) -> Arc<Gateway> {
+    let client = mock.client();
+    // Building the client runs the MCP handshake (initialize +
+    // notifications/initialized); clear it so request assertions see only
+    // the test's own traffic (earlier gateways' sends stay recorded).
+    mock.clear_handshake();
     let gateway =
-        Gateway::new(Arc::new(mock.client()), provider, dir.to_path_buf()).expect("create gateway");
+        Gateway::new(Arc::new(client), provider, dir.to_path_buf()).expect("create gateway");
     Arc::new(gateway)
 }
 
@@ -409,21 +416,15 @@ fn approve_sends_exact_message_to_exact_destination_and_thread() {
         })
     );
 
-    let posts = mock.requests_to("/chat.postMessage");
-    assert_eq!(posts.len(), 1);
+    let sends = mock.calls_to("slack_send_message");
+    assert_eq!(sends.len(), 1);
     assert_eq!(
-        posts[0].authorization.as_deref(),
-        Some(format!("Bearer {TEST_TOKEN}").as_str())
+        sends[0].authorization.as_deref(),
+        Some(format!("Bearer {TEST_SLACK_MCP_TOKEN}").as_str())
     );
     assert_eq!(
-        posts[0].body,
-        json!({ "channel": "#deploys", "text": message, "thread_ts": "1699999999.000200" })
-    );
-    let permalinks = mock.requests_to("/chat.getPermalink");
-    assert_eq!(permalinks.len(), 1);
-    assert_eq!(
-        permalinks[0].body_str("message_ts"),
-        Some("1700000000.000001")
+        sends[0].body["params"]["arguments"],
+        json!({ "channel_id": "#deploys", "message": message, "thread_ts": "1699999999.000200" })
     );
     assert_eq!(provider.seen_messages(), vec![message.to_string()]);
 
@@ -449,9 +450,22 @@ fn popup_request_carries_resolved_destination_display_but_sends_the_raw_id() {
         Some("Drake Thomsen (@drake.thomsen)")
     );
     assert_eq!(requests[0].incoming.destination, "U0DRAKE");
-    let posts = mock.requests_to("/chat.postMessage");
-    assert_eq!(posts.len(), 1);
-    assert_eq!(posts[0].body_str("channel"), Some("U0DRAKE"));
+    let sends = mock.calls_to("slack_send_message");
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0]
+            .body
+            .pointer("/params/arguments/channel_id")
+            .and_then(Value::as_str),
+        Some("U0DRAKE")
+    );
+    // The display name came from a user lookup, not from the send.
+    let lookups = mock.calls_to("slack_read_user_profile");
+    assert_eq!(lookups.len(), 1);
+    assert_eq!(
+        lookups[0].body["params"]["arguments"],
+        json!({ "user_id": "U0DRAKE" })
+    );
 
     // A #name destination is already readable: no display override.
     let payload = client.call_tool(args("channel test", "#eng", None));
@@ -498,7 +512,7 @@ fn deny_blocks_reworded_retry_to_same_destination_without_prompt() {
     // No popup for the blocked retry, and nothing reached Slack.
     assert_eq!(provider.call_count(), 1);
     assert_eq!(provider.seen_messages(), vec![original.to_string()]);
-    assert_eq!(mock.post_count(), 0);
+    assert_eq!(mock.send_count(), 0);
 
     // The cooldown is per destination: the same text elsewhere is asked about.
     provider.push(Decision::Feedback("Not to #random either.".into()));
@@ -528,7 +542,7 @@ fn feedback_is_returned_without_sending_and_revision_needs_new_approval() {
         payload,
         json!({ "status": "feedback", "feedback": feedback })
     );
-    assert_eq!(mock.post_count(), 0);
+    assert_eq!(mock.send_count(), 0);
     assert!(
         mock.requests().is_empty(),
         "no Slack call at all: {:?}",
@@ -547,9 +561,15 @@ fn feedback_is_returned_without_sending_and_revision_needs_new_approval() {
         provider.seen_messages(),
         vec![draft.to_string(), revised.to_string()]
     );
-    let posts = mock.requests_to("/chat.postMessage");
-    assert_eq!(posts.len(), 1);
-    assert_eq!(posts[0].body_str("text"), Some(revised));
+    let sends = mock.calls_to("slack_send_message");
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0]
+            .body
+            .pointer("/params/arguments/message")
+            .and_then(Value::as_str),
+        Some(revised)
+    );
 
     client.finish();
 }
@@ -566,7 +586,7 @@ fn identical_retry_after_approval_is_a_duplicate_and_not_resent() {
     let first = client.call_tool(args(message, "C0METRICS", Some("1700000500.000100")));
     assert_eq!(first["status"], "sent", "{first}");
     assert_eq!(first["duplicate"], false);
-    assert_eq!(mock.post_count(), 1);
+    assert_eq!(mock.send_count(), 1);
 
     // The identical request (even from another agent) returns the cached
     // result: no popup, no second post.
@@ -582,7 +602,7 @@ fn identical_retry_after_approval_is_a_duplicate_and_not_resent() {
             "duplicate": true,
         })
     );
-    assert_eq!(mock.post_count(), 1);
+    assert_eq!(mock.send_count(), 1);
     assert_eq!(provider.call_count(), 1);
 
     // Approval covers only that exact request: another thread is a new
@@ -592,7 +612,7 @@ fn identical_retry_after_approval_is_a_duplicate_and_not_resent() {
     assert_eq!(other_thread["status"], "error", "{other_thread}");
     assert!(other_thread["error"].is_string(), "{other_thread}");
     assert_eq!(provider.call_count(), 2);
-    assert_eq!(mock.post_count(), 1);
+    assert_eq!(mock.send_count(), 1);
 
     client.finish();
 }
@@ -681,9 +701,12 @@ fn concurrent_requests_get_their_own_decisions() {
     );
 
     // Only the approved request reached Slack, exactly as requested.
-    let posts = mock.requests_to("/chat.postMessage");
-    assert_eq!(posts.len(), 1);
-    assert_eq!(posts[0].body, json!({ "channel": "#alpha", "text": alpha }));
+    let sends = mock.calls_to("slack_send_message");
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0].body["params"]["arguments"],
+        json!({ "channel_id": "#alpha", "message": alpha })
+    );
 
     client.finish();
 }
@@ -724,7 +747,7 @@ fn deny_cooldown_survives_restart() {
     assert!((590..=600).contains(&remaining), "remaining {remaining}");
 
     assert_eq!(provider.call_count(), 0, "no popup after restart");
-    assert_eq!(mock.post_count(), 0);
+    assert_eq!(mock.send_count(), 0);
     client.finish();
 }
 
@@ -748,7 +771,7 @@ fn approved_send_is_deduplicated_after_restart() {
         json!({ "status": "sent", "ts": first["ts"], "permalink": first["permalink"], "duplicate": true })
     );
     assert_eq!(provider.call_count(), 0);
-    assert_eq!(mock.post_count(), 1);
+    assert_eq!(mock.send_count(), 1);
     client.finish();
 }
 
@@ -763,7 +786,7 @@ fn slack_failure_is_a_tool_error_and_records_nothing() {
     let mut client = McpClient::start(gateway(&mock, provider.clone(), &dir));
     client.initialize();
 
-    mock.set_post_message_error(Some("channel_not_found"));
+    mock.set_send_error(Some("channel_not_found"));
     let message = "Standup moved to 10:30 today.";
     let result = client.result(
         "tools/call",
@@ -776,12 +799,12 @@ fn slack_failure_is_a_tool_error_and_records_nothing() {
     assert!(error.contains("channel_not_found"), "{error}");
 
     // Nothing was recorded as sent: a retry asks again and sends.
-    mock.set_post_message_error(None);
+    mock.set_send_error(None);
     let payload = client.call_tool(args(message, "#nope", None));
     assert_eq!(payload["status"], "sent", "{payload}");
     assert_eq!(payload["duplicate"], false);
     assert_eq!(provider.call_count(), 2);
-    assert_eq!(mock.post_count(), 2);
+    assert_eq!(mock.send_count(), 2);
 
     client.finish();
 }
@@ -1009,7 +1032,7 @@ fn panic_while_handling_a_call_is_a_tool_error_and_the_server_keeps_running() {
     assert!(error.contains("internal gateway error"), "{error}");
 
     assert_eq!(client.result("ping", json!({})), json!({}));
-    assert_eq!(mock.post_count(), 0);
+    assert_eq!(mock.send_count(), 0);
     client.finish();
 }
 

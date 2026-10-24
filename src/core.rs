@@ -36,8 +36,8 @@ const SIMILARITY_MAX_CHARS: usize = 1000;
 /// Length (in chars) of the message excerpt stored with a deny cooldown.
 const EXCERPT_CHARS: usize = 80;
 
-/// Slack truncates `chat.postMessage` text beyond this many characters, so a
-/// longer message could not be sent exactly as approved.
+/// Slack truncates message text beyond this many characters, so a longer
+/// message could not be sent exactly as approved.
 const MAX_MESSAGE_CHARS: usize = 40_000;
 
 const COOLDOWNS_FILE: &str = "cooldowns.json";

@@ -105,8 +105,9 @@ fn build_gateway(provider: Arc<dyn DecisionProvider>, dir: &PathBuf) -> Gateway 
         Ok(c) => c,
         Err(e) => {
             eprintln!("slack-approval-gateway: cannot initialize Slack client: {}", e.0);
-            eprintln!("Direct transport (default): set SLACK_BOT_TOKEN, or create {}/slack_token (chmod 600)", dir.display());
-            eprintln!("with a bot token that has the chat:write and chat:write.public scopes.");
+            eprintln!("Slack MCP transport (default): set SLACK_MCP_TOKEN, or create {}/slack_mcp_token (chmod 600)", dir.display());
+            eprintln!("with a Slack user OAuth token (run scripts/slack_mcp_oauth.py to get one;");
+            eprintln!("it needs the chat:write, users:read and channels:read scopes).");
             eprintln!("Mistral Slack Connector transport (SLACK_TRANSPORT=mistral-connector): set MISTRAL_API_KEY,");
             eprintln!("or create {}/mistral_api_key (chmod 600), and connect the Slack workspace to the", dir.display());
             eprintln!("Slack connector in the Mistral console.");

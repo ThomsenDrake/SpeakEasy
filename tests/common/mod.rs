@@ -1,7 +1,8 @@
 //! Shared helpers for the integration tests.
 //!
-//! - [`MockSlackServer`]: a local stand-in for the Slack Web API. It records
-//!   every request and replies with canned JSON.
+//! - [`MockSlackMcpServer`]: a local stand-in for the official Slack MCP
+//!   server (MCP Streamable HTTP: JSON-RPC POSTs, JSON or SSE replies). It
+//!   records every request and replies with canned JSON-RPC results.
 //! - [`MockMistralServer`]: a local stand-in for the Mistral platform API
 //!   (connector tool listing and tool calls). Same recording contract.
 //! - [`ScriptedProvider`]: a [`DecisionProvider`] that replays scripted
@@ -15,7 +16,7 @@
 use serde_json::{json, Value};
 use slack_approval_gateway::core::{Decision, DecisionProvider, MessageRequest, ProviderError};
 use slack_approval_gateway::mistral_slack::MistralConnectorSlackClient;
-use slack_approval_gateway::slack::UreqSlackClient;
+use slack_approval_gateway::slack_mcp::SlackMcpClient;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -25,9 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Bot token used by [`MockSlackServer::client`]. Requests made with it carry
-/// `Authorization: Bearer xoxb-test-token`.
-pub const TEST_TOKEN: &str = "xoxb-test-token";
+/// Slack user OAuth token used by [`MockSlackMcpServer::client`]. Requests
+/// made with it carry `Authorization: Bearer xoxp-slack-mcp-test-token`.
+pub const TEST_SLACK_MCP_TOKEN: &str = "xoxp-slack-mcp-test-token";
 
 /// Mistral API key used by [`MockMistralServer::client`]. Requests made with
 /// it carry `Authorization: Bearer mistral-test-key`.
@@ -40,7 +41,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Routing and recording interface shared by the mock API servers
-/// ([`MockSlackServer`], [`MockMistralServer`]).
+/// ([`MockSlackMcpServer`], [`MockMistralServer`]).
 trait MockApi: Send + Sync {
     /// The canned reply for one request (computed before recording).
     fn route(&self, req: &RecordedRequest) -> Reply;
@@ -54,15 +55,15 @@ trait MockApi: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Mock Slack Web API
+// Mock Slack MCP server (the official Slack MCP endpoint, locally)
 // ---------------------------------------------------------------------------
 
-/// One HTTP request received by [`MockSlackServer`].
+/// One HTTP request received by a mock server.
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
     /// HTTP method, e.g. `POST`.
     pub method: String,
-    /// Request path without the query string, e.g. `/chat.postMessage`.
+    /// Request path without the query string, e.g. `/mcp`.
     pub path: String,
     /// Raw query string without the leading `?`, if any.
     pub query: Option<String>,
@@ -70,6 +71,8 @@ pub struct RecordedRequest {
     pub authorization: Option<String>,
     /// Value of the `Content-Type` header, if present.
     pub content_type: Option<String>,
+    /// Every request header, with lowercased names.
+    pub headers: Vec<(String, String)>,
     /// Parsed JSON body; `Value::Null` if the body was empty or not JSON.
     pub body: Value,
 }
@@ -79,40 +82,62 @@ impl RecordedRequest {
     pub fn body_str(&self, key: &str) -> Option<&str> {
         self.body.get(key).and_then(Value::as_str)
     }
+
+    /// A request header value by lowercased name, e.g.
+    /// `req.header("mcp-session-id")`.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
-/// State shared between the server handle and its connection threads.
-struct MockState {
+/// State shared between the mock Slack MCP server handle and its threads.
+struct MockSlackMcpState {
     requests: Mutex<Vec<RecordedRequest>>,
-    post_message_error: Mutex<Option<String>>,
-    post_message_raw_reply: Mutex<Option<String>>,
-    permalink_error: Mutex<Option<String>>,
-    /// When set, `users.info` and `conversations.info` fail with this error
-    /// (to exercise the resolver's fallback to the raw destination).
-    lookup_error: Mutex<Option<String>>,
+    /// The server's tool catalog, served by `tools/list`.
+    tools: Mutex<Vec<Value>>,
+    /// Exact CallToolResult for every tool call when set (`None` = the
+    /// default replies).
+    tool_reply: Mutex<Option<Value>>,
+    /// Per-tool-name CallToolResult overrides (checked before `tool_reply`).
+    tool_replies: Mutex<HashMap<String, Value>>,
+    /// Forced failure for every request: HTTP status + `{"detail": …}` body.
+    call_error: Mutex<Option<(u16, String)>>,
+    /// When set, the send tool replies `isError` with this text.
+    send_error: Mutex<Option<String>>,
+    /// Serve tool-call replies as an SSE stream (`data:` lines).
+    sse: AtomicBool,
     /// Counter for generated message timestamps.
     next_ts: AtomicU64,
     shutdown: AtomicBool,
 }
 
-/// A mock Slack Web API on `127.0.0.1:<random port>`.
+/// A mock Slack MCP server on `127.0.0.1:<random port>`, speaking MCP
+/// Streamable HTTP: one JSON-RPC message per `POST /mcp`, with plain-JSON
+/// replies (or SSE streams after [`set_sse`](Self::set_sse)).
 ///
 /// Routes (anything else gets `404 Not Found`):
-/// - `POST /chat.postMessage` replies
-///   `{"ok":true,"channel":<mock_channel_id(request channel)>,"ts":"1700000000.00000N",...}`
-///   with a fresh `ts` per post (`N` = 1, 2, 3, …), or
-///   `{"ok":false,"error":...}` after [`set_post_message_error`](Self::set_post_message_error).
-///   Like real Slack, the reply carries a channel *ID*: `C0123` is echoed,
-///   `#general` becomes `CGENERAL` (see [`mock_channel_id`]). The recorded
-///   request body always keeps the exact destination the client sent.
-/// - `POST /chat.getPermalink` replies
-///   `{"ok":true,"permalink":"https://mock.slack.com/archives/{channel}/p{ts without '.'}"}`,
-///   or `{"ok":false,"error":...}` after [`set_permalink_error`](Self::set_permalink_error).
-/// - `POST /users.info` replies with a canned `U0DRAKE` user (any other ID
-///   gets `user_not_found`), and `POST /conversations.info` with a canned
-///   `C0ENG` channel and a `D0DRAKE` DM (whose partner is `U0DRAKE`) — these
-///   back destination-resolution tests. Both fail with a canned error after
-///   [`set_lookup_error`](Self::set_lookup_error).
+/// - `initialize` replies with the echoed protocol version, empty
+///   capabilities and server info, plus an `Mcp-Session-Id` response header
+///   (which the client must send back on later requests);
+/// - `notifications/initialized` replies `202 Accepted` with no body;
+/// - `tools/list` replies with the tool catalog, settable with
+///   [`set_tools`](Self::set_tools). The default catalog lists
+///   `slack_search_messages`, `slack_read_user_profile`, `slack_read_channel`,
+///   `slack_list_channels` and `slack_send_message` (declaring
+///   `channel_id`/`message`/`thread_ts`);
+/// - `tools/call` replies with an MCP CallToolResult. `slack_send_message`
+///   gets `{"message_link": …, "message_context": {…}}` as a JSON string in
+///   a text block, with a fresh `ts` per send (`N` = 1, 2, 3, … in
+///   `1700000000.00000N`) and the channel ID Slack would report for the
+///   requested destination (see [`mock_channel_id`]); the read tools get
+///   canned `U0DRAKE`/`C0ENG` lookups. Replace any of it with
+///   [`set_tool_reply`](Self::set_tool_reply) or
+///   [`set_tool_reply_for`](Self::set_tool_reply_for), make the send tool
+///   fail with [`set_send_error`](Self::set_send_error), or fail every
+///   request with an HTTP status via [`set_call_error`](Self::set_call_error).
 ///
 /// Every request is recorded before the reply is written, so it is visible in
 /// [`requests`](Self::requests) as soon as the client call returns. Each
@@ -123,23 +148,25 @@ struct MockState {
 /// The client honors the standard proxy variables (`HTTP_PROXY`,
 /// `HTTPS_PROXY`, `ALL_PROXY`). If one is set, `NO_PROXY` must cover
 /// `127.0.0.1`, or requests meant for the mock go to the proxy.
-pub struct MockSlackServer {
+pub struct MockSlackMcpServer {
     addr: SocketAddr,
-    state: Arc<MockState>,
+    state: Arc<MockSlackMcpState>,
     accept_thread: Option<JoinHandle<()>>,
 }
 
-impl MockSlackServer {
+impl MockSlackMcpServer {
     /// Bind `127.0.0.1:0` and start serving on a background thread.
     pub fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Slack server");
-        let addr = listener.local_addr().expect("mock Slack server address");
-        let state = Arc::new(MockState {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Slack MCP server");
+        let addr = listener.local_addr().expect("mock Slack MCP server address");
+        let state = Arc::new(MockSlackMcpState {
             requests: Mutex::new(Vec::new()),
-            post_message_error: Mutex::new(None),
-            post_message_raw_reply: Mutex::new(None),
-            permalink_error: Mutex::new(None),
-            lookup_error: Mutex::new(None),
+            tools: Mutex::new(default_mcp_tools()),
+            tool_reply: Mutex::new(None),
+            tool_replies: Mutex::new(HashMap::new()),
+            call_error: Mutex::new(None),
+            send_error: Mutex::new(None),
+            sse: AtomicBool::new(false),
             next_ts: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
         });
@@ -152,15 +179,18 @@ impl MockSlackServer {
         }
     }
 
-    /// API base URL to hand to the client, e.g. `http://127.0.0.1:54321`
-    /// (no trailing slash; the client appends `/chat.postMessage`).
-    pub fn base_url(&self) -> String {
-        format!("http://{}", self.addr)
+    /// The MCP endpoint URL to hand to the client, e.g.
+    /// `http://127.0.0.1:54321/mcp`.
+    pub fn mcp_url(&self) -> String {
+        format!("http://{}/mcp", self.addr)
     }
 
-    /// A real [`UreqSlackClient`] pointed at this server, using [`TEST_TOKEN`].
-    pub fn client(&self) -> UreqSlackClient {
-        UreqSlackClient::new(TEST_TOKEN, self.base_url())
+    /// A real [`SlackMcpClient`] pointed at this server, using
+    /// [`TEST_SLACK_MCP_TOKEN`]. The MCP handshake runs here, so a broken
+    /// mock fails the test with the handshake error.
+    pub fn client(&self) -> SlackMcpClient {
+        SlackMcpClient::new(TEST_SLACK_MCP_TOKEN, self.mcp_url())
+            .expect("the MCP handshake with the mock must succeed")
     }
 
     /// Every request received so far, in arrival order.
@@ -168,52 +198,94 @@ impl MockSlackServer {
         lock(&self.state.requests).clone()
     }
 
-    /// Requests received for one path, e.g. `"/chat.getPermalink"`.
-    pub fn requests_to(&self, path: &str) -> Vec<RecordedRequest> {
+    /// Forget the recorded MCP handshake requests (`initialize` +
+    /// `notifications/initialized`), keeping everything else. Building a
+    /// client runs the handshake, so tests clear it to see only their own
+    /// traffic — including traffic from an earlier gateway in the same test
+    /// (the restart tests build a second gateway on the same mock).
+    pub fn clear_handshake(&self) {
+        lock(&self.state.requests).retain(|r| {
+            let method = r.body.get("method").and_then(Value::as_str);
+            method != Some("initialize") && method != Some("notifications/initialized")
+        });
+    }
+
+    /// The JSON-RPC method of each recorded request, in arrival order.
+    pub fn methods(&self) -> Vec<String> {
         lock(&self.state.requests)
             .iter()
-            .filter(|r| r.path == path)
+            .map(|r| {
+                r.body
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Recorded `tools/call` requests for one tool, in arrival order.
+    pub fn calls_to(&self, tool: &str) -> Vec<RecordedRequest> {
+        lock(&self.state.requests)
+            .iter()
+            .filter(|r| r.body.pointer("/params/name").and_then(Value::as_str) == Some(tool))
             .cloned()
             .collect()
     }
 
-    /// Number of `POST /chat.postMessage` requests received so far (i.e.
-    /// send attempts), including ones answered with an error.
-    pub fn post_count(&self) -> usize {
+    /// Number of send-tool calls received so far (i.e. send attempts),
+    /// including ones answered with an error.
+    pub fn send_count(&self) -> usize {
         lock(&self.state.requests)
             .iter()
-            .filter(|r| r.method == "POST" && r.path == "/chat.postMessage")
+            .filter(|r| {
+                r.body.get("method").and_then(Value::as_str) == Some("tools/call")
+                    && r.body
+                        .pointer("/params/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_send_tool)
+            })
             .count()
     }
 
-    /// Make `chat.postMessage` reply `{"ok":false,"error":<error>}` from now
-    /// on (`None` restores success). Failed posts get no `ts`.
-    pub fn set_post_message_error(&self, error: Option<&str>) {
-        *lock(&self.state.post_message_error) = error.map(str::to_string);
+    /// Replace the server's tool catalog (served by `tools/list`).
+    pub fn set_tools(&self, tools: Vec<Value>) {
+        *lock(&self.state.tools) = tools;
     }
 
-    /// Make `chat.postMessage` reply `200 OK` with `body` verbatim from now on
-    /// (`None` restores normal replies), e.g. malformed JSON. Takes precedence
-    /// over [`set_post_message_error`](Self::set_post_message_error).
-    pub fn set_post_message_raw_reply(&self, body: Option<&str>) {
-        *lock(&self.state.post_message_raw_reply) = body.map(str::to_string);
+    /// Serve this exact CallToolResult for every tool call (`None` restores
+    /// the default replies).
+    pub fn set_tool_reply(&self, reply: Option<Value>) {
+        *lock(&self.state.tool_reply) = reply;
     }
 
-    /// Make `chat.getPermalink` reply `{"ok":false,"error":<error>}` from now
-    /// on (`None` restores success), to exercise the client's fallback link.
-    pub fn set_permalink_error(&self, error: Option<&str>) {
-        *lock(&self.state.permalink_error) = error.map(str::to_string);
+    /// Serve this exact CallToolResult for one tool's calls only (takes
+    /// precedence over [`set_tool_reply`](Self::set_tool_reply)); used to
+    /// give the read tools (`slack_read_user_profile`, …) their own replies.
+    pub fn set_tool_reply_for(&self, tool: &str, reply: Value) {
+        lock(&self.state.tool_replies).insert(tool.to_string(), reply);
     }
 
-    /// Make `users.info` and `conversations.info` reply
-    /// `{"ok":false,"error":<error>}` from now on (`None` restores the
-    /// canned lookups), to exercise destination-resolution failures.
-    pub fn set_lookup_error(&self, error: Option<&str>) {
-        *lock(&self.state.lookup_error) = error.map(str::to_string);
+    /// Make the send tool reply `isError: true` with this text from now on
+    /// (`None` restores success).
+    pub fn set_send_error(&self, error: Option<&str>) {
+        *lock(&self.state.send_error) = error.map(str::to_string);
+    }
+
+    /// Make every request fail with an HTTP status and a `{"detail": …}` body
+    /// (`None` restores success).
+    pub fn set_call_error(&self, error: Option<(u16, &str)>) {
+        *lock(&self.state.call_error) = error.map(|(code, detail)| (code, detail.to_string()));
+    }
+
+    /// Serve tool-call replies as an SSE stream (`data:` lines) instead of
+    /// plain JSON, exercising the client's SSE reply handling.
+    pub fn set_sse(&self, sse: bool) {
+        self.state.sse.store(sse, Ordering::SeqCst);
     }
 }
 
-impl Drop for MockSlackServer {
+impl Drop for MockSlackMcpServer {
     fn drop(&mut self) {
         self.state.stop();
         // Wake the blocking accept() so the loop sees the flag. Join only if
@@ -227,9 +299,9 @@ impl Drop for MockSlackServer {
     }
 }
 
-impl MockApi for MockState {
+impl MockApi for MockSlackMcpState {
     fn route(&self, req: &RecordedRequest) -> Reply {
-        route_slack(req, self)
+        route_slack_mcp(req, self)
     }
     fn record(&self, req: RecordedRequest) {
         lock(&self.requests).push(req);
@@ -298,56 +370,86 @@ fn serve_connection(stream: TcpStream, api: &dyn MockApi) -> std::io::Result<()>
         query,
         authorization: raw.header("authorization").map(str::to_string),
         content_type: raw.header("content-type").map(str::to_string),
+        headers: raw.headers.clone(),
         body,
     };
     let reply = api.route(&recorded);
     api.record(recorded);
 
-    let (status, content_type, payload) = match reply {
+    let (status, content_type, payload, extra_headers) = match reply {
         Reply::Json(json) => (
             "200 OK".to_string(),
             "application/json; charset=utf-8".to_string(),
             json.to_string(),
+            Vec::new(),
         ),
         Reply::Raw(raw) => (
             "200 OK".to_string(),
             "application/json; charset=utf-8".to_string(),
             raw,
+            Vec::new(),
         ),
         Reply::Status(code, body) => (
             format!("{} {}", code, reason_phrase(code)),
             "application/json; charset=utf-8".to_string(),
             body,
+            Vec::new(),
         ),
         Reply::NotFound => (
             "404 Not Found".to_string(),
             "text/plain; charset=utf-8".to_string(),
             "not found".to_string(),
+            Vec::new(),
+        ),
+        // A JSON reply with extra response headers (the MCP handshake's
+        // `Mcp-Session-Id`).
+        Reply::JsonWithHeaders(json, headers) => (
+            "200 OK".to_string(),
+            "application/json; charset=utf-8".to_string(),
+            json.to_string(),
+            headers,
+        ),
+        // An SSE stream of `data:` lines (MCP Streamable HTTP replies).
+        Reply::Sse(body) => (
+            "200 OK".to_string(),
+            "text/event-stream".to_string(),
+            body,
+            Vec::new(),
         ),
     };
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+    let mut response = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n");
+    for (name, value) in &extra_headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
-    );
+    ));
     (&stream).write_all(response.as_bytes())?;
     (&stream).flush()
 }
 
-/// What the mock answers to one request.
+/// What a mock answers to one request.
 enum Reply {
     /// `200 OK` with this JSON body.
     Json(Value),
-    /// `200 OK` with this body verbatim (see `set_post_message_raw_reply`).
+    /// `200 OK` with this body verbatim (raw replies, e.g. malformed JSON).
     Raw(String),
-    /// A non-200 status code with this JSON body (e.g. a forced API error).
+    /// A status code with this body: a non-200 error (e.g. a forced API
+    /// error), or `202 Accepted` with an empty body (MCP notifications).
     Status(u16, String),
     /// `404 Not Found`.
     NotFound,
+    /// `200 OK` with this JSON body plus extra response headers.
+    JsonWithHeaders(Value, Vec<(String, String)>),
+    /// `200 OK` with this `text/event-stream` body verbatim.
+    Sse(String),
 }
 
 /// Reason phrase for the status codes the mocks produce.
 fn reason_phrase(code: u16) -> &'static str {
     match code {
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -377,69 +479,163 @@ pub fn mock_channel_id(destination: &str) -> String {
     }
 }
 
-/// Canned Slack reply for a request.
-fn route_slack(req: &RecordedRequest, state: &MockState) -> Reply {
-    if req.method != "POST" {
+/// The default tool catalog, shaped like the official Slack MCP server's:
+/// read tools plus `slack_send_message` declaring
+/// `channel_id`/`message`/`thread_ts`.
+fn default_mcp_tools() -> Vec<Value> {
+    json!([
+        { "name": "slack_search_messages", "inputSchema": { "type": "object", "properties": {
+            "query": { "type": "string" } } } },
+        { "name": "slack_read_user_profile", "inputSchema": { "type": "object", "properties": {
+            "user_id": { "type": "string" } } } },
+        { "name": "slack_read_channel", "inputSchema": { "type": "object", "properties": {
+            "channel_id": { "type": "string" } } } },
+        { "name": "slack_list_channels", "inputSchema": { "type": "object" } },
+        { "name": "slack_send_message", "inputSchema": { "type": "object", "properties": {
+            "channel_id": { "type": "string" },
+            "message": { "type": "string" },
+            "thread_ts": { "type": "string" }
+        }, "required": ["channel_id", "message"] } }
+    ])
+    .as_array()
+    .expect("default tool catalog is an array")
+    .clone()
+}
+
+/// A CallToolResult carrying `payload` as a JSON string inside a text block
+/// (the way the Slack tools wrap their results).
+fn json_text_reply(payload: &Value) -> Value {
+    json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+}
+
+/// The default `slack_send_message` CallToolResult: a fresh `ts` per send and
+/// the channel ID Slack would report for the requested destination.
+fn default_send_reply(state: &MockSlackMcpState, arguments: &Value) -> Value {
+    let n = state.next_ts.fetch_add(1, Ordering::SeqCst);
+    let ts = format!("1700000000.{n:06}");
+    let channel = mock_channel_id(
+        arguments
+            .get("channel_id")
+            .and_then(Value::as_str)
+            .unwrap_or("C0MOCK"),
+    );
+    let link = format!(
+        "https://mock.slack.com/archives/{channel}/p{}",
+        ts.replace('.', "")
+    );
+    json_text_reply(&json!({
+        "message_link": link,
+        "message_context": { "message_ts": ts, "channel_id": channel }
+    }))
+}
+
+/// True when a tool name looks like "send a message" (the same predicate
+/// the client's discovery uses: `slack_send_message`, `post_message`, …).
+fn is_send_tool(tool: &str) -> bool {
+    (tool.contains("send") || tool.contains("post")) && tool.contains("message")
+}
+
+/// The default CallToolResult for one tool call.
+fn default_tool_result(state: &MockSlackMcpState, tool: &str, arguments: &Value) -> Value {
+    if is_send_tool(tool) {
+        return match lock(&state.send_error).clone() {
+            Some(error) => {
+                json!({ "content": [{ "type": "text", "text": error }], "isError": true })
+            }
+            None => default_send_reply(state, arguments),
+        };
+    }
+    if tool == "slack_list_channels" {
+        return json_text_reply(&json!({ "channels": [
+            { "id": "C0ENG", "name": "eng" },
+            { "id": "C0RAND", "name": "random" }
+        ] }));
+    }
+    if tool.contains("user") {
+        return match arguments.get("user_id").and_then(Value::as_str) {
+            Some("U0DRAKE") => json_text_reply(&json!({ "user": {
+                "real_name": "Drake Thomsen", "name": "drake.thomsen",
+                "profile": { "display_name": "Drake" }
+            } })),
+            _ => json!({ "content": [{ "type": "text", "text": "user_not_found" }], "isError": true }),
+        };
+    }
+    if tool.contains("channel") {
+        return match arguments.get("channel_id").and_then(Value::as_str) {
+            Some("C0ENG") => {
+                json_text_reply(&json!({ "channel": { "id": "C0ENG", "name": "eng" } }))
+            }
+            Some("C0RAND") => {
+                json_text_reply(&json!({ "channel": { "id": "C0RAND", "name": "random" } }))
+            }
+            _ => json!({ "content": [{ "type": "text", "text": "channel_not_found" }], "isError": true }),
+        };
+    }
+    json!({ "content": [{ "type": "text", "text": format!("unknown tool: {tool}") }], "isError": true })
+}
+
+/// Canned Slack MCP reply for one JSON-RPC request (`POST /mcp`).
+fn route_slack_mcp(req: &RecordedRequest, state: &MockSlackMcpState) -> Reply {
+    if req.method != "POST" || req.path != "/mcp" {
         return Reply::NotFound;
     }
-    match req.path.as_str() {
-        "/chat.postMessage" => {
-            if let Some(raw) = lock(&state.post_message_raw_reply).clone() {
-                return Reply::Raw(raw);
-            }
-            if let Some(error) = lock(&state.post_message_error).clone() {
-                return Reply::Json(json!({ "ok": false, "error": error }));
-            }
-            let n = state.next_ts.fetch_add(1, Ordering::SeqCst);
-            let ts = format!("1700000000.{n:06}");
-            let channel = mock_channel_id(req.body_str("channel").unwrap_or("C0MOCK"));
-            let mut message = json!({ "type": "message", "text": req.body.get("text"), "ts": ts });
-            if let Some(thread_ts) = req.body.get("thread_ts") {
-                message["thread_ts"] = thread_ts.clone();
-            }
-            Reply::Json(json!({ "ok": true, "channel": channel, "ts": ts, "message": message }))
-        }
-        "/chat.getPermalink" => {
-            if let Some(error) = lock(&state.permalink_error).clone() {
-                return Reply::Json(json!({ "ok": false, "error": error }));
-            }
-            let (Some(channel), Some(ts)) = (req.body_str("channel"), req.body_str("message_ts")) else {
-                return Reply::Json(json!({ "ok": false, "error": "invalid_arguments" }));
+    if let Some((code, detail)) = lock(&state.call_error).clone() {
+        return Reply::Status(code, json!({ "detail": detail }).to_string());
+    }
+    let id = req.body.get("id").cloned().unwrap_or(Value::Null);
+    let method = req.body.get("method").and_then(Value::as_str).unwrap_or("");
+    let rpc = |result: Value| json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    match method {
+        "initialize" => Reply::JsonWithHeaders(
+            rpc(json!({
+                "protocolVersion": req
+                    .body
+                    .pointer("/params/protocolVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("2025-06-18"),
+                "capabilities": {},
+                "serverInfo": { "name": "mock-slack-mcp", "version": "0" }
+            })),
+            vec![("Mcp-Session-Id".to_string(), "mock-session-1".to_string())],
+        ),
+        // The handshake completes with a notification; the server accepts it
+        // and answers nothing.
+        "notifications/initialized" => Reply::Status(202, String::new()),
+        "tools/list" => Reply::Json(rpc(json!({ "tools": lock(&state.tools).clone() }))),
+        "tools/call" => {
+            let tool = req
+                .body
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let arguments = req
+                .body
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let result = if let Some(reply) = lock(&state.tool_replies).get(tool).cloned() {
+                reply
+            } else if let Some(reply) = lock(&state.tool_reply).clone() {
+                reply
+            } else {
+                default_tool_result(state, tool, &arguments)
             };
-            let permalink = format!(
-                "https://mock.slack.com/archives/{channel}/p{}",
-                ts.replace('.', "")
-            );
-            Reply::Json(json!({ "ok": true, "channel": channel, "permalink": permalink }))
-        }
-        "/users.info" => {
-            if let Some(error) = lock(&state.lookup_error).clone() {
-                return Reply::Json(json!({ "ok": false, "error": error }));
-            }
-            match req.body_str("user") {
-                Some("U0DRAKE") => Reply::Json(json!({ "ok": true, "user": {
-                    "name": "drake.thomsen", "real_name": "Drake Thomsen",
-                    "profile": { "display_name": "Drake" }
-                } })),
-                _ => Reply::Json(json!({ "ok": false, "error": "user_not_found" })),
+            let reply = Reply::Json(rpc(result));
+            if state.sse.load(Ordering::SeqCst) {
+                // The same message, framed as an SSE `data:` line.
+                match reply {
+                    Reply::Json(body) => Reply::Sse(format!("data: {body}\n\n")),
+                    other => other,
+                }
+            } else {
+                reply
             }
         }
-        "/conversations.info" => {
-            if let Some(error) = lock(&state.lookup_error).clone() {
-                return Reply::Json(json!({ "ok": false, "error": error }));
-            }
-            match req.body_str("channel") {
-                Some("C0ENG") => Reply::Json(json!({ "ok": true, "channel": {
-                    "id": "C0ENG", "name": "eng", "is_im": false
-                } })),
-                // A DM: the partner is resolved through a second lookup.
-                Some("D0DRAKE") => Reply::Json(json!({ "ok": true, "channel": {
-                    "id": "D0DRAKE", "is_im": true, "user": "U0DRAKE"
-                } })),
-                _ => Reply::Json(json!({ "ok": false, "error": "channel_not_found" })),
-            }
-        }
-        _ => Reply::NotFound,
+        _ => Reply::Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("method not found: {method}") }
+        })),
     }
 }
 

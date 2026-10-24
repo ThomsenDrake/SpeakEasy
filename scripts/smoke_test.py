@@ -5,7 +5,9 @@ Runs `slack-approval-gateway --cli` with:
   - stdin/stdout/stderr = pipes (the MCP stdio transport, like a real agent)
   - a pty as the controlling terminal (so the CLI provider's /dev/tty is the
     pty, like a human's terminal)
-  - SLACK_API_BASE pointed at a local mock Slack Web API
+  - SLACK_MCP_URL pointed at a local mock Slack MCP server (the default
+    transport: the gateway speaks MCP Streamable HTTP to a Slack MCP server
+    with a Slack user OAuth token, never a bot token)
 
 Covers: MCP handshake, tools/list, approve (exact send + permalink),
 duplicate retry (no resend), deny (cooldown), reworded retry during cooldown
@@ -18,8 +20,10 @@ dedupe/cooldowns) — including an explicit error (nothing was sent) when the
 instance is killed while a bridged request is pending. The mock server also
 plays the Mistral platform API, and one section runs the whole approve flow
 with SLACK_TRANSPORT=mistral-connector to verify the connector transport
-end to end (exact message sent through the connector tool call, no direct
-Slack API call).
+end to end (exact message sent through the connector tool call, no Slack
+MCP call). A final section checks that a Slack user ID in the destination
+resolves to a display name in the prompt while the send still carries the
+exact raw ID.
 """
 import fcntl
 import http.server
@@ -46,31 +50,93 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-# ------------------------------------------------- mock Slack + Mistral API
-# One HTTP server plays both the Slack Web API (direct transport) and the
-# Mistral platform API (connector transport).
+# ------------------------------------------- mock Slack MCP + Mistral API
+# One HTTP server plays both the Slack MCP server (the default transport:
+# MCP Streamable HTTP at /mcp) and the Mistral platform API (connector
+# transport).
+MCP_TOOLS = [
+    {"name": "slack_search_messages", "inputSchema": {"type": "object", "properties": {
+        "query": {"type": "string"}}}},
+    {"name": "slack_read_user_profile", "inputSchema": {"type": "object", "properties": {
+        "user_id": {"type": "string"}}}},
+    {"name": "slack_read_channel", "inputSchema": {"type": "object", "properties": {
+        "channel_id": {"type": "string"}}}},
+    {"name": "slack_list_channels", "inputSchema": {"type": "object"}},
+    {"name": "slack_send_message", "inputSchema": {"type": "object", "properties": {
+        "channel_id": {"type": "string"},
+        "message": {"type": "string"},
+        "thread_ts": {"type": "string"},
+    }, "required": ["channel_id", "message"]}},
+]
+
+
+def route_mcp(body):
+    """Canned Slack MCP reply for one JSON-RPC message (POST /mcp).
+
+    Returns (http_status, reply_or_None, extra_headers).
+    """
+    method = body.get("method")
+    rid = body.get("id")
+    if method == "initialize":
+        params = body.get("params") or {}
+        reply = {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "result": {
+                "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                "capabilities": {},
+                "serverInfo": {"name": "mock-slack-mcp", "version": "0"},
+            },
+        }
+        return 200, reply, {"Mcp-Session-Id": "mock-session-1"}
+    if method == "notifications/initialized":
+        # The handshake completes with a notification; accept it, answer nothing.
+        return 202, None, {}
+    if method == "tools/list":
+        return 200, {"jsonrpc": "2.0", "id": rid, "result": {"tools": MCP_TOOLS}}, {}
+    if method == "tools/call":
+        params = body.get("params") or {}
+        name = params.get("name") or ""
+        args = params.get("arguments") or {}
+        if name == "slack_send_message":
+            # A JSON string inside the text block, like the real Slack tools.
+            result = {"content": [{"type": "text", "text": json.dumps({
+                "message_link": "https://mock.slack.com/archives/C123/p1700000000000100",
+                "message_context": {"message_ts": "1700000000.000100",
+                                    "channel_id": "C123"},
+            })}]}
+        elif name == "slack_read_user_profile":
+            if args.get("user_id") == "U0DRAKE":
+                result = {"content": [{"type": "text", "text": json.dumps({"user": {
+                    "real_name": "Drake Thomsen", "name": "drake.thomsen",
+                    "profile": {"display_name": "Drake"}}})}]}
+            else:
+                result = {"content": [{"type": "text", "text": "user_not_found"}],
+                          "isError": True}
+        elif name == "slack_read_channel":
+            if args.get("channel_id") == "C0ENG":
+                result = {"content": [{"type": "text", "text": json.dumps(
+                    {"channel": {"id": "C0ENG", "name": "eng"}})}]}
+            else:
+                result = {"content": [{"type": "text", "text": "channel_not_found"}],
+                          "isError": True}
+        else:
+            result = {"content": [{"type": "text", "text": f"unknown tool: {name}"}],
+                      "isError": True}
+        return 200, {"jsonrpc": "2.0", "id": rid, "result": result}, {}
+    return 200, {"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32601, "message": f"method not found: {method}"}}, {}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         path = self.path.split("?")[0]
         self.server.requests.append((path, dict(self.headers), body))
-        if path == "/chat.postMessage":
-            resp = {"ok": True, "channel": "C123", "ts": "1700000000.000100"}
-        elif path == "/chat.getPermalink":
-            resp = {"ok": True, "permalink": "https://mock.slack.com/archives/C123/p1700000000000100"}
-        elif path == "/users.info":
-            if body.get("user") == "U0DRAKE":
-                resp = {"ok": True, "user": {"name": "drake.thomsen",
-                                             "real_name": "Drake Thomsen",
-                                             "profile": {"display_name": "Drake"}}}
-            else:
-                resp = {"ok": False, "error": "user_not_found"}
-        elif path == "/conversations.info":
-            if body.get("channel") == "C0ENG":
-                resp = {"ok": True, "channel": {"id": "C0ENG", "name": "eng", "is_im": False}}
-            else:
-                resp = {"ok": False, "error": "channel_not_found"}
+        if path == "/mcp":
+            status, resp, extra = route_mcp(body)
+            data = b"" if resp is None else json.dumps(resp).encode()
         elif path.startswith("/v1/connectors/") and path.endswith("/call"):
             # MCP CallToolResult shaped like the real slack connector: a JSON
             # string inside the text block.
@@ -78,14 +144,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "content": [{"type": "text", "text":
                              "{\"message_link\":\"https://mock.slack.com/archives/C123/p1700000000000100\",\"message_context\":{\"message_ts\":\"1700000000.000100\",\"channel_id\":\"C123\"}}"}],
             }
+            status, data, extra = 200, json.dumps(resp).encode(), {}
         else:
             resp = {"ok": False, "error": "unknown_method"}
-        data = json.dumps(resp).encode()
-        self.send_response(200)
+            status, data, extra = 200, json.dumps(resp).encode(), {}
+        self.send_response(status)
+        for name, value in extra.items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if data:
+            self.wfile.write(data)
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -121,8 +191,27 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 port = server.server_address[1]
 
 
-def post_count():
-    return sum(1 for p, _, _ in server.requests if p == "/chat.postMessage")
+def send_calls():
+    """Recorded MCP `tools/call` requests for a send-message tool."""
+    out = []
+    for path, _, body in server.requests:
+        if path != "/mcp" or not isinstance(body, dict):
+            continue
+        if body.get("method") != "tools/call":
+            continue
+        name = (body.get("params") or {}).get("name") or ""
+        if ("send" in name or "post" in name) and "message" in name:
+            out.append(body)
+    return out
+
+
+def send_count():
+    return len(send_calls())
+
+
+def send_arguments(call):
+    """The `arguments` object of one recorded send-tool call."""
+    return (call.get("params") or {}).get("arguments") or {}
 
 
 def connector_requests(suffix):
@@ -146,8 +235,8 @@ def last_connector_call_arguments():
 # ---------------------------------------------------------------- spawn app
 state_dir = tempfile.mkdtemp(prefix="sag-smoke-")
 env = dict(os.environ)
-env["SLACK_BOT_TOKEN"] = "xoxb-smoke-test"
-env["SLACK_API_BASE"] = f"http://127.0.0.1:{port}"
+env["SLACK_MCP_TOKEN"] = "xoxp-smoke-test"
+env["SLACK_MCP_URL"] = f"http://127.0.0.1:{port}/mcp"
 env["SLACK_GATEWAY_STATE_DIR"] = state_dir
 for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
     env.pop(k, None)
@@ -301,20 +390,20 @@ try:
     check("approve returns sent with permalink",
           v.get("status") == "sent" and v.get("permalink", "").startswith("https://mock.slack.com/"),
           json.dumps(v))
-    posts = [b for p, _, b in server.requests if p == "/chat.postMessage"]
-    check("mock Slack received exactly one postMessage", post_count() == 1, f"count={post_count()}")
-    check("postMessage carried the exact message, destination and thread",
-          posts and posts[0].get("text") == "Hello from the smoke test"
-          and posts[0].get("channel") == "#general"
-          and posts[0].get("thread_ts") == "1699999999.000001",
-          json.dumps(posts[:1]))
+    sends = send_calls()
+    check("mock Slack MCP received exactly one send", send_count() == 1, f"count={send_count()}")
+    check("send tool call carried the exact message, destination and thread",
+          sends and send_arguments(sends[0]).get("message") == "Hello from the smoke test"
+          and send_arguments(sends[0]).get("channel_id") == "#general"
+          and send_arguments(sends[0]).get("thread_ts") == "1699999999.000001",
+          json.dumps(sends[:1]))
 
     # 3. identical retry: cached duplicate, no resend
     tool_call(4, "Hello from the smoke test", thread_ts="1699999999.000001")
     r = wait_response(4)
     v = verdict(r)
     check("identical retry returns duplicate without resending",
-          v.get("status") == "sent" and v.get("duplicate") is True and post_count() == 1,
+          v.get("status") == "sent" and v.get("duplicate") is True and send_count() == 1,
           json.dumps(v))
 
     # 4. deny: cooldown set
@@ -334,7 +423,7 @@ try:
     check("reworded retry is cooldown_blocked with remaining time, no send",
           v.get("status") == "cooldown_blocked"
           and 0 < v.get("cooldown_remaining_secs", 0) <= 600
-          and post_count() == 1,
+          and send_count() == 1,
           json.dumps(v))
     time.sleep(0.5)
     check("no CLI prompt appeared for the blocked request",
@@ -348,7 +437,7 @@ try:
     v = verdict(r)
     check("feedback is returned verbatim, nothing sent",
           v.get("status") == "feedback" and v.get("feedback") == "how about pizza instead"
-          and post_count() == 1,
+          and send_count() == 1,
           json.dumps(v))
 
     # 7. concurrency: two requests, prompts serialized, answers matched
@@ -365,11 +454,11 @@ try:
     check("concurrent requests do not mix up decisions",
           v8.get("status") == "sent" and not v8.get("duplicate")
           and v9.get("status") == "feedback" and v9.get("feedback") == "not now"
-          and post_count() == 2,
-          f"v8={json.dumps(v8)} v9={json.dumps(v9)} posts={post_count()}")
-    alpha_posts = [b for p, _, b in server.requests
-                   if p == "/chat.postMessage" and b.get("text") == "Concurrent request alpha"]
-    check("alpha was the message actually sent", len(alpha_posts) == 1)
+          and send_count() == 2,
+          f"v8={json.dumps(v8)} v9={json.dumps(v9)} sends={send_count()}")
+    alpha_sends = [b for b in send_calls()
+                   if send_arguments(b).get("message") == "Concurrent request alpha"]
+    check("alpha was the message actually sent", len(alpha_sends) == 1)
 
     # 7b. bridge: a second agent process (default mode, no --cli) must not
     # start its own instance — it bridges to the running one over the
@@ -451,14 +540,14 @@ try:
           r.get("result", {}).get("serverInfo", {}).get("name") == "slack-approval-gateway",
           json.dumps(r)[:200])
 
-    posts_before = post_count()
+    posts_before = send_count()
     bridge_tool_call(brpc1, 102, "Bridged request one")
     wait_tty("Bridged request one")
     answer("a")
     r = wait_b1(102)
     v = verdict(r)
     check("bridge: approve through the bridge sends via the instance",
-          v.get("status") == "sent" and post_count() == posts_before + 1,
+          v.get("status") == "sent" and send_count() == posts_before + 1,
           json.dumps(v))
 
     # a second bridge at the same time: concurrent bridged agents
@@ -474,7 +563,7 @@ try:
     v = verdict(r)
     check("bridge: second concurrent bridge gets its own verdict",
           v.get("status") == "feedback" and v.get("feedback") == "bridged feedback"
-          and post_count() == posts_before + 1,
+          and send_count() == posts_before + 1,
           json.dumps(v))
 
     # closing an agent's stdio ends its bridge cleanly (the instance lives on)
@@ -678,7 +767,7 @@ try:
     def answer3(text):
         os.write(master3, (text + "\n").encode())
 
-    posts_before_conn = post_count()
+    posts_before_conn = send_count()
     calls_before_conn = connector_call_count()
     rpc3(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                            "clientInfo": {"name": "smoke-connector", "version": "0"}})
@@ -710,9 +799,9 @@ try:
           conn_args.get("message") == "Sent via the Mistral connector"
           and conn_args.get("channel_id") == "#general",
           json.dumps(conn_args))
-    check("connector transport: no direct Slack API call was made",
-          post_count() == posts_before_conn,
-          f"posts={post_count()} before={posts_before_conn}")
+    check("connector transport: no Slack MCP call was made",
+          send_count() == posts_before_conn,
+          f"sends={send_count()} before={posts_before_conn}")
 
     proc3.stdin.close()
     proc3.wait(timeout=15)
@@ -796,7 +885,7 @@ try:
     rpc4(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                            "clientInfo": {"name": "smoke-display", "version": "0"}})
     wait_response4(1)
-    posts_before_disp = post_count()
+    posts_before_disp = send_count()
     rpc4(2, "tools/call", {"name": "request_slack_message", "arguments": {
         "message": "Display name resolution test",
         "destination": "U0DRAKE",
@@ -812,12 +901,12 @@ try:
     check("display names: prompt shows the resolved name next to the raw ID",
           v.get("status") == "sent",
           json.dumps(v))
-    posts = [b for p, _, b in server.requests
-             if p == "/chat.postMessage" and b.get("text") == "Display name resolution test"]
+    disp_sends = [b for b in send_calls()
+                  if send_arguments(b).get("message") == "Display name resolution test"]
     check("display names: the send still carries the exact raw Slack ID",
-          len(posts) == 1 and posts[0].get("channel") == "U0DRAKE"
-          and post_count() == posts_before_disp + 1,
-          f"posts={post_count()}")
+          len(disp_sends) == 1 and send_arguments(disp_sends[0]).get("channel_id") == "U0DRAKE"
+          and send_count() == posts_before_disp + 1,
+          f"sends={send_count()}")
 
     proc4.stdin.close()
     proc4.wait(timeout=15)

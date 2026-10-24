@@ -127,54 +127,131 @@ Public API is fully declared in the stub. Implement:
 - The CLI provider prints `Destination:   <display> (<raw id>)` when a
   display name was resolved, else the raw destination.
 
-### `src/slack.rs` — transport selection + the direct Slack client
+### `src/slack.rs` — transport selection + credential plumbing
 
-This module owns **transport selection** and the `direct` transport. The
-only credential it can hold is a Slack bot token; the alternative
-(`mistral-connector`) holds a Mistral API key and lives in
-`src/mistral_slack.rs`.
+This module owns **transport selection** and the shared credential
+plumbing. The only Slack credential the gateway can hold is a Slack **user
+OAuth token** for the Slack MCP server (the default transport, implemented
+in `src/slack_mcp.rs`); the alternative (`mistral-connector`) holds a
+Mistral API key and lives in `src/mistral_slack.rs`. The old bot-token
+(`direct`) transport was removed on purpose: the gateway is not a Slack app
+and never posts as one.
 
 - `resolve_transport(state_dir) -> Result<SlackTransport, SlackError>`:
-  `SLACK_TRANSPORT` env (`direct` | `mistral-connector`; aliases
-  `mistral_connector`/`connector`), else a one-line
-  `<state_dir>/slack_transport` file, else `Direct`. Unknown values are an
-  error naming the accepted ones.
+  `SLACK_TRANSPORT` env (`slack-mcp` | `mistral-connector`; aliases `mcp` /
+  `slack_mcp` / `mistral_connector` / `connector`), else a one-line
+  `<state_dir>/slack_transport` file, else `SlackMcp`. Legacy values
+  (`direct` / `bot-token` / `token`) are an error explaining the removal and
+  pointing at the new transports; unknown values are an error naming the
+  accepted ones.
 - `build_client(state_dir) -> Result<Arc<dyn SlackClient>, SlackError>`:
   dispatch on the selected transport; `src/main.rs` calls this once at
   startup and exits with usage hints (naming what the selected transport
-  needs) on error.
-- `UreqSlackClient::from_env(state_dir)`: token from `SLACK_BOT_TOKEN`,
-  else read `<state_dir>/slack_token` (trim whitespace; the shared
-  `read_secret_file` helper also names the env var in its error). Error if
-  neither. API base from `SLACK_API_BASE` (default
-  `https://slack.com/api`, trailing slash stripped).
-- `UreqSlackClient::new(token, api_base)`.
-- `post_message`: `POST {api_base}/chat.postMessage` with
-  `Authorization: Bearer <token>` and JSON body
-  `{channel, text, thread_ts?}` (`thread_ts` only when `Some`). Slack's API
-  accepts `application/json` bodies. Parse `{ok, error?, channel?, ts?}`;
-  `!ok` → `SlackError(error or "unknown_error")`. Then resolve the permalink
-  with `POST {api_base}/chat.getPermalink` `{channel, message_ts: ts}` →
-  `{ok, permalink?}`. If that fails, fall back to a constructed URL
-  `https://<SLACK_WORKSPACE_DOMAIN or "workspace">.slack.com/archives/{channel}/p{ts without '.'}`.
-  Return `SlackSend { channel, ts, permalink }`.
-- Use `ureq` 3.x (`features = ["json", "tls"]` already in Cargo.toml):
-  `ureq::post(url).header(...).send_json(serde_json::json!(...))`, then
-  `resp.body_mut().read_json::<serde_json::Value>()`. Handle `ureq::Error`
-  (transport vs status) and timeouts (set a reasonable timeout, e.g. 15s).
-- `resolve_destination`: `#`/`@` names → `None` (already readable). `U…` →
-  `POST users.info {user}` → `real_name` (fallback `profile.display_name`,
-  `name`) formatted `Name (@username)` when a handle differs. `C…`/`G…`/`D…`
-  → `POST conversations.info {channel}` → `#name`; for a DM (`is_im`) chain
-  to `users.info` with the channel's `user` for the partner's name. Any
-  failure (missing `users:read`/`channels:read` scopes, unknown ID) logs to
-  stderr and returns `None` — the popup shows the raw ID.
-- Tests (`tests/slack_client_test.rs`): a mock Slack API on a local
-  `TcpListener` (127.0.0.1:0) that records method, path, `Authorization`
-  header, and JSON body, and replies with canned JSON. Assert: exact
-  `channel`/`text`/`thread_ts` in the body; `thread_ts` key absent when
-  `None`; `SlackSend` fields from `chat.postMessage` + `chat.getPermalink`;
-  `{ok:false,error}` → `SlackError`; `from_env` reads token file.
+  needs: `SLACK_MCP_TOKEN`/`slack_mcp_token` + the OAuth helper for
+  `slack-mcp`, `MISTRAL_API_KEY`/`mistral_api_key` for `mistral-connector`)
+  on error.
+- Shared `pub(crate)` helpers used by both transports: `non_empty_env`,
+  `read_secret_file` (trims whitespace; the error names both the env var
+  and the file; warns when the file is readable by other users), and
+  `fallback_permalink` (a constructed
+  `https://<SLACK_WORKSPACE_DOMAIN or "workspace">.slack.com/archives/{channel}/p{ts without '.'}`
+  URL, used when a transport returns a `ts` but no link).
+
+### `src/slack_mcp.rs` — the Slack MCP server transport (default)
+
+`SlackMcpClient` implements the `SlackClient` contract by speaking MCP
+(Streamable HTTP: one JSON-RPC 2.0 message per POST; replies are plain JSON
+or an SSE stream of `data:` lines) to a remote Slack MCP server — by default
+the official `https://mcp.slack.com/mcp`. The credential is a Slack **user
+OAuth token** (`SLACK_MCP_TOKEN` or `<state_dir>/slack_mcp_token`), obtained
+with `scripts/slack_mcp_oauth.py` (authorize
+`https://slack.com/oauth/v2_user/authorize`, exchange
+`https://slack.com/api/oauth.v2.user.access`); it is never a bot token.
+
+- `from_env(state_dir)`: token from `SLACK_MCP_TOKEN`, else
+  `<state_dir>/slack_mcp_token` (via the shared `read_secret_file`);
+  `SLACK_MCP_URL` (default `https://mcp.slack.com/mcp`, trailing slash
+  stripped), `SLACK_MCP_TOOL` (pin the send tool), and argument renames
+  `SLACK_MCP_CHANNEL_ARG` / `SLACK_MCP_TEXT_ARG` / `SLACK_MCP_THREAD_ARG`.
+  The MCP handshake runs at construction, so a bad token or endpoint fails
+  at startup, not after an approval.
+- `new(token, url)`: reject a token with whitespace/control characters;
+  build a `ureq` agent with a 30s timeout, `http_status_as_error(false)`
+  (statuses are inspected by hand so the server's error body can be
+  reported) and `max_redirects(0)` (the bearer token must never leak via a
+  redirect); run `initialize` + `notifications/initialized`. The
+  `Mcp-Session-Id` response header from `initialize` is stored and sent on
+  later requests, along with the negotiated `MCP-Protocol-Version`. All RPC
+  goes through one `Mutex<McpSession>` (session id, protocol version, id
+  counter, cached tool list and send tool), so concurrent requests are
+  serialized and id matching is trivial.
+- Send-tool discovery, argument-name detection and reply parsing are shared
+  with the connector transport in `src/slack_tools.rs`.
+- `post_message`: `tools/call` the send tool with the exact text to the
+  exact destination (optionally `thread_ts`). A CallToolResult with
+  `isError` (top-level or in `metadata.mcp_meta`) → `SlackError` with the
+  joined text blocks. Otherwise the outcome is extracted by
+  `slack_tools::send_outcome` (structured content, a JSON text block like
+  `{"message_link": …, "message_context": {…}}`, or a plain `slack.com`
+  URL in the text; the `ts` is parsed out of a `/p<16 digits>` permalink
+  when only a link is available). A missing permalink falls back to
+  `fallback_permalink(destination, ts)`.
+- `resolve_destination`: `#`/`@` names → `None`. `U…` → the first tool
+  whose name contains "user" + ("info"|"profile"|"list"|"search"), called
+  with `user_id`; the display name is `Name (@handle)` from the reply's JSON
+  name fields (flat, nested `user`/`profile`, or `Real Name:`/`Username:`
+  text lines). `C…`/`G…` → the first tool whose name contains
+  "channel"/"conversation" + ("info"|"list"|"history"|"read"), called with
+  `channel_id`; `#name` from the reply's channels array, channel object, or
+  a `Channel: #name (ID)` first text line. `D…` DM IDs → `None`. Any failure
+  → `None` (the popup shows the raw ID).
+- HTTP rules: the token never appears in error text or `Debug` output.
+- Tests (`tests/slack_mcp_test.rs`): `MockSlackMcpServer` in
+  `tests/common/mod.rs` (a local MCP server on a `TcpListener`:
+  handshake with an `Mcp-Session-Id` header, `tools/list`, `tools/call`
+  with canned CallToolResults, a per-server `ts` counter, per-tool reply
+  overrides, SSE replies). Assert: the handshake runs at construction and
+  the session id is sent back; discovery + exact `params.arguments` +
+  bearer token; outcome from structured content, from text, and the
+  constructed fallback; `thread_ts` absent when `None`; pinned tool skips
+  discovery and uses the legacy names; argument renames; schema-adapted
+  names; `isError` → `SlackError`; HTTP error → `SlackError` with `detail`
+  and never the token; a rejected handshake fails construction; no send
+  tool → error listing names; discovery cached across calls; SSE replies
+  parse; concurrent posts each get their own result; `from_env` token file
+  + env precedence + arg overrides + `SLACK_WORKSPACE_DOMAIN` fallback +
+  `build_client` dispatch; `resolve_destination` user/channel resolution
+  (nested, flat, and text shapes) and its `None` cases.
+
+### `src/slack_tools.rs` — shared tool-call plumbing (both transports)
+
+`pub(crate)` helpers shared by `slack_mcp` and `mistral_slack`:
+
+- `SendToolSpec { name, channel_arg, text_arg, thread_arg }` and
+  `resolve_send_tool(tools, channel_override, text_override,
+  thread_override, no_tool_hint)`: the first tool whose lowercase name
+  contains ("send"|"post") and "message", with argument names picked from
+  the tool's declared `inputSchema.properties` (candidates, most specific
+  first: channel — `channel_id`/`channel`/`channel_name`/`destination`/
+  `to`/`recipient`; text — `message`/`text`/`content`/`body`; thread —
+  `thread_ts`/`thread`/`parent_ts`/`reply_to`). No declared schema → legacy
+  `channel`/`text`/`thread_ts` (the thread argument assumed present). No
+  match → error listing the available names and the pin hint. Explicit
+  overrides win. A thread reply to a tool whose schema declares no thread
+  argument is an error (nothing is sent).
+- `send_arguments(spec, destination, thread_ts, text)`: the exact arguments
+  object (`thread` key only when `Some`).
+- `tool_result_error(reply)`: the error text when the CallToolResult has
+  `isError`/`is_error` (top-level or wrapped in `metadata.mcp_meta`).
+- `send_outcome(reply)`: best-effort `SendOutcome { ts, permalink, channel }`
+  from (1) top-level or `mcp_meta`-wrapped `structuredContent` plus the
+  result object's own fields, (2) a text block that parses as a JSON object
+  (`message_link`/`permalink`/`url`/`link`, and `message_context`'s
+  `message_ts`/`channel_id`), (3) the first `https://…slack.com` URL in the
+  text (also after unescaping `\/`); the `ts` is parsed out of a
+  `/p<16 digits>` permalink when only a link is available.
+- `text_content`/`json_text`/`field_line`/`find_slack_url`/`ts_from_permalink`
+  plus unit tests for all of the above.
 
 ### `src/mistral_slack.rs` — the Mistral Slack Connector transport
 
@@ -183,6 +260,8 @@ calling the Slack tool of a Mistral platform connector **directly** (no LLM
 in the send path), so the exact approved message still goes to the exact
 approved destination. The Slack credentials live in the Mistral console
 (the connected Slack workspace); this process holds only a Mistral API key.
+Send-tool discovery, argument-name detection and reply parsing are shared
+with the Slack MCP transport in `src/slack_tools.rs`.
 
 - `from_env(state_dir)`: key from `MISTRAL_API_KEY`, else
   `<state_dir>/mistral_api_key` (via the shared `read_secret_file`).
@@ -285,16 +364,20 @@ approved destination. The Slack credentials live in the Mistral console
 - Only protocol bytes go to `output`; log diagnostics to stderr.
 - Tests (`tests/e2e.rs`): drive `mcp::run` in-process with
   `std::os::unix::net::UnixStream::pair()` (macOS/Linux), a scripted
-  `DecisionProvider`, and the mock Slack server from `tests/common/mod.rs`.
-  Cover: initialize/tools/list shape; approve → mock server received the exact
-  message/destination/thread and the agent got `sent` + permalink; deny →
+  `DecisionProvider`, and the mock Slack MCP server from
+  `tests/common/mod.rs` (the gateway's Slack client is a real
+  `SlackMcpClient` pointed at it). Cover: initialize/tools/list shape;
+  approve → the mock's send tool received the exact message/destination/
+  thread as `params.arguments` and the agent got `sent` + permalink; deny →
   `denied` with 600 and a reworded same-destination retry is
   `cooldown_blocked` with remaining time and the provider was NOT called
-  again; feedback → agent gets the text and the mock server saw no call;
+  again; feedback → agent gets the text and the mock saw no send;
   identical retry after approval → `sent` with `duplicate: true` and the
-  mock server's post count unchanged; two concurrent requests with different
+  mock's send count unchanged; two concurrent requests with different
   content get correctly matched decisions (no mixing); a NEW `Gateway` on
-  the same state dir (simulated restart) still returns `cooldown_blocked`.
+  the same state dir (simulated restart) still returns `cooldown_blocked`;
+  a `U…` destination resolves to a display name in the request the provider
+  saw while the send still carries the raw ID.
 
 ### `src/instance.rs` — single-instance coordination and stdio bridges
 
@@ -417,20 +500,26 @@ approved send to finish before exiting. The window is created hidden
   `cd ui && npm install && npm run build`.
 - `scripts/install.sh` installs the app into every detected coding agent on
   this Mac and starts the LaunchAgent service (`--dry-run`, `--enforce`,
-  `--uninstall`, `--token`, `--state-dir`, `--transport`,
+  `--uninstall`, `--slack-mcp-token`, `--state-dir`, `--transport`,
   `--mistral-api-key` flags; see README §0). `scripts/agent_config.py` is
   the per-agent config editor it uses (idempotent, `.bak-sag` backups);
-  `scripts/test_agent_config.py` tests it.
+  `scripts/test_agent_config.py` tests it. `scripts/slack_mcp_oauth.py`
+  runs the Slack MCP user-token OAuth flow (local callback on port 3118,
+  verifies the token against the MCP endpoint, writes
+  `<state-dir>/slack_mcp_token` chmod 600).
 - First builds compile Tauri/wry and take several minutes; that's expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.
-- `cargo test` must pass (core unit tests, slack client tests, mistral
-  connector client tests + transport-selection tests, MCP e2e tests, and
-  the `UiState` bridge tests).
-- `scripts/smoke_test.py` drives the real binary end to end: mock Slack
-  Web API + mock Mistral platform API on one local server, a pty as the
-  CLI terminal, the single-instance bridge path, and one full approve flow
-  with `SLACK_TRANSPORT=mistral-connector` (asserts the exact message went
-  through the connector tool call and no direct Slack API call was made).
+- `cargo test` must pass (core + slack_tools unit tests, Slack MCP client
+  tests, mistral connector client tests + transport-selection tests, MCP
+  e2e tests, and the `UiState` bridge tests).
+- `scripts/smoke_test.py` drives the real binary end to end: a mock Slack
+  MCP server (the default transport) + mock Mistral platform API on one
+  local server, a pty as the CLI terminal, the single-instance bridge path,
+  one full approve flow with `SLACK_TRANSPORT=mistral-connector` (asserts
+  the exact message went through the connector tool call and no Slack MCP
+  call was made), and a destination display-name check (a Slack user ID
+  resolves to a display name in the prompt while the send still carries the
+  exact raw ID).
 - Do not add dependencies beyond those in Cargo.toml unless strictly
   necessary; if you must, keep them minimal and say so in your summary.
 
