@@ -14,7 +14,7 @@
 use slack_approval_gateway::core::{
     Decision, DecisionProvider, Gateway, MessageRequest, ProviderError,
 };
-use slack_approval_gateway::slack::UreqSlackClient;
+use slack_approval_gateway::slack;
 use slack_approval_gateway::{instance, mcp, ui};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -97,12 +97,15 @@ impl DecisionProvider for CliDecisionProvider {
 }
 
 fn build_gateway(provider: Arc<dyn DecisionProvider>, dir: &PathBuf) -> Gateway {
-    let slack = match UreqSlackClient::from_env(dir) {
-        Ok(c) => Arc::new(c),
+    let slack = match slack::build_client(dir) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("slack-approval-gateway: cannot initialize Slack client: {}", e.0);
-            eprintln!("Set SLACK_BOT_TOKEN, or create {}/slack_token (chmod 600) with a bot token.", dir.display());
-            eprintln!("The token needs the chat:write and chat:write.public scopes.");
+            eprintln!("Direct transport (default): set SLACK_BOT_TOKEN, or create {}/slack_token (chmod 600)", dir.display());
+            eprintln!("with a bot token that has the chat:write and chat:write.public scopes.");
+            eprintln!("Mistral Slack Connector transport (SLACK_TRANSPORT=mistral-connector): set MISTRAL_API_KEY,");
+            eprintln!("or create {}/mistral_api_key (chmod 600), and connect the Slack workspace to the", dir.display());
+            eprintln!("Slack connector in the Mistral console.");
             std::process::exit(1);
         }
     };

@@ -15,7 +15,11 @@ and the single-instance bridge: extra agent processes (no --cli) connect to
 the running instance over the state-dir socket and their MCP sessions are
 served by that one instance (same popup owner, same Slack client, shared
 dedupe/cooldowns) — including an explicit error (nothing was sent) when the
-instance is killed while a bridged request is pending.
+instance is killed while a bridged request is pending. The mock server also
+plays the Mistral platform API, and one section runs the whole approve flow
+with SLACK_TRANSPORT=mistral-connector to verify the connector transport
+end to end (exact message sent through the connector tool call, no direct
+Slack API call).
 """
 import fcntl
 import http.server
@@ -42,7 +46,9 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-# ---------------------------------------------------------------- mock Slack
+# ------------------------------------------------- mock Slack + Mistral API
+# One HTTP server plays both the Slack Web API (direct transport) and the
+# Mistral platform API (connector transport).
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -53,8 +59,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
             resp = {"ok": True, "channel": "C123", "ts": "1700000000.000100"}
         elif path == "/chat.getPermalink":
             resp = {"ok": True, "permalink": "https://mock.slack.com/archives/C123/p1700000000000100"}
+        elif path.startswith("/v1/connectors/") and path.endswith("/call"):
+            # MCP CallToolResult: permalink in the text and in structuredContent
+            resp = {
+                "content": [{"type": "text", "text":
+                             "Message sent: https://mock.slack.com/archives/C123/p1700000000000100"}],
+                "metadata": {"mcp_meta": {"structuredContent": {
+                    "ok": True, "channel": "C123", "ts": "1700000000.000100",
+                    "permalink": "https://mock.slack.com/archives/C123/p1700000000000100"}}},
+            }
         else:
             resp = {"ok": False, "error": "unknown_method"}
+        data = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        self.server.requests.append((path, dict(self.headers), None))
+        if path.startswith("/v1/connectors/") and path.endswith("/tools"):
+            # Bare array, like the real API.
+            resp = [
+                {"name": "slack_search_messages", "inputSchema": {"type": "object"}},
+                {"name": "slack_send_message", "inputSchema": {"type": "object"}},
+            ]
+        else:
+            resp = {"detail": "not found"}
         data = json.dumps(resp).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -74,6 +107,24 @@ port = server.server_address[1]
 
 def post_count():
     return sum(1 for p, _, _ in server.requests if p == "/chat.postMessage")
+
+
+def connector_requests(suffix):
+    """Recorded Mistral API requests whose path ends with `suffix`."""
+    return [(p, h, b) for p, h, b in server.requests
+            if p.startswith("/v1/connectors/") and p.endswith(suffix)]
+
+
+def connector_call_count():
+    return len(connector_requests("/call"))
+
+
+def last_connector_call_arguments():
+    """The `arguments` object of the most recent connector tool call."""
+    for p, _, body in reversed(server.requests):
+        if p.startswith("/v1/connectors/") and p.endswith("/call"):
+            return (body or {}).get("arguments", {})
+    return {}
 
 
 # ---------------------------------------------------------------- spawn app
@@ -105,6 +156,7 @@ proc = subprocess.Popen(
     preexec_fn=make_controlling_tty,
 )
 os.close(slave)
+spawned = [proc]  # every instance process, for the finally cleanup
 
 tty_out = bytearray()
 
@@ -455,6 +507,7 @@ try:
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=env, pass_fds=(slave2,), preexec_fn=make_ctty2,
     )
+    spawned.append(proc2)
     os.close(slave2)
     tty_out2 = bytearray()
 
@@ -528,6 +581,126 @@ try:
     proc2.stdin.close()
     proc2.wait(timeout=15)
 
+    # 8b. Mistral Slack Connector transport: a fresh process selected with
+    # SLACK_TRANSPORT=mistral-connector must send the approved message
+    # through the connector tool call (not the Slack Web API) and return
+    # the permalink the connector reports.
+    master3, slave3 = pty.openpty()
+
+    def make_ctty3():
+        os.setsid()
+        fcntl.ioctl(slave3, 0x20007461, 0)
+
+    env3 = dict(env)
+    env3["SLACK_TRANSPORT"] = "mistral-connector"
+    env3["MISTRAL_API_KEY"] = "mistral-smoke-test"
+    env3["MISTRAL_API_BASE"] = f"http://127.0.0.1:{port}"
+    proc3 = subprocess.Popen(
+        [BINARY, "--cli"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env3, pass_fds=(slave3,), preexec_fn=make_ctty3,
+    )
+    spawned.append(proc3)
+    os.close(slave3)
+    tty_out3 = bytearray()
+
+    def tty_reader3():
+        while True:
+            try:
+                chunk = os.read(master3, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            tty_out3.extend(chunk)
+
+    threading.Thread(target=tty_reader3, daemon=True).start()
+    responses3 = {}
+    resp3_lock = threading.Lock()
+
+    def stdout_reader3():
+        for raw in proc3.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg:
+                with resp3_lock:
+                    responses3[msg["id"]] = msg
+
+    threading.Thread(target=stdout_reader3, daemon=True).start()
+
+    def rpc3(id_, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": id_, "method": method}
+        if params is not None:
+            msg["params"] = params
+        proc3.stdin.write((json.dumps(msg) + "\n").encode())
+        proc3.stdin.flush()
+
+    def wait_response3(id_, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with resp3_lock:
+                if id_ in responses3:
+                    return responses3[id_]
+            time.sleep(0.05)
+        raise AssertionError(f"timeout waiting for response id={id_} (connector)")
+
+    def wait_tty3(pattern, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pattern.encode() in tty_out3:
+                return
+            time.sleep(0.05)
+        raise AssertionError(
+            f"timeout waiting for tty pattern {pattern!r}; tty tail: {bytes(tty_out3[-1500:])!r}"
+        )
+
+    def answer3(text):
+        os.write(master3, (text + "\n").encode())
+
+    posts_before_conn = post_count()
+    calls_before_conn = connector_call_count()
+    rpc3(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "smoke-connector", "version": "0"}})
+    wait_response3(1)
+    args3 = {
+        "message": "Sent via the Mistral connector",
+        "destination": "#general",
+        "reason": "smoke test (connector transport)",
+        "agent": "smoke-agent",
+        "conversation": {"title": "Smoke test conversation", "id_or_link": "smoke-connector",
+                         "summary": "Verifying the Mistral Slack Connector transport."},
+    }
+    rpc3(2, "tools/call", {"name": "request_slack_message", "arguments": args3})
+    wait_tty3("Sent via the Mistral connector")
+    wait_tty3("Approve [a]")
+    answer3("a")
+    r = wait_response3(2)
+    v = verdict(r)
+    check("connector transport: approve returns sent with the connector permalink",
+          v.get("status") == "sent"
+          and v.get("permalink") == "https://mock.slack.com/archives/C123/p1700000000000100",
+          json.dumps(v))
+    check("connector transport: the send tool was discovered and called once",
+          len(connector_requests("/tools")) >= 1
+          and connector_call_count() == calls_before_conn + 1,
+          f"calls={connector_call_count()}")
+    conn_args = last_connector_call_arguments()
+    check("connector tool call carried the exact message and destination",
+          conn_args.get("text") == "Sent via the Mistral connector"
+          and conn_args.get("channel") == "#general",
+          json.dumps(conn_args))
+    check("connector transport: no direct Slack API call was made",
+          post_count() == posts_before_conn,
+          f"posts={post_count()} before={posts_before_conn}")
+
+    proc3.stdin.close()
+    proc3.wait(timeout=15)
+
     # 9. invalid params -> JSON-RPC error
     print()
     if failures:
@@ -535,7 +708,7 @@ try:
         sys.exit(1)
     print("SMOKE TEST PASSED: all checks green")
 finally:
-    for p in [proc] + bridges:
+    for p in spawned + bridges:
         if p.poll() is None:
             p.kill()
     server.shutdown()

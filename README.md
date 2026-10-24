@@ -76,11 +76,14 @@ This installs the gateway on this Mac end to end:
 
 1. Builds the frontend and the release binary.
 2. Installs the binary to `~/.local/bin/slack-approval-gateway`.
-3. Creates `~/.slack-approval-gateway/` (mode 700) and writes the bot token
-   to `slack_token` (mode 600) — the only place the token lives. Without
-   `--token`/`SLACK_BOT_TOKEN` a placeholder is written; sends then fail
-   until you install a real token (`scripts/install.sh --token xoxb-...`,
-   the service restarts and reads the file at startup).
+3. Creates `~/.slack-approval-gateway/` (mode 700) and writes the credential
+   files (mode 600) — the only place a credential lives: `slack_token` for
+   the default direct transport, or `slack_transport` +
+   `mistral_api_key` for the Mistral Slack Connector transport (below).
+   Without a credential a placeholder is written; sends then fail until you
+   install a real one (`scripts/install.sh --token xoxb-...` or
+   `scripts/install.sh --transport mistral-connector --mistral-api-key ...`;
+   the service restarts and reads the files at startup).
 4. Installs a LaunchAgent (`com.speakeasy.slack-approval-gateway`) that
    starts the single gateway instance at login (`--serve`: UI + MCP socket,
    no agent on stdio). Logs: `~/.slack-approval-gateway/gateway.log`.
@@ -90,7 +93,8 @@ This installs the gateway on this Mac end to end:
 6. Audits the exclusivity boundary (below) and prints findings.
 
 Flags: `--dry-run`, `--enforce`, `--uninstall [--purge]`, `--skip-build`,
-`--token xoxb-...`, `--state-dir DIR`. Every modified config file is backed
+`--token xoxb-...`, `--state-dir DIR`, `--transport direct|mistral-connector`,
+`--mistral-api-key KEY`. Every modified config file is backed
 up once to `<file>.bak-sag`; `--uninstall` restores them.
 
 | Agent | Detected via | Config written |
@@ -160,6 +164,63 @@ Optional environment variables:
 - `SLACK_GATEWAY_STATE_DIR` — state directory (default
   `~/.slack-approval-gateway`). Holds `cooldowns.json`, `sent.json`, and lock
   files; everything persists across restarts.
+
+### 1b. Slack transport: direct vs Mistral Slack Connector
+
+The gateway can send the approved message two ways, selected once per
+install (or per process via env):
+
+| | `direct` (default) | `mistral-connector` |
+|---|---|---|
+| Send path | Slack Web API (`chat.postMessage`) | Mistral Slack Connector tool call (`POST /v1/connectors/{c}/tools/{t}/call`) |
+| Credential the app holds | Slack bot token (`slack_token` / `SLACK_BOT_TOKEN`) | Mistral API key (`mistral_api_key` / `MISTRAL_API_KEY`) |
+| Where Slack credentials live | the app's state dir | the **Mistral console** (the connected Slack workspace) |
+| Agent-facing behavior | identical — same popup, same verdicts, same dedupe/cooldowns | identical |
+
+The connector transport is an **option**: it trades holding a Slack bot token
+for holding a Mistral API key, and moves the Slack workspace connection into
+the Mistral console. The gateway calls the connector's send tool **directly**
+(no LLM in the send path), so the exact approved message still goes to the
+exact approved destination.
+
+Setup:
+
+1. In the Mistral console, connect your Slack workspace to the **Slack
+   connector** (the connector named `slack`). Until the workspace is
+   connected there, connector sends fail with
+   `No credentials found for connector 'slack'`.
+2. Install with the connector transport:
+
+   ```sh
+   scripts/install.sh --transport mistral-connector --mistral-api-key "$MISTRAL_API_KEY"
+   ```
+
+   This writes `slack_transport` (`mistral-connector`) and `mistral_api_key`
+   (mode 600) into the state dir and restarts the service. No Slack bot token
+   is needed or written.
+
+3. Manual selection (same precedence): `SLACK_TRANSPORT=mistral-connector`
+   in the gateway's environment, else a one-line `slack_transport` file in
+   the state dir, else `direct`.
+
+Optional environment variables (connector transport):
+
+- `MISTRAL_API_KEY` — the key, if not in `<state-dir>/mistral_api_key`.
+- `MISTRAL_API_BASE` — override the Mistral API endpoint (default
+  `https://api.mistral.ai`; used by tests).
+- `MISTRAL_SLACK_CONNECTOR` — connector name or id (default `slack`).
+- `MISTRAL_SLACK_TOOL` — pin the exact send-tool name (skips discovery).
+  Needed if the connector's tool list has no name containing "send"/"post"
+  + "message"; without a pin the gateway discovers it once (first match)
+  and caches it.
+- `MISTRAL_SLACK_CHANNEL_ARG`, `MISTRAL_SLACK_TEXT_ARG`,
+  `MISTRAL_SLACK_THREAD_ARG` — rename the tool arguments the connector
+  expects (defaults `channel`, `text`, `thread_ts`).
+
+The exclusivity boundary is unchanged: agents still reach Slack only through
+the gateway. With the connector transport the app never holds Slack
+credentials at all — they live in the Mistral console, and the gateway only
+holds a Mistral API key scoped to calling that connector's tools.
 
 ### 2. Launching the app
 
@@ -250,8 +311,11 @@ intended path that sends:
   is what stands between an agent and a direct Slack write when the agent
   does not go through the gateway.
 - Prefer running agents as a **separate OS user** that cannot read the
-  gateway's state directory (which contains `slack_token`). An agent
-  running as the same user could read the token file directly.
+  gateway's state directory (which contains `slack_token`, or
+  `mistral_api_key` with the connector transport). An agent running as the
+  same user could read the credential file directly. With the connector
+  transport the Slack credentials never touch this machine — they live in
+  the Mistral console — so the file to protect is the Mistral API key.
 - MCP is stdio (plus the local Unix socket for bridges), so agents must run
   on the same machine as the gateway.
 - Keep the token file `chmod 600` (the installer does this).
@@ -289,27 +353,34 @@ intended path that sends:
 ```sh
 cd ui && npm install && npm run build && cd ..   # frontend (required once)
 cargo build --release    # first build compiles Tauri/wry; takes minutes
-cargo test               # 59 lib + 13 MCP e2e + 3 instance-socket + 12 Slack tests
+cargo test               # 67 lib + 13 MCP e2e + 3 instance-socket + 12 Slack
+                         # + 14 Mistral-connector tests
 cargo test -- --ignored  # also the 15s HTTP timeout test
-python3 scripts/smoke_test.py        # drives the real binary (mock Slack + pty + bridges)
+python3 scripts/smoke_test.py        # drives the real binary (mock Slack +
+                                     # mock Mistral API + pty + bridges)
 python3 scripts/test_agent_config.py # installer config-edit helper tests
 bash scripts/install.sh --dry-run    # preview the agent install
 ```
 
 `docs/SPEC.md` is the module contract (`core` = gateway/cooldowns/dedupe,
-`slack` = the only credential holder, `mcp` = JSON-RPC server,
+`slack` = transport selection + the only direct credential holder,
+`mistral_slack` = the connector transport, `mcp` = JSON-RPC server,
 `instance` = single-instance coordination + stdio bridges, `ui` = the Tauri
 webview bridge). GUI behavior is verified by build + spec review plus the
 IPC bridge unit tests; the decision flows are covered by the test suite,
 the smoke script (which also exercises the bridge path against a live
-instance), and a manual run of the installed service.
+instance and the connector transport against a mock Mistral API), and a
+manual run of the installed service.
 
 ## Layout
 
 ```
 ├── src/core.rs       gateway: validation, purpose fingerprinting, persisted
 │                     deny cooldowns, persisted sent-record dedupe, decision flow
-├── src/slack.rs      Slack Web API client (only place credentials exist)
+├── src/slack.rs      transport selection + Slack Web API client (the only
+│                     place a direct Slack credential exists)
+├── src/mistral_slack.rs  Mistral Slack Connector client (alternative
+│                     transport; holds only a Mistral API key)
 ├── src/mcp.rs        MCP JSON-RPC server (one tool: request_slack_message)
 ├── src/instance.rs   single-instance coordination: gateway.lock/gateway.sock,
 │                     stdio<->socket bridges, stale-lock recovery

@@ -114,13 +114,28 @@ Public API is fully declared in the stub. Implement:
   blocked; expired cooldown passes; persistence roundtrip (new `Gateway` on
   same dir still blocks); provider error → `Error`, nothing sent.
 
-### `src/slack.rs` — the only place credentials live
+### `src/slack.rs` — transport selection + the direct Slack client
 
-- `from_env(state_dir)`: token from `SLACK_BOT_TOKEN`, else read
-  `<state_dir>/slack_token` (trim whitespace). Error if neither. API base
-  from `SLACK_API_BASE` (default `https://slack.com/api`, trailing slash
-  stripped).
-- `new(token, api_base)`.
+This module owns **transport selection** and the `direct` transport. The
+only credential it can hold is a Slack bot token; the alternative
+(`mistral-connector`) holds a Mistral API key and lives in
+`src/mistral_slack.rs`.
+
+- `resolve_transport(state_dir) -> Result<SlackTransport, SlackError>`:
+  `SLACK_TRANSPORT` env (`direct` | `mistral-connector`; aliases
+  `mistral_connector`/`connector`), else a one-line
+  `<state_dir>/slack_transport` file, else `Direct`. Unknown values are an
+  error naming the accepted ones.
+- `build_client(state_dir) -> Result<Arc<dyn SlackClient>, SlackError>`:
+  dispatch on the selected transport; `src/main.rs` calls this once at
+  startup and exits with usage hints (naming what the selected transport
+  needs) on error.
+- `UreqSlackClient::from_env(state_dir)`: token from `SLACK_BOT_TOKEN`,
+  else read `<state_dir>/slack_token` (trim whitespace; the shared
+  `read_secret_file` helper also names the env var in its error). Error if
+  neither. API base from `SLACK_API_BASE` (default
+  `https://slack.com/api`, trailing slash stripped).
+- `UreqSlackClient::new(token, api_base)`.
 - `post_message`: `POST {api_base}/chat.postMessage` with
   `Authorization: Bearer <token>` and JSON body
   `{channel, text, thread_ts?}` (`thread_ts` only when `Some`). Slack's API
@@ -140,6 +155,52 @@ Public API is fully declared in the stub. Implement:
   `channel`/`text`/`thread_ts` in the body; `thread_ts` key absent when
   `None`; `SlackSend` fields from `chat.postMessage` + `chat.getPermalink`;
   `{ok:false,error}` → `SlackError`; `from_env` reads token file.
+
+### `src/mistral_slack.rs` — the Mistral Slack Connector transport
+
+`MistralConnectorSlackClient` implements the same `SlackClient` contract by
+calling the Slack tool of a Mistral platform connector **directly** (no LLM
+in the send path), so the exact approved message still goes to the exact
+approved destination. The Slack credentials live in the Mistral console
+(the connected Slack workspace); this process holds only a Mistral API key.
+
+- `from_env(state_dir)`: key from `MISTRAL_API_KEY`, else
+  `<state_dir>/mistral_api_key` (via the shared `read_secret_file`).
+  `MISTRAL_API_BASE` (default `https://api.mistral.ai`),
+  `MISTRAL_SLACK_CONNECTOR` (default `slack`), `MISTRAL_SLACK_TOOL` (pin
+  the send tool), and argument renames `MISTRAL_SLACK_CHANNEL_ARG` /
+  `MISTRAL_SLACK_TEXT_ARG` / `MISTRAL_SLACK_THREAD_ARG` (defaults
+  `channel` / `text` / `thread_ts`).
+- Send-tool discovery: `GET {api_base}/v1/connectors/{connector}/tools?page_size=100`
+  (bare JSON array; `data`/`items` wrappers also accepted), first tool whose
+  lowercase name contains ("send"|"post") and "message", cached for the
+  life of the client (`Mutex<Option<String>>`). No match → error listing
+  the available names and the `MISTRAL_SLACK_TOOL` hint. A pinned tool
+  skips discovery.
+- `post_message`: `POST {api_base}/v1/connectors/{connector}/tools/{tool}/call`
+  with `Authorization: Bearer <key>` and body
+  `{"arguments": {channel_arg: destination, text_arg: text, thread_arg?}}`
+  (`thread_arg` only when `Some`). The reply is an MCP CallToolResult:
+  `metadata.mcp_meta.isError`/`is_error` → `SlackError` with the joined
+  text blocks; otherwise `(ts, permalink)` from
+  `metadata.mcp_meta.structuredContent` (`ts`/`message_ts` +
+  `permalink`/`url`/`link`), falling back to the first `https://…slack.com`
+  URL in the text blocks (the `ts` is parsed out of a `/p<16 digits>`
+  permalink), then to `fallback_permalink(destination, ts)`.
+- HTTP rules mirror the direct client: statuses inspected by hand (the
+  platform's `{"detail": …}` error body is reported), 30s timeout,
+  redirects never followed (the bearer key must not leak), and the API key
+  never appears in error text or `Debug` output.
+- Tests (`tests/mistral_slack_test.rs`): a mock Mistral platform API
+  (`MockMistralServer` in `tests/common/mod.rs`, same recording contract as
+  the mock Slack server) serving the tool catalog and canned CallToolResult
+  replies. Assert: discovery + exact `arguments` + bearer key; outcome from
+  structured content, from text, and the constructed fallback;
+  `thread_ts` absent when `None`; pinned tool skips discovery; argument
+  renames; `isError` → `SlackError`; HTTP error → `SlackError` with
+  `detail` and never the key; no send tool → error listing names;
+  discovery cached across calls; `from_env` key file + arg overrides;
+  `resolve_transport` precedence (env > file > default).
 
 ### `src/mcp.rs` — MCP JSON-RPC server (stdio and socket)
 
@@ -308,13 +369,20 @@ approved send to finish before exiting. The window is created hidden
   `cd ui && npm install && npm run build`.
 - `scripts/install.sh` installs the app into every detected coding agent on
   this Mac and starts the LaunchAgent service (`--dry-run`, `--enforce`,
-  `--uninstall` flags; see README §0). `scripts/agent_config.py` is the
-  per-agent config editor it uses (idempotent, `.bak-sag` backups);
+  `--uninstall`, `--token`, `--state-dir`, `--transport`,
+  `--mistral-api-key` flags; see README §0). `scripts/agent_config.py` is
+  the per-agent config editor it uses (idempotent, `.bak-sag` backups);
   `scripts/test_agent_config.py` tests it.
 - First builds compile Tauri/wry and take several minutes; that's expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.
-- `cargo test` must pass (core unit tests, slack client tests, MCP e2e
-  tests, and the `UiState` bridge tests).
+- `cargo test` must pass (core unit tests, slack client tests, mistral
+  connector client tests + transport-selection tests, MCP e2e tests, and
+  the `UiState` bridge tests).
+- `scripts/smoke_test.py` drives the real binary end to end: mock Slack
+  Web API + mock Mistral platform API on one local server, a pty as the
+  CLI terminal, the single-instance bridge path, and one full approve flow
+  with `SLACK_TRANSPORT=mistral-connector` (asserts the exact message went
+  through the connector tool call and no direct Slack API call was made).
 - Do not add dependencies beyond those in Cargo.toml unless strictly
   necessary; if you must, keep them minimal and say so in your summary.
 
