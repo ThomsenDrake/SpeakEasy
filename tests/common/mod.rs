@@ -2,6 +2,8 @@
 //!
 //! - [`MockSlackServer`]: a local stand-in for the Slack Web API. It records
 //!   every request and replies with canned JSON.
+//! - [`MockMistralServer`]: a local stand-in for the Mistral platform API
+//!   (connector tool listing and tool calls). Same recording contract.
 //! - [`ScriptedProvider`]: a [`DecisionProvider`] that replays scripted
 //!   human decisions and records what it was asked about.
 //! - [`temp_state_dir`]: a fresh, unique gateway state directory.
@@ -12,6 +14,7 @@
 
 use serde_json::{json, Value};
 use slack_approval_gateway::core::{Decision, DecisionProvider, MessageRequest, ProviderError};
+use slack_approval_gateway::mistral_slack::MistralConnectorSlackClient;
 use slack_approval_gateway::slack::UreqSlackClient;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -26,10 +29,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// `Authorization: Bearer xoxb-test-token`.
 pub const TEST_TOKEN: &str = "xoxb-test-token";
 
+/// Mistral API key used by [`MockMistralServer::client`]. Requests made with
+/// it carry `Authorization: Bearer mistral-test-key`.
+pub const TEST_MISTRAL_KEY: &str = "mistral-test-key";
+
 /// Lock a mutex, ignoring poisoning (a panicking test thread must not cascade
 /// into unrelated assertions).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Routing and recording interface shared by the mock API servers
+/// ([`MockSlackServer`], [`MockMistralServer`]).
+trait MockApi: Send + Sync {
+    /// The canned reply for one request (computed before recording).
+    fn route(&self, req: &RecordedRequest) -> Reply;
+    /// Record a request (after routing, before the reply is written, so it
+    /// is visible as soon as the client call returns).
+    fn record(&self, req: RecordedRequest);
+    /// True when the accept loop should stop.
+    fn shutdown_requested(&self) -> bool;
+    /// Signal shutdown (called by the server handle's `Drop`).
+    fn stop(&self);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +134,8 @@ impl MockSlackServer {
             next_ts: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
         });
-        let thread_state = Arc::clone(&state);
-        let accept_thread = std::thread::spawn(move || accept_loop(listener, thread_state));
+        let api: Arc<dyn MockApi> = state.clone();
+        let accept_thread = std::thread::spawn(move || accept_loop(listener, api));
         Self {
             addr,
             state,
@@ -178,7 +199,7 @@ impl MockSlackServer {
 
 impl Drop for MockSlackServer {
     fn drop(&mut self) {
-        self.state.shutdown.store(true, Ordering::SeqCst);
+        self.state.stop();
         // Wake the blocking accept() so the loop sees the flag. Join only if
         // the wake-up connection succeeded; otherwise leave the thread
         // detached rather than risk blocking the test.
@@ -190,15 +211,30 @@ impl Drop for MockSlackServer {
     }
 }
 
-fn accept_loop(listener: TcpListener, state: Arc<MockState>) {
+impl MockApi for MockState {
+    fn route(&self, req: &RecordedRequest) -> Reply {
+        route_slack(req, self)
+    }
+    fn record(&self, req: RecordedRequest) {
+        lock(&self.requests).push(req);
+    }
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+    fn stop(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+fn accept_loop(listener: TcpListener, api: Arc<dyn MockApi>) {
     for stream in listener.incoming() {
-        if state.shutdown.load(Ordering::SeqCst) {
+        if api.shutdown_requested() {
             break;
         }
         let Ok(stream) = stream else { continue };
-        let state = Arc::clone(&state);
+        let api = Arc::clone(&api);
         std::thread::spawn(move || {
-            let _ = serve_connection(stream, &state);
+            let _ = serve_connection(stream, &*api);
         });
     }
 }
@@ -222,7 +258,7 @@ impl RawRequest {
 }
 
 /// Serve exactly one request on `stream`, then close it.
-fn serve_connection(stream: TcpStream, state: &MockState) -> std::io::Result<()> {
+fn serve_connection(stream: TcpStream, api: &dyn MockApi) -> std::io::Result<()> {
     // Bound every read/write so a misbehaving client cannot pin a thread.
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -248,13 +284,30 @@ fn serve_connection(stream: TcpStream, state: &MockState) -> std::io::Result<()>
         content_type: raw.header("content-type").map(str::to_string),
         body,
     };
-    let reply = route(&recorded, state);
-    lock(&state.requests).push(recorded);
+    let reply = api.route(&recorded);
+    api.record(recorded);
 
     let (status, content_type, payload) = match reply {
-        Reply::Json(json) => ("200 OK", "application/json; charset=utf-8", json.to_string()),
-        Reply::Raw(raw) => ("200 OK", "application/json; charset=utf-8", raw),
-        Reply::NotFound => ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string()),
+        Reply::Json(json) => (
+            "200 OK".to_string(),
+            "application/json; charset=utf-8".to_string(),
+            json.to_string(),
+        ),
+        Reply::Raw(raw) => (
+            "200 OK".to_string(),
+            "application/json; charset=utf-8".to_string(),
+            raw,
+        ),
+        Reply::Status(code, body) => (
+            format!("{} {}", code, reason_phrase(code)),
+            "application/json; charset=utf-8".to_string(),
+            body,
+        ),
+        Reply::NotFound => (
+            "404 Not Found".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+            "not found".to_string(),
+        ),
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -270,8 +323,23 @@ enum Reply {
     Json(Value),
     /// `200 OK` with this body verbatim (see `set_post_message_raw_reply`).
     Raw(String),
+    /// A non-200 status code with this JSON body (e.g. a forced API error).
+    Status(u16, String),
     /// `404 Not Found`.
     NotFound,
+}
+
+/// Reason phrase for the status codes the mocks produce.
+fn reason_phrase(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        _ => "Error",
+    }
 }
 
 /// The channel ID Slack would report for a destination: IDs are echoed
@@ -294,7 +362,7 @@ pub fn mock_channel_id(destination: &str) -> String {
 }
 
 /// Canned Slack reply for a request.
-fn route(req: &RecordedRequest, state: &MockState) -> Reply {
+fn route_slack(req: &RecordedRequest, state: &MockState) -> Reply {
     if req.method != "POST" {
         return Reply::NotFound;
     }
@@ -396,6 +464,205 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<RawRequest>
         reader.read_exact(&mut raw.body)?;
     }
     Ok(Some(raw))
+}
+
+// ---------------------------------------------------------------------------
+// Mock Mistral platform API (Slack connector)
+// ---------------------------------------------------------------------------
+
+/// State shared between the mock Mistral API server handle and its threads.
+struct MockMistralState {
+    requests: Mutex<Vec<RecordedRequest>>,
+    /// The connector's tool catalog, served by `GET /v1/connectors/*/tools`.
+    tools: Mutex<Vec<Value>>,
+    /// Exact JSON reply for tool calls when set (`None` = the default reply).
+    tool_reply: Mutex<Option<Value>>,
+    /// Forced tool-call failure: HTTP status + `{"detail": …}` body.
+    call_error: Mutex<Option<(u16, String)>>,
+    shutdown: AtomicBool,
+}
+
+/// A mock Mistral platform API on `127.0.0.1:<random port>`.
+///
+/// Routes (anything else gets `404 Not Found`):
+/// - `GET /v1/connectors/{connector}/tools` replies with the tool catalog as
+///   a bare JSON array (what the real API returns), settable with
+///   [`set_tools`](Self::set_tools). The default catalog lists
+///   `slack_search_messages`, `slack_list_channels` and `slack_send_message`.
+/// - `POST /v1/connectors/{connector}/tools/{tool}/call` replies with an MCP
+///   CallToolResult-shaped JSON document: a text block containing a Slack
+///   permalink plus `metadata.mcp_meta.structuredContent` with
+///   `{ok, channel, ts, permalink}`. Replace it with
+///   [`set_tool_reply`](Self::set_tool_reply), or force a non-200 status with
+///   `{"detail": …}` via [`set_call_error`](Self::set_call_error).
+///
+/// Like [`MockSlackServer`], every request is recorded (including its
+/// `Authorization` header and parsed JSON body), each connection is served on
+/// its own thread, and dropping the server stops the accept loop.
+pub struct MockMistralServer {
+    addr: SocketAddr,
+    state: Arc<MockMistralState>,
+    accept_thread: Option<JoinHandle<()>>,
+}
+
+impl MockMistralServer {
+    /// Bind `127.0.0.1:0` and start serving on a background thread.
+    pub fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Mistral server");
+        let addr = listener.local_addr().expect("mock Mistral server address");
+        let state = Arc::new(MockMistralState {
+            requests: Mutex::new(Vec::new()),
+            tools: Mutex::new(default_mistral_tools()),
+            tool_reply: Mutex::new(None),
+            call_error: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        });
+        let api: Arc<dyn MockApi> = state.clone();
+        let accept_thread = std::thread::spawn(move || accept_loop(listener, api));
+        Self {
+            addr,
+            state,
+            accept_thread: Some(accept_thread),
+        }
+    }
+
+    /// API base URL to hand to the client, e.g. `http://127.0.0.1:54321`
+    /// (no trailing slash; the client appends `/v1/connectors/...`).
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// A real [`MistralConnectorSlackClient`] pointed at this server, using
+    /// [`TEST_MISTRAL_KEY`].
+    pub fn client(&self) -> MistralConnectorSlackClient {
+        MistralConnectorSlackClient::new(TEST_MISTRAL_KEY, self.base_url())
+    }
+
+    /// Every request received so far, in arrival order.
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        lock(&self.state.requests).clone()
+    }
+
+    /// Requests received for one path prefix, e.g. `"/v1/connectors/slack/tools"`.
+    pub fn requests_to(&self, path: &str) -> Vec<RecordedRequest> {
+        lock(&self.state.requests)
+            .iter()
+            .filter(|r| r.path == path)
+            .cloned()
+            .collect()
+    }
+
+    /// Recorded tool calls (`POST /v1/connectors/{c}/tools/{t}/call`), in
+    /// arrival order.
+    pub fn tool_calls(&self) -> Vec<RecordedRequest> {
+        lock(&self.state.requests)
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/call"))
+            .cloned()
+            .collect()
+    }
+
+    /// Replace the connector's tool catalog.
+    pub fn set_tools(&self, tools: Vec<Value>) {
+        *lock(&self.state.tools) = tools;
+    }
+
+    /// Serve this exact JSON document for every tool call (`None` restores
+    /// the default reply).
+    pub fn set_tool_reply(&self, reply: Option<Value>) {
+        *lock(&self.state.tool_reply) = reply;
+    }
+
+    /// Make tool calls fail with an HTTP status and a `{"detail": …}` body
+    /// (`None` restores success).
+    pub fn set_call_error(&self, error: Option<(u16, &str)>) {
+        *lock(&self.state.call_error) = error.map(|(code, detail)| (code, detail.to_string()));
+    }
+}
+
+impl Drop for MockMistralServer {
+    fn drop(&mut self) {
+        self.state.stop();
+        if TcpStream::connect_timeout(&self.addr, Duration::from_secs(1)).is_ok() {
+            if let Some(handle) = self.accept_thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl MockApi for MockMistralState {
+    fn route(&self, req: &RecordedRequest) -> Reply {
+        route_mistral(req, self)
+    }
+    fn record(&self, req: RecordedRequest) {
+        lock(&self.requests).push(req);
+    }
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+    fn stop(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The default connector tool catalog: two read tools plus the send tool
+/// with `channel`/`text`/`thread_ts` arguments.
+fn default_mistral_tools() -> Vec<Value> {
+    json!([
+        { "name": "slack_search_messages", "inputSchema": { "type": "object" } },
+        { "name": "slack_list_channels", "inputSchema": { "type": "object" } },
+        { "name": "slack_send_message", "inputSchema": { "type": "object", "properties": {
+            "channel": { "type": "string" }, "text": { "type": "string" },
+            "thread_ts": { "type": "string" }
+        } } }
+    ])
+    .as_array()
+    .expect("default tool catalog is an array")
+    .clone()
+}
+
+/// The default tool-call reply: an MCP CallToolResult with the permalink in
+/// both the text block and the structured content.
+fn default_tool_reply() -> Value {
+    json!({
+        "content": [{ "type": "text",
+            "text": "Message sent to #general: https://mock.slack.com/archives/CGENERAL/p1700000000000100" }],
+        "metadata": { "mcp_meta": { "structuredContent": {
+            "ok": true, "channel": "CGENERAL", "ts": "1700000000.000100",
+            "permalink": "https://mock.slack.com/archives/CGENERAL/p1700000000000100"
+        } } }
+    })
+}
+
+/// Canned Mistral API reply for a request. Paths look like
+/// `/v1/connectors/{connector}/tools` (list) or
+/// `/v1/connectors/{connector}/tools/{tool}/call` (invoke).
+fn route_mistral(req: &RecordedRequest, state: &MockMistralState) -> Reply {
+    let segments: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
+    let is_tools = segments.len() == 4
+        && segments[0] == "v1"
+        && segments[1] == "connectors"
+        && segments[3] == "tools";
+    let is_call = segments.len() == 6
+        && segments[0] == "v1"
+        && segments[1] == "connectors"
+        && segments[3] == "tools"
+        && segments[5] == "call";
+    if is_tools && req.method == "GET" {
+        // The real API answers with a bare array of tools.
+        return Reply::Json(Value::Array(lock(&state.tools).clone()));
+    }
+    if is_call && req.method == "POST" {
+        if let Some((code, detail)) = lock(&state.call_error).clone() {
+            return Reply::Status(code, json!({ "detail": detail }).to_string());
+        }
+        if let Some(reply) = lock(&state.tool_reply).clone() {
+            return Reply::Json(reply);
+        }
+        return Reply::Json(default_tool_reply());
+    }
+    Reply::NotFound
 }
 
 // ---------------------------------------------------------------------------

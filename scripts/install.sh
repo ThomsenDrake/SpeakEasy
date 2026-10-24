@@ -5,8 +5,9 @@
 # What it does:
 #   1. Builds the app (frontend + release binary).
 #   2. Installs the binary to ~/.local/bin/slack-approval-gateway.
-#   3. Sets up the state dir and the Slack bot token file (chmod 600). The
-#      gateway is the only component that ever sees the token.
+#   3. Sets up the state dir, the Slack transport selection, and the
+#      credential files (chmod 600). The gateway is the only component
+#      that ever sees a credential.
 #   4. Installs a LaunchAgent so the single gateway instance starts at login
 #      (--serve: UI + MCP socket, no agent on stdio). Agent-spawned copies
 #      of the binary bridge to this instance over the state-dir socket, so
@@ -25,6 +26,8 @@
 # Usage:
 #   scripts/install.sh [--dry-run] [--enforce] [--uninstall] [--purge]
 #                      [--skip-build] [--token xoxb-...] [--state-dir DIR]
+#                      [--transport direct|mistral-connector]
+#                      [--mistral-api-key KEY]
 #
 #   --dry-run     print what would happen, change nothing
 #   --enforce     also remove direct Slack MCP servers from agent configs
@@ -40,6 +43,17 @@
 #                 placeholder is written and sends fail until you set a real
 #                 token:  scripts/install.sh --token xoxb-...
 #   --state-dir   state dir (default ~/.slack-approval-gateway)
+#   --transport   how the gateway sends to Slack (default: direct):
+#                 direct             Slack Web API with the bot token above;
+#                 mistral-connector  the Mistral Slack Connector — Slack
+#                                    credentials live in the Mistral console
+#                                    (connect the workspace there first), and
+#                                    the gateway only holds a Mistral API key.
+#   --mistral-api-key  Mistral API key, stored only in
+#                 <state-dir>/mistral_api_key (chmod 600). Falls back to
+#                 $MISTRAL_API_KEY. Required for the mistral-connector
+#                 transport; without it a placeholder is written and sends
+#                 fail until you set a real key.
 
 set -euo pipefail
 
@@ -61,27 +75,40 @@ PURGE=0
 SKIP_BUILD=0
 TOKEN_ARG=""
 STATE_DIR="$DEFAULT_STATE_DIR"
+TRANSPORT_ARG=""
+MISTRAL_KEY_ARG=""
 
-prev=""
+expect_value=""
 for arg in "$@"; do
-  case "$prev" in
-    --token) TOKEN_ARG="$arg" ;;
-    --state-dir) STATE_DIR="$arg" ;;
-  esac
+  if [ -n "$expect_value" ]; then
+    case "$expect_value" in
+      --token) TOKEN_ARG="$arg" ;;
+      --state-dir) STATE_DIR="$arg" ;;
+      --transport) TRANSPORT_ARG="$arg" ;;
+      --mistral-api-key) MISTRAL_KEY_ARG="$arg" ;;
+    esac
+    expect_value=""
+    continue
+  fi
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --enforce) ENFORCE=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
-    --token|--state-dir) : ;;  # value consumed on the next iteration
+    --token|--state-dir|--transport|--mistral-api-key) expect_value="$arg" ;;
     --token=*) TOKEN_ARG="${arg#--token=}" ;;
     --state-dir=*) STATE_DIR="${arg#--state-dir=}" ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    --transport=*) TRANSPORT_ARG="${arg#--transport=}" ;;
+    --mistral-api-key=*) MISTRAL_KEY_ARG="${arg#--mistral-api-key=}" ;;
+    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
   esac
-  prev="$arg"
 done
+if [ -n "$expect_value" ]; then
+  echo "missing value for $expect_value (see --help)" >&2
+  exit 2
+fi
 
 say() { printf '%s\n' "$*"; }
 hr() { say ""; say "────────────────────────────────────────────────────────────"; }
@@ -220,40 +247,102 @@ run install -m 0755 "$BINARY" "$INSTALL_BIN"
 say "  installed: $INSTALL_BIN"
 
 # --------------------------------------------------------------------------- #
-# 3. state dir + token
+# 3. state dir, transport, and credentials
 # --------------------------------------------------------------------------- #
 hr
-say "3. State dir and Slack token"
+say "3. State dir, transport, and credentials"
 hr
 run mkdir -p "$STATE_DIR"
 if [ "$DRY_RUN" = 0 ]; then chmod 700 "$STATE_DIR"; fi
-TOKEN_FILE="$STATE_DIR/slack_token"
-TOKEN="$TOKEN_ARG"
-if [ -z "$TOKEN" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then TOKEN="$SLACK_BOT_TOKEN"; fi
-if [ -n "$TOKEN" ]; then
+
+# --- transport selection (--transport direct|mistral-connector)
+TRANSPORT="$TRANSPORT_ARG"
+if [ -z "$TRANSPORT" ]; then TRANSPORT="direct"; fi
+case "$TRANSPORT" in
+  direct|mistral-connector) ;;
+  *) say "unknown --transport value: $TRANSPORT (expected direct or mistral-connector)" >&2; exit 2 ;;
+esac
+TRANSPORT_FILE="$STATE_DIR/slack_transport"
+if [ -n "$TRANSPORT_ARG" ]; then
   if [ "$DRY_RUN" = 0 ]; then
-    umask 077
-    printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
-    chmod 600 "$TOKEN_FILE"
+    printf '%s\n' "$TRANSPORT" > "$TRANSPORT_FILE"
   else
-    say "  [dry-run] write $TOKEN_FILE (chmod 600)"
+    say "  [dry-run] write $TRANSPORT_FILE ($TRANSPORT)"
   fi
-  say "  wrote $TOKEN_FILE (chmod 600) — the only place the token lives"
-elif [ -f "$TOKEN_FILE" ]; then
-  say "  keeping existing $TOKEN_FILE"
+  say "  transport: $TRANSPORT (written to $TRANSPORT_FILE)"
+elif [ -f "$TRANSPORT_FILE" ]; then
+  say "  keeping existing transport selection in $TRANSPORT_FILE ($(cat "$TRANSPORT_FILE"))"
 else
-  if [ "$DRY_RUN" = 0 ]; then
-    umask 077
-    printf '%s\n' "xoxb-placeholder-set-a-real-token" > "$TOKEN_FILE"
-    chmod 600 "$TOKEN_FILE"
+  say "  transport: direct (default; SLACK_TRANSPORT or $TRANSPORT_FILE can change it)"
+fi
+
+# --- Mistral API key (the mistral-connector transport)
+MISTRAL_KEY_FILE="$STATE_DIR/mistral_api_key"
+if [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
+  MISTRAL_KEY="$MISTRAL_KEY_ARG"
+  if [ -z "$MISTRAL_KEY" ] && [ -n "${MISTRAL_API_KEY:-}" ]; then MISTRAL_KEY="$MISTRAL_API_KEY"; fi
+  if [ -n "$MISTRAL_KEY" ]; then
+    if [ "$DRY_RUN" = 0 ]; then
+      umask 077
+      printf '%s\n' "$MISTRAL_KEY" > "$MISTRAL_KEY_FILE"
+      chmod 600 "$MISTRAL_KEY_FILE"
+    else
+      say "  [dry-run] write $MISTRAL_KEY_FILE (chmod 600)"
+    fi
+    say "  wrote $MISTRAL_KEY_FILE (chmod 600) — the only place the Mistral API key lives"
+    say "  (Slack credentials stay in the Mistral console; connect the Slack"
+    say "   workspace to the Slack connector there before sending)"
+  elif [ -f "$MISTRAL_KEY_FILE" ]; then
+    say "  keeping existing $MISTRAL_KEY_FILE"
   else
-    say "  [dry-run] write placeholder $TOKEN_FILE"
+    if [ "$DRY_RUN" = 0 ]; then
+      umask 077
+      printf '%s\n' "mistral-placeholder-set-a-real-key" > "$MISTRAL_KEY_FILE"
+      chmod 600 "$MISTRAL_KEY_FILE"
+    else
+      say "  [dry-run] write placeholder $MISTRAL_KEY_FILE"
+    fi
+    say "  WARNING: no Mistral API key given (--mistral-api-key KEY or MISTRAL_API_KEY)."
+    say "  Wrote a placeholder to $MISTRAL_KEY_FILE — approval popups work, but"
+    say "  connector sends fail until you install a real key:"
+    say "    scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_KEY"
+    say "  (the service restarts automatically; it reads the file at startup)"
   fi
-  say "  WARNING: no token given (--token xoxb-... or SLACK_BOT_TOKEN)."
-  say "  Wrote a placeholder to $TOKEN_FILE — approval popups work, but"
-  say "  sends fail until you install a real bot token:"
-  say "    scripts/install.sh --token xoxb-your-bot-token"
-  say "  (the service restarts automatically; it reads the file at startup)"
+fi
+
+# --- Slack bot token (the direct transport)
+TOKEN_FILE="$STATE_DIR/slack_token"
+if [ "$TRANSPORT" = "direct" ]; then
+  TOKEN="$TOKEN_ARG"
+  if [ -z "$TOKEN" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then TOKEN="$SLACK_BOT_TOKEN"; fi
+  if [ -n "$TOKEN" ]; then
+    if [ "$DRY_RUN" = 0 ]; then
+      umask 077
+      printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
+      chmod 600 "$TOKEN_FILE"
+    else
+      say "  [dry-run] write $TOKEN_FILE (chmod 600)"
+    fi
+    say "  wrote $TOKEN_FILE (chmod 600) — the only place the token lives"
+  elif [ -f "$TOKEN_FILE" ]; then
+    say "  keeping existing $TOKEN_FILE"
+  else
+    if [ "$DRY_RUN" = 0 ]; then
+      umask 077
+      printf '%s\n' "xoxb-placeholder-set-a-real-token" > "$TOKEN_FILE"
+      chmod 600 "$TOKEN_FILE"
+    else
+      say "  [dry-run] write placeholder $TOKEN_FILE"
+    fi
+    say "  WARNING: no token given (--token xoxb-... or SLACK_BOT_TOKEN)."
+    say "  Wrote a placeholder to $TOKEN_FILE — approval popups work, but"
+    say "  sends fail until you install a real bot token:"
+    say "    scripts/install.sh --token xoxb-your-bot-token"
+    say "  (the service restarts automatically; it reads the file at startup)"
+  fi
+else
+  say "  connector transport selected: no Slack bot token needed"
+  say "  (Slack credentials live in the Mistral console's Slack connector)"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -725,9 +814,17 @@ say "  Service:    $PLIST_LABEL (launchctl; logs in $STATE_DIR/gateway.log)"
 say "  State dir:  $STATE_DIR (cooldowns, sent records, token, socket)"
 say ""
 say "Next steps:"
-say "  1. Set a real Slack bot token if you have not:"
-say "       scripts/install.sh --token xoxb-your-bot-token"
-say "     (the service restarts and reads the file at startup)"
+if [ "$TRANSPORT" = "mistral-connector" ]; then
+  say "  1. In the Mistral console, connect your Slack workspace to the Slack"
+  say "     connector (the gateway calls it; it holds the Slack credentials)."
+  say "  2. Set a real Mistral API key if you have not:"
+  say "       scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_KEY"
+  say "     (the service restarts and reads the file at startup)"
+else
+  say "  1. Set a real Slack bot token if you have not:"
+  say "       scripts/install.sh --token xoxb-your-bot-token"
+  say "     (the service restarts and reads the file at startup)"
+fi
 say "  2. Restart your agents (or start a new session) so they pick up the"
 say "     new MCP server; then ask any agent to send a Slack message."
 say "  3. The popup appears, the gateway sends only what you approve, and"
