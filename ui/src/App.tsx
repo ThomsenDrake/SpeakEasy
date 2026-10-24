@@ -35,6 +35,10 @@ interface MessageRequest {
     conversation: ConversationContext;
   };
   received_at: number;
+  /** Human-readable form of `incoming.destination` (e.g. a display name for
+   *  a Slack ID), resolved by the gateway; null when unresolved. Display
+   *  only — the exact `destination` is what gets sent. */
+  destination_display: string | null;
 }
 
 type DecisionPayload =
@@ -54,20 +58,21 @@ const demoRequest: MessageRequest = {
   incoming: {
     message:
       "Heads-up: gateway v0.3 finished deploying — 12/12 checks green. Rolling out to the remaining workspaces now.",
-    destination: "#eng-deploys",
+    destination: "U09CV6A19EH",
     thread_ts: "1729612800.123456",
     reason:
-      "The team asked for deploy notifications in this channel; the canary passed and the runbook says to announce.",
+      "The team asked for deploy notifications; the canary passed and the runbook says to announce.",
     agent: "claude-code",
     conversation: {
       title: "Ship gateway v0.3",
       id_or_link:
         "https://app.superset.sh/workspaces/speakeasy/tasks/deploy-gateway-v03",
       summary:
-        "Agent finished the release checklist (build, tests, smoke test, changelog) and asks to announce the deploy in #eng-deploys.",
+        "Agent finished the release checklist (build, tests, smoke test, changelog) and asks to announce the deploy to the release manager.",
     },
   },
   received_at: Math.floor(Date.now() / 1000),
+  destination_display: "Drake Thomsen (@drake.thomsen)",
 };
 
 function Section({
@@ -141,8 +146,14 @@ function RequestCard({
         <Row gap="8" vertical="center" wrap>
           <Row gap="4" vertical="center" onBackground="info-medium">
             <Hash size={14} aria-hidden />
-            <Tag scheme="info" label={incoming.destination} />
+            <Tag
+              scheme="info"
+              label={request.destination_display ?? incoming.destination}
+            />
           </Row>
+          {request.destination_display && (
+            <Tag scheme="neutral" size="s" label={incoming.destination} />
+          )}
           {incoming.thread_ts && (
             <Tag
               scheme="neutral"

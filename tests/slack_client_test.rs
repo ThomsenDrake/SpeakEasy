@@ -334,6 +334,60 @@ fn from_env_reads_token_file_api_base_and_workspace_domain() {
     );
 }
 
+#[test]
+fn resolve_destination_resolves_user_channel_and_dm_ids() {
+    let mock = MockSlackServer::start();
+    let client = mock.client();
+
+    // User ID -> "Real Name (@username)".
+    assert_eq!(
+        client.resolve_destination("U0DRAKE"),
+        Some("Drake Thomsen (@drake.thomsen)".to_string())
+    );
+    let user_req = &mock.requests_to("/users.info")[0];
+    assert_eq!(user_req.method, "POST");
+    assert_eq!(user_req.body, json!({ "user": "U0DRAKE" }));
+    assert_eq!(
+        user_req.authorization.as_deref(),
+        Some("Bearer xoxb-test-token")
+    );
+
+    // Channel ID -> "#name".
+    assert_eq!(client.resolve_destination("C0ENG"), Some("#eng".to_string()));
+    let chan_req = &mock.requests_to("/conversations.info")[0];
+    assert_eq!(chan_req.body, json!({ "channel": "C0ENG" }));
+
+    // DM ID -> conversations.info chains to the partner's users.info.
+    assert_eq!(
+        client.resolve_destination("D0DRAKE"),
+        Some("Drake Thomsen (@drake.thomsen)".to_string())
+    );
+    let requests = mock.requests();
+    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["/users.info", "/conversations.info", "/conversations.info", "/users.info"]
+    );
+}
+
+#[test]
+fn resolve_destination_returns_none_for_names_unknown_ids_and_failures() {
+    let mock = MockSlackServer::start();
+    let client = mock.client();
+
+    // Already-readable destinations need no lookup.
+    assert_eq!(client.resolve_destination("#eng"), None);
+    assert_eq!(client.resolve_destination("@drake"), None);
+    assert!(mock.requests().is_empty(), "no lookup for #/@ names");
+
+    // Unknown IDs and lookup failures fall back to the raw destination.
+    assert_eq!(client.resolve_destination("U0NOPE"), None);
+    assert_eq!(client.resolve_destination("C0NOPE"), None);
+    mock.set_lookup_error(Some("missing_scope"));
+    assert_eq!(client.resolve_destination("U0DRAKE"), None);
+    assert_eq!(client.resolve_destination("C0ENG"), None);
+}
+
 /// Checks the ~15s request timeout against a server that never replies.
 /// Slow, so ignored by default: `cargo test --test slack_client_test -- --ignored`.
 #[test]

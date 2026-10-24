@@ -63,7 +63,11 @@ impl DecisionProvider for CliDecisionProvider {
             r.conversation.title, r.conversation.id_or_link
         ));
         out(&mut tty_w, &format!("  summary: {}", r.conversation.summary));
-        out(&mut tty_w, &format!("Destination:   {}{}", r.destination, match &r.thread_ts {
+        let destination = match &request.destination_display {
+            Some(display) => format!("{display} ({})", r.destination),
+            None => r.destination.clone(),
+        };
+        out(&mut tty_w, &format!("Destination:   {destination}{}", match &r.thread_ts {
             Some(t) => format!(" (Slack thread {t})"),
             None => String::new(),
         }));

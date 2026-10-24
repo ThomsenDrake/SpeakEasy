@@ -101,6 +101,12 @@ pub struct MessageRequest {
     pub incoming: IncomingRequest,
     /// Unix timestamp (seconds) when the gateway received the request.
     pub received_at: u64,
+    /// Human-readable form of `incoming.destination` (e.g. `Drake Thomsen
+    /// (@drake.thomsen)` for `U09CV6A19EH`, `#eng` for `C0123`), resolved
+    /// best-effort by the Slack client. `None` when the destination is
+    /// already readable (`#name`, `@name`) or cannot be resolved; the UI
+    /// then shows the raw destination. Never used for sending.
+    pub destination_display: Option<String>,
 }
 
 /// The human's decision on a pending request.
@@ -165,6 +171,17 @@ pub trait SlackClient: Send + Sync {
         thread_ts: Option<&str>,
         text: &str,
     ) -> Result<SlackSend, SlackError>;
+
+    /// Best-effort human-readable form of a destination Slack ID
+    /// (`U09CV6A19EH` → `Drake Thomsen (@drake.thomsen)`, `C0123` →
+    /// `#eng`), for display in the approval popup. `None` when the
+    /// destination is already readable or cannot be resolved (unknown ID,
+    /// missing read scopes): the UI then shows the raw destination. Never
+    /// used for sending; failures must not fail the request.
+    fn resolve_destination(&self, destination: &str) -> Option<String> {
+        let _ = destination;
+        None
+    }
 }
 
 /// The outcome of handling one agent request, serialized back to the agent.
@@ -325,7 +342,10 @@ impl Gateway {
         }
 
         // 3. Ask the human. The state lock is released: this may block for a
-        // long time and other requests must keep flowing.
+        // long time and other requests must keep flowing. The destination's
+        // display name is resolved best-effort for the popup; a failure
+        // changes nothing (the raw destination is shown).
+        let destination_display = self.slack.resolve_destination(&req.destination);
         let msg = MessageRequest {
             id: format!(
                 "req-{now}-{}",
@@ -333,6 +353,7 @@ impl Gateway {
             ),
             incoming: req,
             received_at: now,
+            destination_display,
         };
         let decision = self.provider.request_decision(&msg);
         let req = msg.incoming;

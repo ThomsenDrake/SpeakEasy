@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use slack_approval_gateway::core::{Decision, DecisionProvider, MessageRequest, ProviderError};
 use slack_approval_gateway::mistral_slack::MistralConnectorSlackClient;
 use slack_approval_gateway::slack::UreqSlackClient;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -87,6 +87,9 @@ struct MockState {
     post_message_error: Mutex<Option<String>>,
     post_message_raw_reply: Mutex<Option<String>>,
     permalink_error: Mutex<Option<String>>,
+    /// When set, `users.info` and `conversations.info` fail with this error
+    /// (to exercise the resolver's fallback to the raw destination).
+    lookup_error: Mutex<Option<String>>,
     /// Counter for generated message timestamps.
     next_ts: AtomicU64,
     shutdown: AtomicBool,
@@ -105,6 +108,11 @@ struct MockState {
 /// - `POST /chat.getPermalink` replies
 ///   `{"ok":true,"permalink":"https://mock.slack.com/archives/{channel}/p{ts without '.'}"}`,
 ///   or `{"ok":false,"error":...}` after [`set_permalink_error`](Self::set_permalink_error).
+/// - `POST /users.info` replies with a canned `U0DRAKE` user (any other ID
+///   gets `user_not_found`), and `POST /conversations.info` with a canned
+///   `C0ENG` channel and a `D0DRAKE` DM (whose partner is `U0DRAKE`) — these
+///   back destination-resolution tests. Both fail with a canned error after
+///   [`set_lookup_error`](Self::set_lookup_error).
 ///
 /// Every request is recorded before the reply is written, so it is visible in
 /// [`requests`](Self::requests) as soon as the client call returns. Each
@@ -131,6 +139,7 @@ impl MockSlackServer {
             post_message_error: Mutex::new(None),
             post_message_raw_reply: Mutex::new(None),
             permalink_error: Mutex::new(None),
+            lookup_error: Mutex::new(None),
             next_ts: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
         });
@@ -194,6 +203,13 @@ impl MockSlackServer {
     /// on (`None` restores success), to exercise the client's fallback link.
     pub fn set_permalink_error(&self, error: Option<&str>) {
         *lock(&self.state.permalink_error) = error.map(str::to_string);
+    }
+
+    /// Make `users.info` and `conversations.info` reply
+    /// `{"ok":false,"error":<error>}` from now on (`None` restores the
+    /// canned lookups), to exercise destination-resolution failures.
+    pub fn set_lookup_error(&self, error: Option<&str>) {
+        *lock(&self.state.lookup_error) = error.map(str::to_string);
     }
 }
 
@@ -396,6 +412,33 @@ fn route_slack(req: &RecordedRequest, state: &MockState) -> Reply {
             );
             Reply::Json(json!({ "ok": true, "channel": channel, "permalink": permalink }))
         }
+        "/users.info" => {
+            if let Some(error) = lock(&state.lookup_error).clone() {
+                return Reply::Json(json!({ "ok": false, "error": error }));
+            }
+            match req.body_str("user") {
+                Some("U0DRAKE") => Reply::Json(json!({ "ok": true, "user": {
+                    "name": "drake.thomsen", "real_name": "Drake Thomsen",
+                    "profile": { "display_name": "Drake" }
+                } })),
+                _ => Reply::Json(json!({ "ok": false, "error": "user_not_found" })),
+            }
+        }
+        "/conversations.info" => {
+            if let Some(error) = lock(&state.lookup_error).clone() {
+                return Reply::Json(json!({ "ok": false, "error": error }));
+            }
+            match req.body_str("channel") {
+                Some("C0ENG") => Reply::Json(json!({ "ok": true, "channel": {
+                    "id": "C0ENG", "name": "eng", "is_im": false
+                } })),
+                // A DM: the partner is resolved through a second lookup.
+                Some("D0DRAKE") => Reply::Json(json!({ "ok": true, "channel": {
+                    "id": "D0DRAKE", "is_im": true, "user": "U0DRAKE"
+                } })),
+                _ => Reply::Json(json!({ "ok": false, "error": "channel_not_found" })),
+            }
+        }
         _ => Reply::NotFound,
     }
 }
@@ -477,6 +520,8 @@ struct MockMistralState {
     tools: Mutex<Vec<Value>>,
     /// Exact JSON reply for tool calls when set (`None` = the default reply).
     tool_reply: Mutex<Option<Value>>,
+    /// Per-tool-name reply overrides (checked before `tool_reply`).
+    tool_replies: Mutex<HashMap<String, Value>>,
     /// Forced tool-call failure: HTTP status + `{"detail": …}` body.
     call_error: Mutex<Option<(u16, String)>>,
     shutdown: AtomicBool,
@@ -514,6 +559,7 @@ impl MockMistralServer {
             requests: Mutex::new(Vec::new()),
             tools: Mutex::new(default_mistral_tools()),
             tool_reply: Mutex::new(None),
+            tool_replies: Mutex::new(HashMap::new()),
             call_error: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         });
@@ -571,6 +617,13 @@ impl MockMistralServer {
     /// the default reply).
     pub fn set_tool_reply(&self, reply: Option<Value>) {
         *lock(&self.state.tool_reply) = reply;
+    }
+
+    /// Serve this exact JSON document for one tool's calls only (takes
+    /// precedence over [`set_tool_reply`](Self::set_tool_reply)); used to
+    /// give the read tools (`slack_read_user_profile`, …) their own replies.
+    pub fn set_tool_reply_for(&self, tool: &str, reply: Value) {
+        lock(&self.state.tool_replies).insert(tool.to_string(), reply);
     }
 
     /// Make tool calls fail with an HTTP status and a `{"detail": …}` body
@@ -657,6 +710,12 @@ fn route_mistral(req: &RecordedRequest, state: &MockMistralState) -> Reply {
         if let Some((code, detail)) = lock(&state.call_error).clone() {
             return Reply::Status(code, json!({ "detail": detail }).to_string());
         }
+        // segments = [v1, connectors, <connector>, tools, <tool>, call]
+        if let Some(tool) = segments.get(4) {
+            if let Some(reply) = lock(&state.tool_replies).get(*tool).cloned() {
+                return Reply::Json(reply);
+            }
+        }
         if let Some(reply) = lock(&state.tool_reply).clone() {
             return Reply::Json(reply);
         }
@@ -693,6 +752,7 @@ pub struct ScriptedProvider {
     decisions: Mutex<VecDeque<Decision>>,
     rules: Mutex<Vec<(String, Decision)>>,
     seen: Mutex<Vec<String>>,
+    requests: Mutex<Vec<MessageRequest>>,
     delay: Option<Duration>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
@@ -705,6 +765,7 @@ impl ScriptedProvider {
             decisions: Mutex::new(decisions.into_iter().collect()),
             rules: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
             delay: None,
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
@@ -733,6 +794,12 @@ impl ScriptedProvider {
     /// Message text of every request the provider was asked about, in call order.
     pub fn seen_messages(&self) -> Vec<String> {
         lock(&self.seen).clone()
+    }
+
+    /// Every request the provider was asked about, in call order (includes
+    /// the gateway-assigned ID and the resolved destination display name).
+    pub fn requests(&self) -> Vec<MessageRequest> {
+        lock(&self.requests).clone()
     }
 
     /// How many times `request_decision` was called (i.e. popups shown).
@@ -768,6 +835,7 @@ impl DecisionProvider for ScriptedProvider {
     fn request_decision(&self, request: &MessageRequest) -> Result<Decision, ProviderError> {
         let message = &request.incoming.message;
         lock(&self.seen).push(message.clone());
+        lock(&self.requests).push(request.clone());
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
         if let Some(delay) = self.delay {

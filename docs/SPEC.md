@@ -76,10 +76,13 @@ Public API is fully declared in the stub. Implement:
      If a sent record with the same hash exists, return
      `Sent { ts, permalink, duplicate: true }` from the cached record. Do NOT
      call the provider and do NOT send again.
-  3. Build `MessageRequest { id, incoming: req, received_at: now }` with a
-     unique ID (e.g. `req-<now>-<atomic counter>`). Call
-     `provider.request_decision(&msg)` **without holding the state lock**
-     (it may block for a long time).
+  3. Build `MessageRequest { id, incoming: req, received_at: now, destination_display }`
+     with a unique ID (e.g. `req-<now>-<atomic counter>`), where
+     `destination_display = slack.resolve_destination(&req.destination)` is a
+     best-effort human-readable form of the destination for the popup
+     (`None` when already readable or unresolvable; never used for sending).
+     Call `provider.request_decision(&msg)` **without holding the state
+     lock** (it may block for a long time).
   4. Match the decision:
      - `Ok(Decision::Approve)`: acquire `send_lock`. Re-check the sent records
        for `hash` under the lock (a concurrent identical request may have
@@ -113,6 +116,16 @@ Public API is fully declared in the stub. Implement:
   blocked without provider call; same message to a different destination NOT
   blocked; expired cooldown passes; persistence roundtrip (new `Gateway` on
   same dir still blocks); provider error → `Error`, nothing sent.
+
+- `SlackClient` also has `resolve_destination(destination) -> Option<String>`
+  (default `None`): a best-effort display name for Slack IDs
+  (`U…` → `Name (@handle)`, `C…`/`G…` → `#name`, `D…` → partner's name where
+  the transport can). It is called once per popup, only on the path that
+  actually reaches the provider (not for cooldown-blocked or duplicate
+  requests), and its result rides on `MessageRequest.destination_display`
+  to the UI. It must never fail the request.
+- The CLI provider prints `Destination:   <display> (<raw id>)` when a
+  display name was resolved, else the raw destination.
 
 ### `src/slack.rs` — transport selection + the direct Slack client
 
@@ -149,6 +162,13 @@ only credential it can hold is a Slack bot token; the alternative
   `ureq::post(url).header(...).send_json(serde_json::json!(...))`, then
   `resp.body_mut().read_json::<serde_json::Value>()`. Handle `ureq::Error`
   (transport vs status) and timeouts (set a reasonable timeout, e.g. 15s).
+- `resolve_destination`: `#`/`@` names → `None` (already readable). `U…` →
+  `POST users.info {user}` → `real_name` (fallback `profile.display_name`,
+  `name`) formatted `Name (@username)` when a handle differs. `C…`/`G…`/`D…`
+  → `POST conversations.info {channel}` → `#name`; for a DM (`is_im`) chain
+  to `users.info` with the channel's `user` for the partner's name. Any
+  failure (missing `users:read`/`channels:read` scopes, unknown ID) logs to
+  stderr and returns `None` — the popup shows the raw ID.
 - Tests (`tests/slack_client_test.rs`): a mock Slack API on a local
   `TcpListener` (127.0.0.1:0) that records method, path, `Authorization`
   header, and JSON body, and replies with canned JSON. Assert: exact
@@ -188,6 +208,14 @@ approved destination. The Slack credentials live in the Mistral console
   `MISTRAL_SLACK_THREAD_ARG` (or `with_arguments`) override the detected
   names. A thread reply to a tool whose schema declares no thread argument
   is an error (nothing is sent).
+- `resolve_destination`: `#`/`@` names → `None`. `U…` →
+  `slack_read_user_profile {user_id}` — the reply's text block is a JSON
+  string `{"result": "…Real Name: …\nUsername: …"}`; the display name is
+  `Real Name` (fallback `Display Name`, `Username`), formatted
+  `Name (@username)`. `C…`/`G…` → `slack_read_channel {channel_id, limit: 1}`
+  — the reply's `{"messages": "Channel: #name (ID)\n…"}` first line yields
+  `#name`. `D…` DM IDs → `None` (the connector has no DM-partner lookup).
+  Any failure → `None`.
 - `post_message`: `POST {api_base}/v1/connectors/{connector}/tools/{tool}/call`
   with `Authorization: Bearer <key>` and body
   `{"arguments": {channel_arg: destination, text_arg: text, thread_arg?}}`
@@ -310,12 +338,17 @@ scripts.
   the webview-ready flag, the `AppHandle`, and the gateway (for the
   cooldown status line).
 - `TauriDecisionProvider::request_decision`: register the request, deliver
-  it to the webview (emit `approval-request`, or queue it in the outbox if
-  the webview is not ready), then block on the single-use reply channel.
+  it to the webview (emit `approval-request` with the whole `MessageRequest`,
+  including `destination_display`, or queue it in the outbox if the webview
+  is not ready), then block on the single-use reply channel.
   If the app exits, the sender is dropped and the request fails with
   `ProviderError` — it is never approved. A single-use channel guarantees
   exactly one decision per request; repeated UI clicks cannot produce a
   second decision.
+- The frontend renders the destination as
+  `destination_display ?? incoming.destination`, with the raw destination
+  as a secondary tag when a display name was resolved (display only — the
+  exact `destination` is what gets sent).
 - Tauri commands invoked by the webview: `submit_decision(request_id,
   decision)` (first decision wins; repeats and unknown IDs are ignored),
   `ui_ready` (flushes the outbox — the frontend awaits its `listen()`
