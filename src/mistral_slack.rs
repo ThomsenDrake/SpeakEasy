@@ -30,22 +30,51 @@ const DEFAULT_CONNECTOR: &str = "slack";
 ///
 /// The send tool is either pinned with `MISTRAL_SLACK_TOOL` or discovered once
 /// from the connector's tool list (the first tool whose name contains "send"
-/// or "post" and "message"). The tool is called with `channel`/`text`
-/// arguments (`thread_ts` for replies) by default;
+/// or "post" and "message"). The argument names are taken from the tool's
+/// declared `inputSchema` (e.g. the `slack` connector's `slack_send_message`
+/// takes `channel_id`/`message`/`thread_ts`); the legacy `channel`/`text`/
+/// `thread_ts` names are the fallback when the schema is not declared.
 /// `MISTRAL_SLACK_CHANNEL_ARG`, `MISTRAL_SLACK_TEXT_ARG` and
-/// `MISTRAL_SLACK_THREAD_ARG` rename them.
+/// `MISTRAL_SLACK_THREAD_ARG` override the detected names.
 pub struct MistralConnectorSlackClient {
     api_key: String,
     api_base: String,
     connector: String,
     tool: Option<String>,
-    channel_arg: String,
-    text_arg: String,
-    thread_arg: String,
-    /// Discovered send-tool name, cached for the life of the client.
-    discovered: Mutex<Option<String>>,
+    /// Explicit argument-name overrides (`None` = detect from the schema).
+    channel_arg: Option<String>,
+    text_arg: Option<String>,
+    thread_arg: Option<String>,
+    /// Discovered send tool, cached for the life of the client.
+    discovered: Mutex<Option<SendTool>>,
     agent: ureq::Agent,
 }
+
+/// The resolved send tool: its name and the argument names to call it with.
+#[derive(Debug, Clone)]
+struct SendTool {
+    name: String,
+    channel_arg: String,
+    text_arg: String,
+    /// `None` when the tool's schema declares no thread argument.
+    thread_arg: Option<String>,
+}
+
+/// Candidate property names for the channel argument, most specific first.
+const CHANNEL_ARG_CANDIDATES: &[&str] = &[
+    "channel_id",
+    "channel",
+    "channel_name",
+    "destination",
+    "to",
+    "recipient",
+];
+
+/// Candidate property names for the message-text argument.
+const TEXT_ARG_CANDIDATES: &[&str] = &["message", "text", "content", "body"];
+
+/// Candidate property names for the thread (reply) argument.
+const THREAD_ARG_CANDIDATES: &[&str] = &["thread_ts", "thread", "parent_ts", "reply_to"];
 
 impl MistralConnectorSlackClient {
     /// Build from the environment: `MISTRAL_API_KEY` (required) or a key file
@@ -73,15 +102,20 @@ impl MistralConnectorSlackClient {
         let connector =
             non_empty_env("MISTRAL_SLACK_CONNECTOR").unwrap_or_else(|| DEFAULT_CONNECTOR.to_string());
         let tool = non_empty_env("MISTRAL_SLACK_TOOL");
-        let channel_arg =
-            non_empty_env("MISTRAL_SLACK_CHANNEL_ARG").unwrap_or_else(|| "channel".to_string());
-        let text_arg = non_empty_env("MISTRAL_SLACK_TEXT_ARG").unwrap_or_else(|| "text".to_string());
-        let thread_arg =
-            non_empty_env("MISTRAL_SLACK_THREAD_ARG").unwrap_or_else(|| "thread_ts".to_string());
-        Ok(Self::new(api_key, api_base)
+        let channel_arg = non_empty_env("MISTRAL_SLACK_CHANNEL_ARG");
+        let text_arg = non_empty_env("MISTRAL_SLACK_TEXT_ARG");
+        let thread_arg = non_empty_env("MISTRAL_SLACK_THREAD_ARG");
+        let mut client = Self::new(api_key, api_base)
             .with_connector(&connector)
-            .with_tool(tool)
-            .with_arguments(&channel_arg, &text_arg, &thread_arg))
+            .with_tool(tool);
+        if channel_arg.is_some() || text_arg.is_some() || thread_arg.is_some() {
+            client = client.with_arguments(
+                channel_arg.as_deref(),
+                text_arg.as_deref(),
+                thread_arg.as_deref(),
+            );
+        }
+        Ok(client)
     }
 
     /// Build explicitly (used by tests with a mock API base).
@@ -101,9 +135,9 @@ impl MistralConnectorSlackClient {
             api_base,
             connector: DEFAULT_CONNECTOR.to_string(),
             tool: None,
-            channel_arg: "channel".to_string(),
-            text_arg: "text".to_string(),
-            thread_arg: "thread_ts".to_string(),
+            channel_arg: None,
+            text_arg: None,
+            thread_arg: None,
             discovered: Mutex::new(None),
             agent,
         }
@@ -131,11 +165,17 @@ impl MistralConnectorSlackClient {
         self
     }
 
-    /// Rename the tool arguments the connector expects.
-    pub fn with_arguments(mut self, channel: &str, text: &str, thread: &str) -> Self {
-        self.channel_arg = channel.to_string();
-        self.text_arg = text.to_string();
-        self.thread_arg = thread.to_string();
+    /// Override the tool argument names the connector expects (`None` leaves
+    /// a name to be detected from the tool's input schema).
+    pub fn with_arguments(
+        mut self,
+        channel: Option<&str>,
+        text: Option<&str>,
+        thread: Option<&str>,
+    ) -> Self {
+        self.channel_arg = channel.map(str::to_string);
+        self.text_arg = text.map(str::to_string);
+        self.thread_arg = thread.map(str::to_string);
         self
     }
 
@@ -188,12 +228,26 @@ impl MistralConnectorSlackClient {
         )))
     }
 
-    /// The name of the connector's send-message tool: pinned, or discovered
-    /// once from the tool list (the first tool whose name contains "send" or
-    /// "post" and "message").
-    fn send_tool(&self) -> Result<String, SlackError> {
+    /// The connector's send-message tool: pinned, or discovered once from the
+    /// tool list (the first tool whose name contains "send" or "post" and
+    /// "message"), with argument names resolved from its `inputSchema`.
+    fn send_tool(&self) -> Result<SendTool, SlackError> {
+        // A pinned tool skips discovery; without a schema the legacy
+        // channel/text/thread_ts names are used (overridable).
         if let Some(tool) = &self.tool {
-            return Ok(tool.clone());
+            return Ok(SendTool {
+                name: tool.clone(),
+                channel_arg: self
+                    .channel_arg
+                    .clone()
+                    .unwrap_or_else(|| "channel".to_string()),
+                text_arg: self.text_arg.clone().unwrap_or_else(|| "text".to_string()),
+                thread_arg: Some(
+                    self.thread_arg
+                        .clone()
+                        .unwrap_or_else(|| "thread_ts".to_string()),
+                ),
+            });
         }
         let lock = || self.discovered.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = lock().clone() {
@@ -204,14 +258,40 @@ impl MistralConnectorSlackClient {
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
             .collect();
-        let found = names
+        let found = tools
             .iter()
-            .find(|name| is_send_message_tool(name))
-            .map(|name| name.to_string());
+            .find(|t| t.get("name").and_then(Value::as_str).is_some_and(is_send_message_tool));
         match found {
-            Some(name) => {
-                *lock() = Some(name.clone());
-                Ok(name)
+            Some(tool) => {
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let props = schema_properties(tool);
+                let resolved = SendTool {
+                    channel_arg: self.channel_arg.clone().unwrap_or_else(|| {
+                        pick_argument(props.as_ref(), CHANNEL_ARG_CANDIDATES, "channel")
+                    }),
+                    text_arg: self
+                        .text_arg
+                        .clone()
+                        .unwrap_or_else(|| pick_argument(props.as_ref(), TEXT_ARG_CANDIDATES, "text")),
+                    // Without a declared schema, assume the legacy thread_ts.
+                    thread_arg: match &self.thread_arg {
+                        Some(arg) => Some(arg.clone()),
+                        None => match props {
+                            Some(props) => THREAD_ARG_CANDIDATES
+                                .iter()
+                                .find(|c| props.contains_key(**c))
+                                .map(|c| c.to_string()),
+                            None => Some("thread_ts".to_string()),
+                        },
+                    },
+                    name,
+                };
+                *lock() = Some(resolved.clone());
+                Ok(resolved)
             }
             None => Err(SlackError(format!(
                 "connector '{}' has no send-message tool (available: {}); set MISTRAL_SLACK_TOOL to the exact tool name",
@@ -250,18 +330,25 @@ impl SlackClient for MistralConnectorSlackClient {
         let tool = self.send_tool()?;
         let mut arguments = Map::new();
         arguments.insert(
-            self.channel_arg.clone(),
+            tool.channel_arg.clone(),
             Value::String(destination.to_string()),
         );
-        arguments.insert(self.text_arg.clone(), Value::String(text.to_string()));
+        arguments.insert(tool.text_arg.clone(), Value::String(text.to_string()));
         if let Some(thread_ts) = thread_ts {
-            arguments.insert(
-                self.thread_arg.clone(),
-                Value::String(thread_ts.to_string()),
-            );
+            match &tool.thread_arg {
+                Some(arg) => {
+                    arguments.insert(arg.clone(), Value::String(thread_ts.to_string()));
+                }
+                None => {
+                    return Err(SlackError(format!(
+                        "connector tool {} declares no thread argument; cannot reply in thread {thread_ts}",
+                        tool.name
+                    )))
+                }
+            }
         }
         let reply = self.post(
-            &format!("/v1/connectors/{}/tools/{}/call", self.connector, tool),
+            &format!("/v1/connectors/{}/tools/{}/call", self.connector, tool.name),
             &Value::Object(json_arguments(arguments)),
         )?;
         // The reply is an MCP CallToolResult: `content` blocks plus metadata
@@ -273,17 +360,19 @@ impl SlackClient for MistralConnectorSlackClient {
             .unwrap_or(false);
         if is_error {
             return Err(SlackError(format!(
-                "connector tool {tool} failed: {}",
+                "connector tool {} failed: {}",
+                tool.name,
                 text_content(&reply).unwrap_or_else(|| "no detail returned".to_string())
             )));
         }
-        let (ts, permalink) = send_outcome(&reply);
-        let permalink = permalink
-            .or_else(|| ts.as_deref().map(|ts| fallback_permalink(destination, ts)))
+        let outcome = send_outcome(&reply);
+        let permalink = outcome
+            .permalink
+            .or_else(|| outcome.ts.as_deref().map(|ts| fallback_permalink(destination, ts)))
             .unwrap_or_default();
         Ok(SlackSend {
-            channel: destination.to_string(),
-            ts: ts.unwrap_or_default(),
+            channel: outcome.channel.unwrap_or_else(|| destination.to_string()),
+            ts: outcome.ts.unwrap_or_default(),
             permalink,
         })
     }
@@ -296,6 +385,31 @@ fn json_arguments(arguments: Map<String, Value>) -> Map<String, Value> {
     body
 }
 
+/// A tool's declared `inputSchema.properties`, when present.
+fn schema_properties(tool: &Value) -> Option<Map<String, Value>> {
+    tool.get("inputSchema")
+        .and_then(|s| s.get("properties"))
+        .and_then(Value::as_object)
+        .cloned()
+}
+
+/// The first candidate present in the schema's properties, else `fallback`
+/// (used when the tool declares no schema at all).
+fn pick_argument(
+    props: Option<&Map<String, Value>>,
+    candidates: &[&str],
+    fallback: &str,
+) -> String {
+    if let Some(props) = props {
+        for candidate in candidates {
+            if props.contains_key(*candidate) {
+                return candidate.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
 /// True when a tool name looks like "send a message" (`slack_send_message`,
 /// `post_message`, …).
 fn is_send_message_tool(name: &str) -> bool {
@@ -303,14 +417,24 @@ fn is_send_message_tool(name: &str) -> bool {
     (n.contains("send") || n.contains("post")) && n.contains("message")
 }
 
+/// The text of a tool-call reply's text content blocks.
+fn text_blocks(reply: &Value) -> Vec<&str> {
+    reply
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The joined text of a tool-call reply's text content blocks.
 fn text_content(reply: &Value) -> Option<String> {
-    let blocks = reply.get("content")?.as_array()?;
-    let texts: Vec<&str> = blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|b| b.get("text").and_then(Value::as_str))
-        .collect();
+    let texts = text_blocks(reply);
     if texts.is_empty() {
         None
     } else {
@@ -318,35 +442,79 @@ fn text_content(reply: &Value) -> Option<String> {
     }
 }
 
-/// Best-effort `(ts, permalink)` from a tool-call reply: the structured
-/// content first, then any Slack archives URL in the text blocks (the `ts`
-/// is parsed out of the permalink when only a link is returned).
-fn send_outcome(reply: &Value) -> (Option<String>, Option<String>) {
+/// What a successful tool call reported (every field optional; the caller
+/// falls back).
+#[derive(Debug, Default)]
+struct SendOutcome {
+    ts: Option<String>,
+    permalink: Option<String>,
+    channel: Option<String>,
+}
+
+/// Best-effort outcome extraction from a tool-call reply. The slack
+/// connector reports `{"message_link": …, "message_context": {…}}` as a JSON
+/// string inside a text block; other connectors use MCP structured content;
+/// a plain Slack archives URL in the text is the last resort (the `ts` is
+/// parsed out of the permalink when only a link is returned).
+fn send_outcome(reply: &Value) -> SendOutcome {
+    let mut out = SendOutcome::default();
+    // 1. MCP structured content.
     let structured = reply
         .get("metadata")
         .and_then(|m| m.get("mcp_meta"))
         .and_then(|m| m.get("structuredContent").or_else(|| m.get("structured_content")))
         .and_then(Value::as_object);
-    let mut ts = structured
-        .and_then(|s| s.get("ts").or_else(|| s.get("message_ts")))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let mut permalink = structured
-        .and_then(|s| ["permalink", "url", "link"].iter().find_map(|key| s.get(*key)))
-        .and_then(Value::as_str)
-        .filter(|url| url.starts_with("http"))
-        .map(str::to_string);
-    if permalink.is_none() {
+    if let Some(s) = structured {
+        out.ts = string_field(s, &["ts", "message_ts"]);
+        out.permalink = string_field(s, &["permalink", "url", "link"])
+            .filter(|url| url.starts_with("http"));
+        out.channel = string_field(s, &["channel", "channel_id"]);
+    }
+    // 2. A text block that parses as a JSON object.
+    if out.permalink.is_none() || out.ts.is_none() || out.channel.is_none() {
+        for text in text_blocks(reply) {
+            let Ok(value) = serde_json::from_str::<Value>(text) else {
+                continue;
+            };
+            let Some(obj) = value.as_object() else { continue };
+            if out.permalink.is_none() {
+                out.permalink = string_field(obj, &["message_link", "permalink", "url", "link"])
+                    .filter(|url| url.starts_with("http"));
+            }
+            let context = obj.get("message_context").and_then(Value::as_object);
+            if out.ts.is_none() {
+                out.ts = context
+                    .and_then(|c| string_field(c, &["message_ts", "ts"]))
+                    .or_else(|| string_field(obj, &["message_ts", "ts"]));
+            }
+            if out.channel.is_none() {
+                out.channel = context
+                    .and_then(|c| string_field(c, &["channel_id", "channel"]))
+                    .or_else(|| string_field(obj, &["channel_id", "channel"]));
+            }
+        }
+    }
+    // 3. Any Slack archives URL in the text (also after unescaping JSON `\/`).
+    if out.permalink.is_none() {
         if let Some(text) = text_content(reply) {
-            permalink = find_slack_url(&text);
+            out.permalink =
+                find_slack_url(&text).or_else(|| find_slack_url(&text.replace("\\/", "/")));
         }
     }
-    if ts.is_none() {
-        if let Some(link) = &permalink {
-            ts = ts_from_permalink(link);
+    if out.ts.is_none() {
+        if let Some(link) = &out.permalink {
+            out.ts = ts_from_permalink(link);
         }
     }
-    (ts, permalink)
+    out
+}
+
+/// The first of `keys` present as a non-empty string in `obj`.
+fn string_field(obj: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| obj.get(*k))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// The first `https://…` URL in `text` that points at a Slack archive.
@@ -462,12 +630,30 @@ mod tests {
                 "permalink": "https://acme.slack.com/archives/C1/p1700000000000100"
             } } }
         });
-        let (ts, permalink) = send_outcome(&reply);
-        assert_eq!(ts.as_deref(), Some("1700000000.000100"));
+        let out = send_outcome(&reply);
+        assert_eq!(out.ts.as_deref(), Some("1700000000.000100"));
         assert_eq!(
-            permalink.as_deref(),
+            out.permalink.as_deref(),
             Some("https://acme.slack.com/archives/C1/p1700000000000100")
         );
+    }
+
+    #[test]
+    fn json_text_block_yields_link_ts_and_channel() {
+        // The real slack connector's reply: a JSON string inside the text
+        // block, with JSON-escaped slashes.
+        let reply = serde_json::json!({
+            "content": [{ "type": "text", "text":
+                "{\"message_link\":\"https:\\/\\/mistralai.slack.com\\/archives\\/D09CV6A8SF7\\/p1792850219522549\",\"message_context\":{\"message_ts\":\"1792850219.522549\",\"channel_id\":\"D09CV6A8SF7\"}}"
+            }]
+        });
+        let out = send_outcome(&reply);
+        assert_eq!(out.ts.as_deref(), Some("1792850219.522549"));
+        assert_eq!(
+            out.permalink.as_deref(),
+            Some("https://mistralai.slack.com/archives/D09CV6A8SF7/p1792850219522549")
+        );
+        assert_eq!(out.channel.as_deref(), Some("D09CV6A8SF7"));
     }
 
     #[test]
@@ -476,10 +662,10 @@ mod tests {
             "content": [{ "type": "text",
                 "text": "Posted to #general: https://acme.slack.com/archives/C1/p1700000000000100 — done" }]
         });
-        let (ts, permalink) = send_outcome(&reply);
-        assert_eq!(ts.as_deref(), Some("1700000000.000100"));
+        let out = send_outcome(&reply);
+        assert_eq!(out.ts.as_deref(), Some("1700000000.000100"));
         assert_eq!(
-            permalink.as_deref(),
+            out.permalink.as_deref(),
             Some("https://acme.slack.com/archives/C1/p1700000000000100")
         );
     }
@@ -489,9 +675,10 @@ mod tests {
         let reply = serde_json::json!({
             "content": [{ "type": "text", "text": "see https://example.com/docs for details" }]
         });
-        let (ts, permalink) = send_outcome(&reply);
-        assert_eq!(ts, None);
-        assert_eq!(permalink, None);
+        let out = send_outcome(&reply);
+        assert_eq!(out.ts, None);
+        assert_eq!(out.permalink, None);
+        assert_eq!(out.channel, None);
     }
 
     #[test]

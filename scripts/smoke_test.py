@@ -60,13 +60,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/chat.getPermalink":
             resp = {"ok": True, "permalink": "https://mock.slack.com/archives/C123/p1700000000000100"}
         elif path.startswith("/v1/connectors/") and path.endswith("/call"):
-            # MCP CallToolResult: permalink in the text and in structuredContent
+            # MCP CallToolResult shaped like the real slack connector: a JSON
+            # string inside the text block.
             resp = {
                 "content": [{"type": "text", "text":
-                             "Message sent: https://mock.slack.com/archives/C123/p1700000000000100"}],
-                "metadata": {"mcp_meta": {"structuredContent": {
-                    "ok": True, "channel": "C123", "ts": "1700000000.000100",
-                    "permalink": "https://mock.slack.com/archives/C123/p1700000000000100"}}},
+                             "{\"message_link\":\"https://mock.slack.com/archives/C123/p1700000000000100\",\"message_context\":{\"message_ts\":\"1700000000.000100\",\"channel_id\":\"C123\"}}"}],
             }
         else:
             resp = {"ok": False, "error": "unknown_method"}
@@ -81,10 +79,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         self.server.requests.append((path, dict(self.headers), None))
         if path.startswith("/v1/connectors/") and path.endswith("/tools"):
-            # Bare array, like the real API.
+            # Bare array, like the real API; the send tool declares the real
+            # argument names (channel_id/message/thread_ts).
             resp = [
                 {"name": "slack_search_messages", "inputSchema": {"type": "object"}},
-                {"name": "slack_send_message", "inputSchema": {"type": "object"}},
+                {"name": "slack_send_message", "inputSchema": {"type": "object",
+                    "properties": {
+                        "channel_id": {"type": "string"},
+                        "message": {"type": "string"},
+                        "thread_ts": {"type": "string"},
+                    }, "required": ["channel_id", "message"]}},
             ]
         else:
             resp = {"detail": "not found"}
@@ -691,8 +695,8 @@ try:
           f"calls={connector_call_count()}")
     conn_args = last_connector_call_arguments()
     check("connector tool call carried the exact message and destination",
-          conn_args.get("text") == "Sent via the Mistral connector"
-          and conn_args.get("channel") == "#general",
+          conn_args.get("message") == "Sent via the Mistral connector"
+          and conn_args.get("channel_id") == "#general",
           json.dumps(conn_args))
     check("connector transport: no direct Slack API call was made",
           post_count() == posts_before_conn,

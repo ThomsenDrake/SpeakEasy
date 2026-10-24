@@ -213,9 +213,13 @@ Optional environment variables (connector transport):
   Needed if the connector's tool list has no name containing "send"/"post"
   + "message"; without a pin the gateway discovers it once (first match)
   and caches it.
-- `MISTRAL_SLACK_CHANNEL_ARG`, `MISTRAL_SLACK_TEXT_ARG`,
-  `MISTRAL_SLACK_THREAD_ARG` — rename the tool arguments the connector
-  expects (defaults `channel`, `text`, `thread_ts`).
+- The tool's argument names are **detected from its declared `inputSchema`**
+  — the `slack` connector's `slack_send_message` takes `channel_id` /
+  `message` / `thread_ts`, and the gateway adapts automatically. If the tool
+  declares no schema, the legacy `channel` / `text` / `thread_ts` names are
+  used. `MISTRAL_SLACK_CHANNEL_ARG`, `MISTRAL_SLACK_TEXT_ARG` and
+  `MISTRAL_SLACK_THREAD_ARG` override the detected names. A thread reply to
+  a tool that declares no thread argument is refused (nothing is sent).
 
 The exclusivity boundary is unchanged: agents still reach Slack only through
 the gateway. With the connector transport the app never holds Slack
