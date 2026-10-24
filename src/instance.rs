@@ -6,9 +6,13 @@
 //! it holds `gateway.lock` in the state dir, listens for MCP connections on
 //! `gateway.sock` (a Unix socket), and serves both its own stdio and every
 //! socket connection with the same JSON-RPC handler. Any later process
-//! connects to the socket and becomes a *bridge*: a byte-transparent pump
-//! between the agent's stdio and the instance, so the agent's MCP session
-//! behaves exactly as if it had spawned the instance itself.
+//! connects to the socket and becomes a *bridge*: a pump between the
+//! agent's stdio and the instance, so the agent's MCP session behaves
+//! exactly as if it had spawned the instance itself. The bridge tracks
+//! in-flight request ids and, if the instance connection drops with
+//! requests still pending (the instance quit or crashed), answers each
+//! with a JSON-RPC error — the agent is told nothing was sent instead of
+//! hanging on a dead session.
 //!
 //! All state (cooldowns, sent records, locks) already lives in the shared
 //! state dir, so even if two instances ever raced into existence, deny
@@ -16,10 +20,12 @@
 
 use crate::core::Gateway;
 use crate::mcp;
-use std::io::{BufReader, Write};
+use serde_json::Value;
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -181,11 +187,101 @@ pub fn serve_connections(gateway: Arc<Gateway>, listener: UnixListener) {
     });
 }
 
-/// Pump bytes between an agent's stdio and the instance's socket. Runs
-/// until the instance closes the connection; exits the process. Protocol
-/// bytes are the only thing written to stdout; diagnostics go to stderr.
-pub fn run_bridge(mut stream: UnixStream) -> ! {
+/// Pump newline-delimited JSON-RPC between an agent's stdio and the
+/// instance's socket. Runs until the instance closes the connection; exits
+/// the process. Protocol bytes are the only thing written to stdout;
+/// diagnostics go to stderr.
+pub fn run_bridge(stream: UnixStream) -> ! {
     eprintln!("slack-approval-gateway: bridging MCP stdio to the running instance");
+    // BufReader<Stdin> (not Stdin::lock, a MutexGuard): it must be Send to
+    // move into the forwarding thread.
+    let stdin = BufReader::new(std::io::stdin());
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let unanswered = pump_jsonrpc(stdin, stdout, stream);
+    if !unanswered.is_empty() {
+        eprintln!(
+            "slack-approval-gateway: instance connection closed with {} pending request(s); \
+             answered each with an error (nothing was sent)",
+            unanswered.len()
+        );
+    }
+    std::process::exit(0);
+}
+
+/// The `id` of a JSON-RPC request (a message with a method and an id and no
+/// result or error), if the line parses as one.
+fn request_id(line: &str) -> Option<Value> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    if msg.get("method").is_some()
+        && msg.get("id").is_some()
+        && msg.get("result").is_none()
+        && msg.get("error").is_none()
+    {
+        msg.get("id").cloned()
+    } else {
+        None
+    }
+}
+
+/// The `id` of a JSON-RPC response (a message with an id and a result or an
+/// error), if the line parses as one.
+fn response_id(line: &str) -> Option<Value> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    if msg.get("id").is_some() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+        msg.get("id").cloned()
+    } else {
+        None
+    }
+}
+
+/// Requests an agent sent that the instance has not answered. `closed`
+/// flips once the instance connection is gone; the forwarding side then
+/// fails requests fast instead of writing them into the void.
+#[derive(Default)]
+struct InFlight {
+    ids: HashSet<Value>,
+    closed: bool,
+}
+
+fn write_line<W: Write>(output: &Arc<Mutex<W>>, bytes: &[u8]) -> std::io::Result<()> {
+    let mut out = output.lock().unwrap_or_else(PoisonError::into_inner);
+    out.write_all(bytes)?;
+    out.flush()
+}
+
+/// Answer a request the instance will never answer: it exited before a
+/// decision was made, so nothing was sent.
+fn write_synthesized_error<W: Write>(output: &Arc<Mutex<W>>, id: &Value) {
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32000,
+            "message": "slack-approval-gateway: the gateway instance exited before a \
+                        decision was made; nothing was sent",
+        }
+    });
+    let Ok(mut line) = serde_json::to_vec(&response) else {
+        return;
+    };
+    line.push(b'\n');
+    let _ = write_line(output, &line);
+}
+
+/// The testable core of [`run_bridge`]: forward `input` (the agent's stdio)
+/// to the instance's socket and the instance's replies to `output`, line by
+/// line, until the instance closes the connection. Request ids are tracked
+/// so that when the connection drops — the instance quit or crashed — every
+/// request still waiting for a decision is answered with a JSON-RPC error
+/// ("nothing was sent"): an agent is told, never left hanging on a dead
+/// session. Requests arriving after the drop are answered the same way,
+/// immediately. Returns the ids the read side answered (the write side
+/// answers its own late requests directly).
+fn pump_jsonrpc<R: BufRead + Send + 'static, W: Write + Send + 'static>(
+    mut input: R,
+    output: Arc<Mutex<W>>,
+    mut stream: UnixStream,
+) -> Vec<Value> {
     let mut to_instance = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -193,39 +289,87 @@ pub fn run_bridge(mut stream: UnixStream) -> ! {
             std::process::exit(1);
         }
     };
-    thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut stdin = stdin.lock();
-        let _ = std::io::copy(&mut stdin, &mut to_instance);
+    let in_flight = Arc::new(Mutex::new(InFlight::default()));
+    let tracked = Arc::clone(&in_flight);
+    let out = Arc::clone(&output);
+    let copy_in = thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match input.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let late = match tracked.lock() {
+                        Ok(mut f) => {
+                            if f.closed {
+                                true
+                            } else {
+                                if let Some(id) = request_id(&line) {
+                                    f.ids.insert(id);
+                                }
+                                false
+                            }
+                        }
+                        Err(_) => break,
+                    };
+                    if late {
+                        // The instance is gone: fail this request right away.
+                        if let Some(id) = request_id(&line) {
+                            write_synthesized_error(&out, &id);
+                        }
+                        continue;
+                    }
+                    if to_instance.write_all(line.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
         // The agent closed its MCP session: tell the instance, then let the
-        // read side finish the shutdown.
+        // read side finish the shutdown. Never joined: with the instance
+        // gone this thread can be parked on stdin, and exiting the process
+        // below is what ends it.
         let _ = to_instance.shutdown(std::net::Shutdown::Write);
     });
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    let _ = std::io::copy(&mut stream, &mut stdout);
-    let _ = stdout.flush();
-    std::process::exit(0);
+    let mut from_instance = BufReader::new(&mut stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match from_instance.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if let Some(id) = response_id(&line) {
+                    if let Ok(mut f) = in_flight.lock() {
+                        f.ids.remove(&id);
+                    }
+                }
+                if write_line(&output, line.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    // The instance is gone (or closed the connection). Flip `closed` and
+    // answer every request still waiting for a decision: the human never
+    // saw it, nothing was sent.
+    let unanswered: Vec<Value> = match in_flight.lock() {
+        Ok(mut f) => {
+            f.closed = true;
+            f.ids.drain().collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    for id in &unanswered {
+        write_synthesized_error(&output, id);
+    }
+    drop(copy_in);
+    unanswered
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Read};
-
-    /// The testable core of [`run_bridge`]: forward `input` to the instance
-    /// and the instance's replies to `output` until the instance closes the
-    /// connection. Returns when the read side reaches EOF.
-    fn pump<R: Read + Send + 'static, W: Write>(mut input: R, mut output: W, mut stream: UnixStream) {
-        let mut to_instance = stream.try_clone().expect("clone stream");
-        let copy_in = thread::spawn(move || {
-            let _ = std::io::copy(&mut input, &mut to_instance);
-            let _ = to_instance.shutdown(std::net::Shutdown::Write);
-        });
-        let _ = std::io::copy(&mut stream, &mut output);
-        let _ = output.flush();
-        let _ = copy_in.join();
-    }
+    use std::io::Cursor;
 
     fn temp_dir(tag: &str) -> PathBuf {
         // Unix socket paths are limited (~104 bytes on macOS), so the test
@@ -299,9 +443,108 @@ mod tests {
             let _ = std::io::copy(&mut reader, &mut writer);
         });
         let input = Cursor::new(b"ping\n".to_vec());
-        let mut output: Vec<u8> = Vec::new();
-        pump(input, &mut output, client);
-        assert_eq!(output, b"ping\n");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
+        let bytes = std::mem::take(&mut *output.lock().unwrap());
+        assert_eq!(bytes, b"ping\n");
+        assert!(unanswered.is_empty());
         echo.join().unwrap();
+    }
+
+    #[test]
+    fn pump_answers_in_flight_requests_when_the_instance_dies() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A fake instance that reads the request and then dies without
+        // answering, like a SIGKILLed gateway.
+        let instance = thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            assert!(line.contains("tools/call"));
+            // Dropping the connection is the whole point: the instance is gone.
+        });
+        let input = Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{}}\n".to_vec(),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
+        instance.join().unwrap();
+        assert_eq!(unanswered, vec![serde_json::json!(7)]);
+        let bytes = std::mem::take(&mut *output.lock().unwrap());
+        let text = String::from_utf8(bytes).unwrap();
+        let msg: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(msg["id"], serde_json::json!(7));
+        assert!(
+            msg["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was sent"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn pump_does_not_reanswer_responded_requests() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A fake instance that answers id 7 and then closes the connection.
+        let instance = thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = writeln!(
+                writer,
+                "{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"ok\":true}}}}"
+            );
+            // Dropping the connection is a graceful shutdown here.
+        });
+        let input = Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{}}\n".to_vec(),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
+        instance.join().unwrap();
+        assert!(unanswered.is_empty());
+        let bytes = std::mem::take(&mut *output.lock().unwrap());
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"result\""), "{text}");
+        assert!(!text.contains("nothing was sent"), "{text}");
+    }
+
+    #[test]
+    fn pump_fails_requests_arriving_after_the_instance_died() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A fake instance that reads one request, then dies without answering.
+        let instance = thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+        });
+        // The agent sends id 7 (never answered) and then id 8, which the
+        // bridge must fail fast instead of forwarding into the dead socket.
+        let input = Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{}}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{}}\n"
+                .to_vec(),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
+        instance.join().unwrap();
+        // Which side answers id 8 is timing-dependent (the read side's drain
+        // or the write side's fail-fast); what matters is that both requests
+        // are answered exactly once.
+        assert!(unanswered.contains(&serde_json::json!(7)), "{unanswered:?}");
+        assert!(unanswered.len() <= 2, "{unanswered:?}");
+        assert!(
+            unanswered
+                .iter()
+                .all(|id| *id == serde_json::json!(7) || *id == serde_json::json!(8)),
+            "{unanswered:?}"
+        );
+        let bytes = std::mem::take(&mut *output.lock().unwrap());
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("nothing was sent").count(), 2, "{text}");
+        assert!(text.contains("\"id\":7"), "{text}");
+        assert!(text.contains("\"id\":8"), "{text}");
     }
 }
