@@ -606,32 +606,32 @@ impl MockApi for MockMistralState {
     }
 }
 
-/// The default connector tool catalog: two read tools plus the send tool
-/// with `channel`/`text`/`thread_ts` arguments.
+/// The default connector tool catalog, shaped like the real `slack`
+/// connector: two read tools plus `slack_send_message` declaring
+/// `channel_id`/`message`/`thread_ts` (and extra optional properties).
 fn default_mistral_tools() -> Vec<Value> {
     json!([
         { "name": "slack_search_messages", "inputSchema": { "type": "object" } },
         { "name": "slack_list_channels", "inputSchema": { "type": "object" } },
         { "name": "slack_send_message", "inputSchema": { "type": "object", "properties": {
-            "channel": { "type": "string" }, "text": { "type": "string" },
-            "thread_ts": { "type": "string" }
-        } } }
+            "channel_id": { "type": "string", "description": "Search all channels" },
+            "message": { "type": "string", "description": "Add a message" },
+            "thread_ts": { "type": "string", "description": "Provide another message's ts value to make this message a reply" },
+            "reply_broadcast": { "type": "boolean", "description": "Also send to conversation" }
+        }, "required": ["channel_id", "message"] } }
     ])
     .as_array()
     .expect("default tool catalog is an array")
     .clone()
 }
 
-/// The default tool-call reply: an MCP CallToolResult with the permalink in
-/// both the text block and the structured content.
+/// The default tool-call reply, shaped like the real slack connector's: a
+/// JSON string inside a text block (no MCP structured content).
 fn default_tool_reply() -> Value {
     json!({
-        "content": [{ "type": "text",
-            "text": "Message sent to #general: https://mock.slack.com/archives/CGENERAL/p1700000000000100" }],
-        "metadata": { "mcp_meta": { "structuredContent": {
-            "ok": true, "channel": "CGENERAL", "ts": "1700000000.000100",
-            "permalink": "https://mock.slack.com/archives/CGENERAL/p1700000000000100"
-        } } }
+        "content": [{ "type": "text", "text":
+            "{\"message_link\":\"https://mock.slack.com/archives/CGENERAL/p1700000000000100\",\"message_context\":{\"message_ts\":\"1700000000.000100\",\"channel_id\":\"CGENERAL\"}}"
+        }]
     })
 }
 

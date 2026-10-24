@@ -174,19 +174,34 @@ approved destination. The Slack credentials live in the Mistral console
 - Send-tool discovery: `GET {api_base}/v1/connectors/{connector}/tools?page_size=100`
   (bare JSON array; `data`/`items` wrappers also accepted), first tool whose
   lowercase name contains ("send"|"post") and "message", cached for the
-  life of the client (`Mutex<Option<String>>`). No match → error listing
+  life of the client (`Mutex<Option<SendTool>>`). No match → error listing
   the available names and the `MISTRAL_SLACK_TOOL` hint. A pinned tool
   skips discovery.
+- Argument names are resolved from the discovered tool's declared
+  `inputSchema.properties` (candidates, most specific first: channel —
+  `channel_id`/`channel`/`channel_name`/`destination`/`to`/`recipient`;
+  text — `message`/`text`/`content`/`body`; thread —
+  `thread_ts`/`thread`/`parent_ts`/`reply_to`), so the real `slack`
+  connector's `slack_send_message` (`channel_id`/`message`/`thread_ts`) works
+  with no configuration. No declared schema → legacy `channel`/`text`/
+  `thread_ts`. `MISTRAL_SLACK_CHANNEL_ARG`/`MISTRAL_SLACK_TEXT_ARG`/
+  `MISTRAL_SLACK_THREAD_ARG` (or `with_arguments`) override the detected
+  names. A thread reply to a tool whose schema declares no thread argument
+  is an error (nothing is sent).
 - `post_message`: `POST {api_base}/v1/connectors/{connector}/tools/{tool}/call`
   with `Authorization: Bearer <key>` and body
   `{"arguments": {channel_arg: destination, text_arg: text, thread_arg?}}`
   (`thread_arg` only when `Some`). The reply is an MCP CallToolResult:
   `metadata.mcp_meta.isError`/`is_error` → `SlackError` with the joined
-  text blocks; otherwise `(ts, permalink)` from
-  `metadata.mcp_meta.structuredContent` (`ts`/`message_ts` +
-  `permalink`/`url`/`link`), falling back to the first `https://…slack.com`
-  URL in the text blocks (the `ts` is parsed out of a `/p<16 digits>`
-  permalink), then to `fallback_permalink(destination, ts)`.
+  text blocks; otherwise the outcome is extracted from (1)
+  `metadata.mcp_meta.structuredContent`, (2) a text block that parses as a
+  JSON object — the real slack connector returns
+  `{"message_link": …, "message_context": {"message_ts": …, "channel_id": …}}`
+  as a JSON string with escaped slashes, (3) the first `https://…slack.com`
+  URL in the text blocks (also after unescaping `\/`). The `ts` is parsed
+  out of a `/p<16 digits>` permalink when only a link is available; the
+  channel is the resolved one when reported. Missing permalink falls back
+  to `fallback_permalink(destination, ts)`.
 - HTTP rules mirror the direct client: statuses inspected by hand (the
   platform's `{"detail": …}` error body is reported), 30s timeout,
   redirects never followed (the bearer key must not leak), and the API key

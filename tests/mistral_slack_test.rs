@@ -42,7 +42,8 @@ fn post_message_discovers_send_tool_and_sends_exact_arguments_with_bearer_key() 
         discovery.query
     );
 
-    // Whole-body equality: exact values and no extra keys.
+    // Whole-body equality: exact values and no extra keys. The argument
+    // names come from the tool's declared inputSchema (channel_id/message).
     let call = &requests[1];
     assert_eq!(call.method, "POST");
     assert_eq!(call.authorization.as_deref(), Some("Bearer mistral-test-key"));
@@ -56,17 +57,17 @@ fn post_message_discovers_send_tool_and_sends_exact_arguments_with_bearer_key() 
     );
     assert_eq!(
         call.body,
-        json!({ "arguments": { "channel": "#general", "text": text, "thread_ts": "1699999999.000200" } })
+        json!({ "arguments": { "channel_id": "#general", "message": text, "thread_ts": "1699999999.000200" } })
     );
-    assert_eq!(call.body_str("text"), None, "text lives under arguments");
     assert_eq!(
-        call.body.pointer("/arguments/text").and_then(|v| v.as_str()),
+        call.body.pointer("/arguments/message").and_then(|v| v.as_str()),
         Some(text),
         "text must be sent verbatim"
     );
 
-    // The outcome comes from the structured content.
-    assert_eq!(sent.channel, "#general");
+    // The outcome comes from the JSON text block; the channel is the
+    // resolved one from message_context, like the direct transport.
+    assert_eq!(sent.channel, "CGENERAL");
     assert_eq!(sent.ts, "1700000000.000100");
     assert_eq!(
         sent.permalink,
@@ -86,7 +87,7 @@ fn thread_ts_argument_is_absent_when_none() {
     assert_eq!(calls.len(), 1);
     assert_eq!(
         calls[0].body,
-        json!({ "arguments": { "channel": "C0123ABC", "text": "hello" } })
+        json!({ "arguments": { "channel_id": "C0123ABC", "message": "hello" } })
     );
 }
 
@@ -117,7 +118,7 @@ fn custom_connector_and_argument_names_are_used() {
         .client()
         .with_connector("019cfb41-5e8a-7350-b162-b2b80604fe5a")
         .with_tool(Some("send_slack_message".to_string()))
-        .with_arguments("channel_id", "message", "parent_ts");
+        .with_arguments(Some("channel_id"), Some("message"), Some("parent_ts"));
 
     client
         .post_message("C0123ABC", Some("1699999999.000200"), "hello")
@@ -135,6 +136,59 @@ fn custom_connector_and_argument_names_are_used() {
             "channel_id": "C0123ABC", "message": "hello", "parent_ts": "1699999999.000200"
         } })
     );
+}
+
+#[test]
+fn argument_names_adapt_to_a_differently_shaped_schema() {
+    let mock = MockMistralServer::start();
+    // A connector whose send tool declares channel/content/parent_ts.
+    mock.set_tools(json!([
+        { "name": "post_message", "inputSchema": { "type": "object", "properties": {
+            "channel": { "type": "string" },
+            "content": { "type": "string" },
+            "parent_ts": { "type": "string" }
+        } } }
+    ])
+    .as_array()
+    .unwrap()
+    .clone());
+
+    mock.client()
+        .post_message("#general", Some("1699999999.000200"), "hello")
+        .expect("post_message should succeed");
+
+    let calls = mock.tool_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].path,
+        "/v1/connectors/slack/tools/post_message/call",
+        "a name containing post+message is a send tool"
+    );
+    assert_eq!(
+        calls[0].body,
+        json!({ "arguments": { "channel": "#general", "content": "hello", "parent_ts": "1699999999.000200" } })
+    );
+}
+
+#[test]
+fn thread_reply_fails_when_the_tool_declares_no_thread_argument() {
+    let mock = MockMistralServer::start();
+    mock.set_tools(json!([
+        { "name": "slack_send_message", "inputSchema": { "type": "object", "properties": {
+            "channel_id": { "type": "string" }, "message": { "type": "string" }
+        }, "required": ["channel_id", "message"] } }
+    ])
+    .as_array()
+    .unwrap()
+    .clone());
+
+    let err = mock
+        .client()
+        .post_message("#general", Some("1699999999.000200"), "hello")
+        .expect_err("a thread reply the tool cannot express must be an error");
+
+    assert!(err.0.contains("no thread argument"), "error was {:?}", err.0);
+    assert!(mock.tool_calls().is_empty(), "nothing must be sent");
 }
 
 #[test]
