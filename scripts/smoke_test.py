@@ -14,7 +14,8 @@ prompts are answered in order (CLI mutex: answers reach the right requests),
 and the single-instance bridge: extra agent processes (no --cli) connect to
 the running instance over the state-dir socket and their MCP sessions are
 served by that one instance (same popup owner, same Slack client, shared
-dedupe/cooldowns).
+dedupe/cooldowns) — including an explicit error (nothing was sent) when the
+instance is killed while a bridged request is pending.
 """
 import fcntl
 import http.server
@@ -316,6 +317,10 @@ try:
         bridges.append(bp)
         responses_b = {}
         lock_b = threading.Lock()
+        # Set only after the reader has drained stdout to EOF, so a bridge
+        # that answers and then exits is not mistaken for one that died
+        # without answering.
+        reader_done = threading.Event()
 
         def reader_b():
             for raw in bp.stdout:
@@ -329,11 +334,12 @@ try:
                 if "id" in msg:
                     with lock_b:
                         responses_b[msg["id"]] = msg
+            reader_done.set()
 
         threading.Thread(target=reader_b, daemon=True).start()
-        return bp, responses_b, lock_b
+        return bp, responses_b, lock_b, reader_done
 
-    def make_bridge_rpc(bp, responses_b, lock_b):
+    def make_bridge_rpc(bp, responses_b, lock_b, reader_done):
         def brpc(id_, method, params=None):
             msg = {"jsonrpc": "2.0", "id": id_, "method": method}
             if params is not None:
@@ -347,8 +353,9 @@ try:
                 with lock_b:
                     if id_ in responses_b:
                         return responses_b[id_]
-                if bp.poll() is not None:
-                    raise AssertionError(f"bridge exited early (code {bp.returncode})")
+                if reader_done.is_set():
+                    raise AssertionError(
+                        f"bridge exited without answering id={id_} (code {bp.returncode})")
                 time.sleep(0.05)
             raise AssertionError(f"timeout waiting for bridge response id={id_}")
 
@@ -367,8 +374,8 @@ try:
             },
         }})
 
-    bridge1, bresp1, block1 = spawn_bridge()
-    brpc1, wait_b1 = make_bridge_rpc(bridge1, bresp1, block1)
+    bridge1, bresp1, block1, done1 = spawn_bridge()
+    brpc1, wait_b1 = make_bridge_rpc(bridge1, bresp1, block1, done1)
     brpc1(101, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                               "clientInfo": {"name": "smoke-bridge", "version": "0"}})
     r = wait_b1(101)
@@ -387,8 +394,8 @@ try:
           json.dumps(v))
 
     # a second bridge at the same time: concurrent bridged agents
-    bridge2, bresp2, block2 = spawn_bridge()
-    brpc2, wait_b2 = make_bridge_rpc(bridge2, bresp2, block2)
+    bridge2, bresp2, block2, done2 = spawn_bridge()
+    brpc2, wait_b2 = make_bridge_rpc(bridge2, bresp2, block2, done2)
     brpc2(201, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                               "clientInfo": {"name": "smoke-bridge-2", "version": "0"}})
     wait_b2(201)
@@ -414,6 +421,25 @@ try:
     bridge_err = bridge1.stderr.read().decode(errors="replace")
     check("bridge logged that it bridged (did not start a second instance)",
           "bridging MCP stdio" in bridge_err, bridge_err[-300:])
+
+    # 7c. bridge: if the instance dies (SIGKILL) while a bridged request is
+    # pending, the agent gets an explicit JSON-RPC error (nothing was sent),
+    # not a hang on a dead session
+    bridge3, bresp3, block3, done3 = spawn_bridge()
+    brpc3, wait_b3 = make_bridge_rpc(bridge3, bresp3, block3, done3)
+    brpc3(401, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                              "clientInfo": {"name": "smoke-bridge-3", "version": "0"}})
+    wait_b3(401)
+    bridge_tool_call(brpc3, 402, "Bridged request pending at kill")
+    wait_tty("Bridged request pending at kill")
+    proc.kill()  # the instance dies without answering
+    r = wait_b3(402)
+    check("bridge answers a pending request with an error when the instance dies",
+          "nothing was sent" in r.get("error", {}).get("message", ""),
+          json.dumps(r)[:300])
+    bridge3.wait(timeout=15)
+    check("bridge exits after the instance dies", bridge3.returncode == 0,
+          f"code={bridge3.returncode}")
 
     # 8. persistence across restart: cooldown survives a new process
     proc.stdin.close()
