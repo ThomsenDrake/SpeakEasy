@@ -501,20 +501,28 @@ fn resolve_transport_prefers_env_then_file_then_default() {
     std::env::remove_var("SLACK_TRANSPORT");
     let dir = temp_state_dir("transport");
 
-    // Default: direct.
-    assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::Direct);
+    // Default: the Slack MCP server.
+    assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::SlackMcp);
 
     // File: one line, trimmed.
     std::fs::write(dir.join("slack_transport"), "mistral-connector\n").unwrap();
     assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::MistralConnector);
 
     // Env beats the file; aliases accepted.
-    std::env::set_var("SLACK_TRANSPORT", "direct");
-    assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::Direct);
+    std::env::set_var("SLACK_TRANSPORT", "slack-mcp");
+    assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::SlackMcp);
+    std::env::set_var("SLACK_TRANSPORT", "mcp");
+    assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::SlackMcp);
     std::env::set_var("SLACK_TRANSPORT", "connector");
     assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::MistralConnector);
     std::env::set_var("SLACK_TRANSPORT", "mistral_connector");
     assert_eq!(resolve_transport(&dir).unwrap(), SlackTransport::MistralConnector);
+
+    // The removed bot-token transport: a helpful error, not a silent default.
+    std::env::set_var("SLACK_TRANSPORT", "direct");
+    let err = resolve_transport(&dir).expect_err("the bot-token transport is gone");
+    assert!(err.0.contains("direct"), "error was {:?}", err.0);
+    assert!(err.0.contains("slack-mcp"), "error was {:?}", err.0);
 
     // Unknown value: error naming the accepted values.
     std::env::set_var("SLACK_TRANSPORT", "carrier-pigeon");

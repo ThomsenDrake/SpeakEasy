@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{MockSlackServer, ScriptedProvider};
+use common::{MockSlackMcpServer, ScriptedProvider};
 use serde_json::{json, Value};
 use slack_approval_gateway::core::{Decision, Gateway};
 use slack_approval_gateway::instance;
@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Start a mock Slack API, making sure requests to it bypass any proxy.
-fn mock_slack() -> MockSlackServer {
+/// Start a mock Slack MCP server, making sure requests to it bypass any proxy.
+fn mock_slack() -> MockSlackMcpServer {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         for name in ["NO_PROXY", "no_proxy"] {
@@ -28,7 +28,7 @@ fn mock_slack() -> MockSlackServer {
             std::env::set_var(name, value);
         }
     });
-    MockSlackServer::start()
+    MockSlackMcpServer::start()
 }
 
 /// A short state dir (Unix socket paths are limited to ~104 bytes, so the
@@ -130,7 +130,7 @@ impl Client {
 
 /// Start an instance (gateway + socket listener) in `dir`.
 fn start_instance(
-    mock: &MockSlackServer,
+    mock: &MockSlackMcpServer,
     provider: Arc<dyn slack_approval_gateway::core::DecisionProvider>,
     dir: &PathBuf,
 ) -> (instance::InstanceGuard, Arc<Gateway>) {
@@ -154,10 +154,23 @@ fn socket_serves_a_full_mcp_session() {
     let verdict = client.request_message(2, "hello over the socket");
     assert_eq!(verdict["status"], "sent");
     assert_eq!(verdict["duplicate"], false);
-    assert_eq!(mock.post_count(), 1);
-    let posts = mock.requests_to("/chat.postMessage");
-    assert_eq!(posts[0].body_str("text"), Some("hello over the socket"));
-    assert_eq!(posts[0].body_str("channel"), Some("#general"));
+    assert_eq!(mock.send_count(), 1);
+    let sends = mock.calls_to("slack_send_message");
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0]
+            .body
+            .pointer("/params/arguments/message")
+            .and_then(Value::as_str),
+        Some("hello over the socket")
+    );
+    assert_eq!(
+        sends[0]
+            .body
+            .pointer("/params/arguments/channel_id")
+            .and_then(Value::as_str),
+        Some("#general")
+    );
 }
 
 #[test]
@@ -175,14 +188,14 @@ fn two_socket_clients_share_one_gateway() {
     // Alice's request is approved and sent.
     let verdict = alice.request_message(3, "shared gateway alpha");
     assert_eq!(verdict["status"], "sent");
-    assert_eq!(mock.post_count(), 1);
+    assert_eq!(mock.send_count(), 1);
 
     // Bob retries the identical request over his own connection: the shared
     // gateway dedupes it — one popup, one send.
     let verdict = bob.request_message(4, "shared gateway alpha");
     assert_eq!(verdict["status"], "sent");
     assert_eq!(verdict["duplicate"], true);
-    assert_eq!(mock.post_count(), 1);
+    assert_eq!(mock.send_count(), 1);
     assert_eq!(provider.call_count(), 1);
 }
 
@@ -207,5 +220,5 @@ fn deny_cooldown_blocks_across_socket_clients() {
     assert_eq!(verdict["status"], "cooldown_blocked");
     assert!(verdict["cooldown_remaining_secs"].as_u64().unwrap() <= 600);
     assert_eq!(provider.call_count(), 1);
-    assert_eq!(mock.post_count(), 0);
+    assert_eq!(mock.send_count(), 0);
 }

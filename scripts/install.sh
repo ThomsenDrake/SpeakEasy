@@ -25,8 +25,8 @@
 #
 # Usage:
 #   scripts/install.sh [--dry-run] [--enforce] [--uninstall] [--purge]
-#                      [--skip-build] [--token xoxb-...] [--state-dir DIR]
-#                      [--transport direct|mistral-connector]
+#                      [--skip-build] [--slack-mcp-token xoxp-...]
+#                      [--state-dir DIR] [--transport slack-mcp|mistral-connector]
 #                      [--mistral-api-key KEY]
 #
 #   --dry-run     print what would happen, change nothing
@@ -38,13 +38,20 @@
 #   --purge       with --uninstall: also delete the state dir (cooldowns,
 #                 sent records, token file)
 #   --skip-build  reuse the existing target/release binary
-#   --token       Slack bot token (xoxb-...). Stored only in
-#                 <state-dir>/slack_token (chmod 600). Without it a
-#                 placeholder is written and sends fail until you set a real
-#                 token:  scripts/install.sh --token xoxb-...
+#   --slack-mcp-token  Slack user OAuth token (xoxp-...) for the official
+#                 Slack MCP server. Stored only in
+#                 <state-dir>/slack_mcp_token (chmod 600). Without it a
+#                 placeholder is written and sends fail until you get a real
+#                 token:  scripts/slack_mcp_oauth.py --client-id ID
+#                 --client-secret SECRET   (an existing token file is kept
+#                 unless this flag is given; $SLACK_MCP_TOKEN is only a
+#                 fallback)
 #   --state-dir   state dir (default ~/.slack-approval-gateway)
-#   --transport   how the gateway sends to Slack (default: direct):
-#                 direct             Slack Web API with the bot token above;
+#   --transport   how the gateway sends to Slack (default: slack-mcp):
+#                 slack-mcp         the official Slack MCP server
+#                                    (https://mcp.slack.com/mcp, remote MCP)
+#                                    with the user token above — the gateway
+#                                    holds no Slack bot token;
 #                 mistral-connector  the Mistral Slack Connector — Slack
 #                                    credentials live in the Mistral console
 #                                    (connect the workspace there first), and
@@ -53,7 +60,8 @@
 #                 <state-dir>/mistral_api_key (chmod 600). Falls back to
 #                 $MISTRAL_API_KEY. Required for the mistral-connector
 #                 transport; without it a placeholder is written and sends
-#                 fail until you set a real key.
+#                 fail until you set a real key (an existing key file is
+#                 kept unless this flag is given).
 
 set -euo pipefail
 
@@ -73,7 +81,7 @@ ENFORCE=0
 UNINSTALL=0
 PURGE=0
 SKIP_BUILD=0
-TOKEN_ARG=""
+MCP_TOKEN_ARG=""
 STATE_DIR="$DEFAULT_STATE_DIR"
 TRANSPORT_ARG=""
 MISTRAL_KEY_ARG=""
@@ -82,7 +90,7 @@ expect_value=""
 for arg in "$@"; do
   if [ -n "$expect_value" ]; then
     case "$expect_value" in
-      --token) TOKEN_ARG="$arg" ;;
+      --slack-mcp-token) MCP_TOKEN_ARG="$arg" ;;
       --state-dir) STATE_DIR="$arg" ;;
       --transport) TRANSPORT_ARG="$arg" ;;
       --mistral-api-key) MISTRAL_KEY_ARG="$arg" ;;
@@ -96,12 +104,12 @@ for arg in "$@"; do
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
-    --token|--state-dir|--transport|--mistral-api-key) expect_value="$arg" ;;
-    --token=*) TOKEN_ARG="${arg#--token=}" ;;
+    --slack-mcp-token|--state-dir|--transport|--mistral-api-key) expect_value="$arg" ;;
+    --slack-mcp-token=*) MCP_TOKEN_ARG="${arg#--slack-mcp-token=}" ;;
     --state-dir=*) STATE_DIR="${arg#--state-dir=}" ;;
     --transport=*) TRANSPORT_ARG="${arg#--transport=}" ;;
     --mistral-api-key=*) MISTRAL_KEY_ARG="${arg#--mistral-api-key=}" ;;
-    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,62p' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -255,15 +263,16 @@ hr
 run mkdir -p "$STATE_DIR"
 if [ "$DRY_RUN" = 0 ]; then chmod 700 "$STATE_DIR"; fi
 
-# --- transport selection (--transport direct|mistral-connector)
+# --- transport selection (--transport slack-mcp|mistral-connector)
 TRANSPORT="$TRANSPORT_ARG"
-if [ -z "$TRANSPORT" ]; then TRANSPORT="direct"; fi
+if [ -z "$TRANSPORT" ]; then TRANSPORT="slack-mcp"; fi
 case "$TRANSPORT" in
-  direct|mistral-connector) ;;
-  *) say "unknown --transport value: $TRANSPORT (expected direct or mistral-connector)" >&2; exit 2 ;;
+  slack-mcp|mistral-connector) ;;
+  *) say "unknown --transport value: $TRANSPORT (expected slack-mcp or mistral-connector)" >&2; exit 2 ;;
 esac
 TRANSPORT_FILE="$STATE_DIR/slack_transport"
 if [ -n "$TRANSPORT_ARG" ]; then
+  TRANSPORT="$TRANSPORT_ARG"
   if [ "$DRY_RUN" = 0 ]; then
     printf '%s\n' "$TRANSPORT" > "$TRANSPORT_FILE"
   else
@@ -271,16 +280,43 @@ if [ -n "$TRANSPORT_ARG" ]; then
   fi
   say "  transport: $TRANSPORT (written to $TRANSPORT_FILE)"
 elif [ -f "$TRANSPORT_FILE" ]; then
-  say "  keeping existing transport selection in $TRANSPORT_FILE ($(cat "$TRANSPORT_FILE"))"
+  # The effective transport is what the file selects; the credential blocks
+  # and the summary below key off $TRANSPORT, so resolve it here.
+  EXISTING_TRANSPORT="$(cat "$TRANSPORT_FILE")"
+  case "$EXISTING_TRANSPORT" in
+    slack-mcp|mistral-connector)
+      TRANSPORT="$EXISTING_TRANSPORT"
+      say "  keeping existing transport selection in $TRANSPORT_FILE ($EXISTING_TRANSPORT)"
+      ;;
+    *)
+      # The old bot-token transport ("direct") was removed: the gateway no
+      # longer holds a Slack bot token.
+      TRANSPORT="slack-mcp"
+      say "  $TRANSPORT_FILE selects '$EXISTING_TRANSPORT', a removed transport"
+      say "  (the gateway no longer holds a Slack bot token); switching to slack-mcp"
+      if [ "$DRY_RUN" = 0 ]; then
+        printf '%s\n' "slack-mcp" > "$TRANSPORT_FILE"
+      else
+        say "  [dry-run] write $TRANSPORT_FILE (slack-mcp)"
+      fi
+      ;;
+  esac
 else
-  say "  transport: direct (default; SLACK_TRANSPORT or $TRANSPORT_FILE can change it)"
+  say "  transport: slack-mcp (default; SLACK_TRANSPORT or $TRANSPORT_FILE can change it)"
 fi
 
 # --- Mistral API key (the mistral-connector transport)
+# Precedence: the --mistral-api-key flag, then an existing key file, then
+# $MISTRAL_API_KEY. An ambient env var must never clobber a working file.
 MISTRAL_KEY_FILE="$STATE_DIR/mistral_api_key"
 if [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
-  MISTRAL_KEY="$MISTRAL_KEY_ARG"
-  if [ -z "$MISTRAL_KEY" ] && [ -n "${MISTRAL_API_KEY:-}" ]; then MISTRAL_KEY="$MISTRAL_API_KEY"; fi
+  if [ -n "$MISTRAL_KEY_ARG" ]; then
+    MISTRAL_KEY="$MISTRAL_KEY_ARG"
+  elif [ ! -f "$MISTRAL_KEY_FILE" ]; then
+    MISTRAL_KEY="${MISTRAL_API_KEY:-}"
+  else
+    MISTRAL_KEY=""
+  fi
   if [ -n "$MISTRAL_KEY" ]; then
     if [ "$DRY_RUN" = 0 ]; then
       umask 077
@@ -293,7 +329,7 @@ if [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
     say "  (Slack credentials stay in the Mistral console; connect the Slack"
     say "   workspace to the Slack connector there before sending)"
   elif [ -f "$MISTRAL_KEY_FILE" ]; then
-    say "  keeping existing $MISTRAL_KEY_FILE"
+    say "  keeping existing $MISTRAL_KEY_FILE (pass --mistral-api-key to replace it)"
   else
     if [ "$DRY_RUN" = 0 ]; then
       umask 077
@@ -310,38 +346,51 @@ if [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
   fi
 fi
 
-# --- Slack bot token (the direct transport)
-TOKEN_FILE="$STATE_DIR/slack_token"
-if [ "$TRANSPORT" = "direct" ]; then
-  TOKEN="$TOKEN_ARG"
-  if [ -z "$TOKEN" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then TOKEN="$SLACK_BOT_TOKEN"; fi
-  if [ -n "$TOKEN" ]; then
+# --- Slack MCP user token (the slack-mcp transport)
+# Precedence: the --slack-mcp-token flag, then an existing token file, then
+# $SLACK_MCP_TOKEN. An ambient env var must never clobber a working file.
+MCP_TOKEN_FILE="$STATE_DIR/slack_mcp_token"
+if [ "$TRANSPORT" = "slack-mcp" ]; then
+  if [ -n "$MCP_TOKEN_ARG" ]; then
+    MCP_TOKEN="$MCP_TOKEN_ARG"
+  elif [ ! -f "$MCP_TOKEN_FILE" ]; then
+    MCP_TOKEN="${SLACK_MCP_TOKEN:-}"
+  else
+    MCP_TOKEN=""
+  fi
+  if [ -n "$MCP_TOKEN" ]; then
     if [ "$DRY_RUN" = 0 ]; then
       umask 077
-      printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
-      chmod 600 "$TOKEN_FILE"
+      printf '%s\n' "$MCP_TOKEN" > "$MCP_TOKEN_FILE"
+      chmod 600 "$MCP_TOKEN_FILE"
     else
-      say "  [dry-run] write $TOKEN_FILE (chmod 600)"
+      say "  [dry-run] write $MCP_TOKEN_FILE (chmod 600)"
     fi
-    say "  wrote $TOKEN_FILE (chmod 600) — the only place the token lives"
-  elif [ -f "$TOKEN_FILE" ]; then
-    say "  keeping existing $TOKEN_FILE"
+    say "  wrote $MCP_TOKEN_FILE (chmod 600) — the only place the Slack user token lives"
+    say "  (the gateway presents it to the Slack MCP server; it is a user token,"
+    say "   not a bot token, and agents never see it)"
+  elif [ -f "$MCP_TOKEN_FILE" ]; then
+    say "  keeping existing $MCP_TOKEN_FILE (pass --slack-mcp-token to replace it)"
   else
     if [ "$DRY_RUN" = 0 ]; then
       umask 077
-      printf '%s\n' "xoxb-placeholder-set-a-real-token" > "$TOKEN_FILE"
-      chmod 600 "$TOKEN_FILE"
+      printf '%s\n' "xoxp-placeholder-get-a-real-token" > "$MCP_TOKEN_FILE"
+      chmod 600 "$MCP_TOKEN_FILE"
     else
-      say "  [dry-run] write placeholder $TOKEN_FILE"
+      say "  [dry-run] write placeholder $MCP_TOKEN_FILE"
     fi
-    say "  WARNING: no token given (--token xoxb-... or SLACK_BOT_TOKEN)."
-    say "  Wrote a placeholder to $TOKEN_FILE — approval popups work, but"
-    say "  sends fail until you install a real bot token:"
-    say "    scripts/install.sh --token xoxb-your-bot-token"
+    say "  WARNING: no Slack MCP token given (--slack-mcp-token xoxp-... or SLACK_MCP_TOKEN)."
+    say "  Wrote a placeholder to $MCP_TOKEN_FILE — approval popups work, but"
+    say "  sends fail until you install a real Slack user token:"
+    say "    scripts/slack_mcp_oauth.py --client-id YOUR_SLACK_APP_CLIENT_ID \\"
+    say "        --client-secret YOUR_SLACK_APP_CLIENT_SECRET"
+    say "  (opens the Slack authorize page for the official Slack MCP server and"
+    say "   writes the token to $MCP_TOKEN_FILE; needs a Slack app with the"
+    say "   redirect URL http://127.0.0.1:3118/callback — see README.md)"
     say "  (the service restarts automatically; it reads the file at startup)"
   fi
 else
-  say "  connector transport selected: no Slack bot token needed"
+  say "  connector transport selected: no Slack MCP token needed"
   say "  (Slack credentials live in the Mistral console's Slack connector)"
 fi
 
@@ -757,8 +806,8 @@ fi
 
 if [ "$DRY_RUN" = 0 ]; then
   DIR_MODE="$(stat -f '%Lp' "$STATE_DIR" 2>/dev/null || echo '?')"
-  TOK_MODE="$(stat -f '%Lp' "$TOKEN_FILE" 2>/dev/null || echo '?')"
-  say "  state dir $STATE_DIR (mode $DIR_MODE), token file mode $TOK_MODE (want 600)"
+  TOK_MODE="$(stat -f '%Lp' "$MCP_TOKEN_FILE" 2>/dev/null || echo '?')"
+  say "  state dir $STATE_DIR (mode $DIR_MODE), Slack MCP token file mode $TOK_MODE (want 600)"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -816,13 +865,21 @@ say ""
 say "Next steps:"
 if [ "$TRANSPORT" = "mistral-connector" ]; then
   say "  1. In the Mistral console, connect your Slack workspace to the Slack"
-  say "     connector (the gateway calls it; it holds the Slack credentials)."
-  say "  2. Set a real Mistral API key if you have not:"
+  say "     connector (the gateway calls it; it holds the Slack credentials),"
+  say "     and set a real Mistral API key if you have not:"
   say "       scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_KEY"
   say "     (the service restarts and reads the file at startup)"
 else
-  say "  1. Set a real Slack bot token if you have not:"
-  say "       scripts/install.sh --token xoxb-your-bot-token"
+  say "  1. Get a Slack user token for the Slack MCP server (one-time):"
+  say "       scripts/slack_mcp_oauth.py --client-id YOUR_SLACK_APP_CLIENT_ID \\"
+  say "           --client-secret YOUR_SLACK_APP_CLIENT_SECRET"
+  say "     It opens the Slack authorize page, verifies the token against"
+  say "     https://mcp.slack.com/mcp, and writes $MCP_TOKEN_FILE (chmod 600)."
+  say "     You need a Slack app (directory-published or internal) with the"
+  say "     redirect URL http://127.0.0.1:3118/callback and the user scopes"
+  say "     chat:write, users:read, channels:read — see README.md."
+  say "     Or set the token directly:"
+  say "       scripts/install.sh --slack-mcp-token xoxp-your-user-token"
   say "     (the service restarts and reads the file at startup)"
 fi
 say "  2. Restart your agents (or start a new session) so they pick up the"
