@@ -130,16 +130,18 @@ Public API is fully declared in the stub. Implement:
 ### `src/slack.rs` — transport selection + credential plumbing
 
 This module owns **transport selection** and the shared credential
-plumbing. The only Slack credential the gateway can hold is a Slack **user
-OAuth token** for the Slack MCP server (the default transport, implemented
-in `src/slack_mcp.rs`); the alternative (`mistral-connector`) holds a
-Mistral API key and lives in `src/mistral_slack.rs`. The old bot-token
-(`direct`) transport was removed on purpose: the gateway is not a Slack app
-and never posts as one.
+plumbing. The gateway holds exactly one credential, per transport: a Slack
+**user OAuth token** for the Slack MCP server (the default transport,
+implemented in `src/slack_mcp.rs`), a Mistral API key for the
+`mistral-connector` transport (`src/mistral_slack.rs`), or a Slack **bot**
+token (`xoxb-…`, default) or **user** token (`xoxp-…`) for the
+`korotovsky` transport (`src/slack_stdio.rs`). The old direct Slack API
+(`direct`) transport was removed on purpose.
 
 - `resolve_transport(state_dir) -> Result<SlackTransport, SlackError>`:
-  `SLACK_TRANSPORT` env (`slack-mcp` | `mistral-connector`; aliases `mcp` /
-  `slack_mcp` / `mistral_connector` / `connector`), else a one-line
+  `SLACK_TRANSPORT` env (`slack-mcp` | `mistral-connector` | `korotovsky`;
+  aliases `mcp` / `slack_mcp` / `mistral_connector` / `connector` /
+  `slack-mcp-stdio` / `stdio`), else a one-line
   `<state_dir>/slack_transport` file, else `SlackMcp`. Legacy values
   (`direct` / `bot-token` / `token`) are an error explaining the removal and
   pointing at the new transports; unknown values are an error naming the
@@ -148,9 +150,10 @@ and never posts as one.
   dispatch on the selected transport; `src/main.rs` calls this once at
   startup and exits with usage hints (naming what the selected transport
   needs: `SLACK_MCP_TOKEN`/`slack_mcp_token` + the OAuth helper for
-  `slack-mcp`, `MISTRAL_API_KEY`/`mistral_api_key` for `mistral-connector`)
-  on error.
-- Shared `pub(crate)` helpers used by both transports: `non_empty_env`,
+  `slack-mcp`, `MISTRAL_API_KEY`/`mistral_api_key` for `mistral-connector`,
+  `SLACK_BOT_TOKEN`/`SLACK_USER_TOKEN` or `slack_bot_token`/
+  `slack_user_token` for `korotovsky`) on error.
+- Shared `pub(crate)` helpers used by the transports: `non_empty_env`,
   `read_secret_file` (trims whitespace; the error names both the env var
   and the file; warns when the file is readable by other users), and
   `fallback_permalink` (a constructed
@@ -223,9 +226,88 @@ with `scripts/slack_mcp_oauth.py` (authorize
   `build_client` dispatch; `resolve_destination` user/channel resolution
   (nested, flat, and text shapes) and its `None` cases.
 
-### `src/slack_tools.rs` — shared tool-call plumbing (both transports)
+### `src/slack_stdio.rs` — the korotovsky Slack MCP server transport (stdio)
 
-`pub(crate)` helpers shared by `slack_mcp` and `mistral_slack`:
+`KorotovskyClient` implements the same `SlackClient` contract by **spawning
+Korotovsky's unofficial Slack MCP server**
+(`@korotovsky/slack-mcp-server`, <https://github.com/korotovsky/slack-mcp-server>)
+as a child process and speaking MCP (newline-delimited JSON-RPC 2.0 over
+its stdin/stdout; the default server command is
+`npx -y @korotovsky/slack-mcp-server`, i.e. it needs node/npx). The
+credential is a Slack **bot token** (`xoxb-…`, default) or **user token**
+(`xoxp-…`), held by the gateway and passed to the child as
+`SLACK_MCP_XOXB_TOKEN` / `SLACK_MCP_XOXP_TOKEN`; agents never see it.
+
+- `from_env(state_dir)`: bot token from `SLACK_BOT_TOKEN` else
+  `<state_dir>/slack_bot_token`, user token from `SLACK_USER_TOKEN` else
+  `<state_dir>/slack_user_token` (either one suffices; the server's own
+  `SLACK_MCP_XOX*` variables already in the environment are inherited by
+  the child and count as a credential); at least one credential is
+  required, else an error naming both files. `SLACK_STDIO_COMMAND`
+  (whitespace-split command line), `SLACK_STDIO_CONTENT_TYPE`
+  (`text/plain` default / `text/markdown`), `SLACK_STDIO_TOOL` (pin the
+  send tool) and argument renames `SLACK_STDIO_CHANNEL_ARG` /
+  `SLACK_STDIO_TEXT_ARG` / `SLACK_STDIO_THREAD_ARG`.
+- `new(bot_token, user_token, command, content_type, state_dir)`: reject a
+  token with whitespace/control characters; spawn the child with piped
+  stdio and set-if-absent environment defaults the gateway controls:
+  `SLACK_MCP_ADD_MESSAGE_TOOL=true` (the server's `conversations_add_message`
+  tool is disabled by default for safety — without this the send tool is
+  not even listed), `SLACK_MCP_LOG_LEVEL=error`, and the server's user/channel
+  caches (`SLACK_MCP_USERS_CACHE` / `SLACK_MCP_CHANNELS_CACHE`) pointed into
+  the state dir. The operator's own values win. A spawn failure names the
+  command and the fix.
+- Process plumbing: a reader thread parses stdout line by line and skips
+  anything that is not one JSON-RPC message (a bad `SLACK_MCP_LOG_LEVEL`
+  prints to stdout); a second thread keeps the last 25 stderr lines for
+  error messages. All RPC goes through one `Mutex<StdioSession>` (child
+  stdin, reply channel, id counter, cached tool list and send tool), so
+  concurrent requests are serialized and id matching is trivial; a dead
+  server surfaces its stderr tail. `Drop` kills the child — the server never
+  outlives the gateway.
+- Handshake at construction: `initialize` + `notifications/initialized` +
+  `tools/list`, and the send tool must resolve — the handshake fails at
+  startup (with the server's stderr) when `conversations_add_message` is
+  not registered.
+- Send-tool resolution: `conversations_add_message` first (the server's own
+  send tool — it does **not** match the generic send-message name pattern),
+  then any tool whose name matches `slack_tools::is_send_message_tool`;
+  argument names detected from the declared `inputSchema`
+  (`channel_id` / `text` / `thread_ts`; the text candidates try `payload`
+  for older server versions). Missing tool → error listing the available
+  names and the `SLACK_MCP_ADD_MESSAGE_TOOL` hint.
+- `post_message`: `tools/call` the send tool with the exact text to the
+  exact destination (optionally `thread_ts`) **plus `content_type:
+  text/plain`** (Slack then renders the exact approved text without markdown
+  interpretation; `text/markdown` is the opt-in override). A CallToolResult
+  with `isError` → `SlackError` with the joined text blocks. The server's
+  reply is plain text (`Successfully posted message to channel … (ts=…)`,
+  or `… in thread … (ts=…)`); the channel and `ts` are parsed out of it
+  (after trying `slack_tools::send_outcome` first, for forward
+  compatibility), and the permalink falls back to
+  `fallback_permalink(channel, ts)`.
+- `resolve_destination`: `#`/`@` names → `None`. `U…` → `users_search`
+  (query = the user ID; the server looks user IDs up directly), parsing the
+  CSV reply (`UserID,UserName,RealName,DisplayName,…`) → `Name (@handle)`.
+  `C…`/`G…` → `channels_list` (`channel_types:
+  public_channel,private_channel,im,mpim`), parsing the CSV reply
+  (`ID,Name,…`) → `#name`. `D…` DM IDs → `None`. Any failure → `None`. The
+  CSV parser handles gocsv-quoted fields (commas/quotes inside values).
+- Tests (`tests/slack_stdio_test.rs`, mock in `scripts/mock_korotovsky.py`:
+  a stdio MCP server recording tool calls + its environment to a JSON-lines
+  file): exact send arguments + `text/plain`; thread replies; tool errors;
+  stdout noise skipped; startup failures (no send tool, server exit with
+  stderr tail, missing command); user/channel resolution incl. quoted CSV;
+  dropping the client kills the child; `from_env` credential precedence
+  (flag/env/file, inherited `SLACK_MCP_XOX*`, whitespace rejection, content
+  type validation), the set-if-absent server env defaults, and
+  `build_client` dispatch. Unit tests cover the reply/CSV/command parsers
+  and send-tool resolution.
+
+### `src/slack_tools.rs` — shared tool-call plumbing (all transports)
+
+`pub(crate)` helpers shared by `slack_mcp`, `slack_stdio` and
+`mistral_slack`:
 
 - `SendToolSpec { name, channel_arg, text_arg, thread_arg }` and
   `resolve_send_tool(tools, channel_override, text_override,
@@ -500,8 +582,10 @@ approved send to finish before exiting. The window is created hidden
   `cd ui && npm install && npm run build`.
 - `scripts/install.sh` installs the app into every detected coding agent on
   this Mac and starts the LaunchAgent service (`--dry-run`, `--enforce`,
-  `--uninstall`, `--slack-mcp-token`, `--state-dir`, `--transport`,
-  `--mistral-api-key` flags; see README §0). `scripts/agent_config.py` is
+  `--uninstall`, `--slack-mcp-token`, `--state-dir`, `--transport`
+  (`slack-mcp` | `mistral-connector` | `korotovsky`), `--mistral-api-key`,
+  `--slack-bot-token`, `--slack-user-token` flags; see README §0).
+  `scripts/agent_config.py` is
   the per-agent config editor it uses (idempotent, `.bak-sag` backups);
   `scripts/test_agent_config.py` tests it. `scripts/slack_mcp_oauth.py`
   runs the Slack MCP user-token OAuth flow (local callback on port 3118,
@@ -522,17 +606,23 @@ approved send to finish before exiting. The window is created hidden
   ones; `--dry-run` changes nothing, including under `--enforce`.
 - First builds compile Tauri/wry and take several minutes; that's expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.
-- `cargo test` must pass (core + slack_tools unit tests, Slack MCP client
-  tests, mistral connector client tests + transport-selection tests, MCP
-  e2e tests, and the `UiState` bridge tests).
+- `cargo test` must pass (core + slack_tools + slack_stdio unit tests, Slack
+  MCP client tests, korotovsky stdio client tests + transport-selection
+  tests, mistral connector client tests, MCP e2e tests, and the `UiState`
+  bridge tests).
 - `scripts/smoke_test.py` drives the real binary end to end: a mock Slack
   MCP server (the default transport) + mock Mistral platform API on one
   local server, a pty as the CLI terminal, the single-instance bridge path,
   one full approve flow with `SLACK_TRANSPORT=mistral-connector` (asserts
   the exact message went through the connector tool call and no Slack MCP
-  call was made), and a destination display-name check (a Slack user ID
-  resolves to a display name in the prompt while the send still carries the
-  exact raw ID).
+  call was made), one full approve flow with `SLACK_TRANSPORT=korotovsky`
+  against `scripts/mock_korotovsky.py` spawned as a stdio child (asserts
+  the gateway enabled `SLACK_MCP_ADD_MESSAGE_TOOL`, the send went through
+  `conversations_add_message` with the exact message/destination as
+  `text/plain`, the permalink was built from the reply, and no Slack MCP or
+  connector call was made), and a destination display-name check (a Slack
+  user ID resolves to a display name in the prompt while the send still
+  carries the exact raw ID).
 - Do not add dependencies beyond those in Cargo.toml unless strictly
   necessary; if you must, keep them minimal and say so in your summary.
 
