@@ -179,9 +179,11 @@ service; you normally never launch it by hand.
 - **GUI mode (default)**: spawned by an agent over MCP stdio. If an
   instance is already running (the login service), the process bridges to
   it; otherwise it becomes the instance. The Tauri webview popup is built
-  with the **Mistral design system (`@mistral/ui`)** — React 19 +
-  Tailwind 4, with the DS vendored under `ui/shared/` (from Mistral's
-  `product-prototypes` template). The MCP server runs on a background
+  with the OSS **Once UI** design system (`@once-ui-system/core`) plus
+  animated primitives vendored from **Motion Primitives**
+  (`ui/src/components/motion-primitives/`, added with
+  `npx motion-primitives add <name>`) — React 19 + Tailwind 4. The MCP
+  server runs on a background
   thread speaking newline-delimited JSON-RPC on stdio, and the instance
   also serves MCP on `gateway.sock` for bridged agents. stdout carries
   protocol only; diagnostics go to stderr. The binary is self-contained:
@@ -313,10 +315,12 @@ instance), and a manual run of the installed service.
 │                     stdio<->socket bridges, stale-lock recovery
 ├── src/ui.rs         Tauri webview bridge (decision provider + IPC commands)
 ├── src/main.rs       wiring, run modes (--cli/--serve/default), tray, window lifecycle
-├── ui/               the approval popup frontend (React + Tailwind 4 +
-│   │                 the vendored Mistral @mistral/ui design system)
-│   ├── src/App.tsx        approval popup (DS components)
-│   └── shared/            vendored @mistral/ui components + design tokens
+├── ui/               the approval popup frontend (React 19 + Tailwind 4 +
+│   │                 Once UI @once-ui-system/core + motion-primitives)
+│   ├── src/App.tsx        approval popup (Once UI + motion-primitives)
+│   ├── src/styles/        globals.css: Tailwind + Once UI tokens/utilities
+│   ├── src/lib/utils.ts   cn() helper used by the motion-primitives files
+│   └── src/components/motion-primitives/   vendored animated primitives
 ├── tests/            unit/integration/e2e tests (mock Slack, scripted humans,
 │                     socket-level instance tests)
 ├── scripts/install.sh         one-command install into every agent + LaunchAgent

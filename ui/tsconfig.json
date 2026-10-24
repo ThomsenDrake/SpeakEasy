@@ -14,11 +14,7 @@
     "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "paths": {
-      "#components/*": ["./shared/ui/components/*"],
-      "#utils/*": ["./shared/ui/utils/*"],
-      "#hooks/*": ["./shared/ui/hooks/*"],
-      "#branding/*": ["./shared/ui/branding/*"],
-      "@ui/*": ["./shared/ui/*"]
+      "@/*": ["./src/*"]
     }
   },
   "include": ["src", "vite.config.ts"]

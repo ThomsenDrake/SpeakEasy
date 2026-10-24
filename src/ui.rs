@@ -1,7 +1,7 @@
 //! Desktop approval UI transport (Tauri webview).
 //!
 //! The human-facing popup is the webview frontend in `ui/` (React + the
-//! Mistral `@mistral/ui` design system). This module is the bridge: it
+//! Once UI design system + Motion Primitives). This module is the bridge: it
 //! receives decision requests from MCP worker threads, forwards them to the
 //! webview as `approval-request` events, and resolves them when the webview
 //! invokes `submit_decision`. Closing the window only hides it — the

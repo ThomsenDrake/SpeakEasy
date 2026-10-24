@@ -11,12 +11,8 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      // Mirrors the tsconfig paths the vendored @mistral/ui components use.
-      "#components": r("./shared/ui/components"),
-      "#utils": r("./shared/ui/utils"),
-      "#hooks": r("./shared/ui/hooks"),
-      "#branding": r("./shared/ui/branding"),
-      "@ui": r("./shared/ui"),
+      // shadcn-style alias used by the vendored motion-primitives components.
+      "@": r("./src"),
     },
   },
   build: {

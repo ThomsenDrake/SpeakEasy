@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+/* Once UI design system: design tokens, then its utility class layer
+   (`.p-24`, `.g-8`, `.radius-l`, `.surface-background`, `.font-body`, …).
+   Both are plain CSS and unlayered, so they win ties against Tailwind's
+   layered utilities. */
+@import "@once-ui-system/core/css/tokens.css";
+@import "@once-ui-system/core/css/styles.css";
+
+/* Tailwind's `dark:` variant follows Once UI's `data-theme` attribute, which
+   src/main.tsx sets on <html> (the Tauri CSP forbids inline scripts, so the
+   theme is applied from the entry module, not a <script> tag). The
+   motion-primitives components use `dark:` classes. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Once UI leaves the font stacks to the app (its token file only has
+   self-referential placeholders). No webfonts are loaded: the Tauri CSP
+   allows self-hosted fonts only. */
+:root {
+  --font-body:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", sans-serif;
+  --font-heading:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", sans-serif;
+  --font-label:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", sans-serif;
+  --font-code: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page-background);
+  color: var(--neutral-on-background-strong);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
