@@ -37,8 +37,13 @@ Subcommands:
   instruction-remove FILE     remove the managed instruction block
   has FILE [NAME]             exit 0 when NAME (default: the gateway) is
                               registered in FILE
-  audit FILE...               JSON report of direct Slack MCP servers and
-                              Slack tokens found in the given config files
+  audit FILE...               JSON report categorizing what agents have
+                              installed: official Slack MCP servers and
+                              Mistral connector servers (expected — agents
+                              read Slack context through them), direct
+                              (token-based) Slack MCP servers and other
+                              agent-side Slack paths (violations), and
+                              Slack/Mistral credentials found in the files
 """
 
 import json
@@ -58,7 +63,7 @@ MARK_END = "<!-- <<< slack-approval-gateway <<< -->"
 
 INSTRUCTION = """## Slack: send only through the approval gateway
 
-To send a Slack message, call the MCP tool `request_slack_message` (server `slack-approval-gateway`). A desktop popup shows the exact message and destination for approval; only the exact approved text is sent to the exact approved destination. Do not send Slack messages by any other route — no Slack MCP servers, curl, webhooks, SDKs, CLIs, scripts, or the browser. Reading Slack is fine."""
+You may have the Slack MCP server or the Mistral Slack connector available — use them to read Slack context (search messages, list channels, read profiles). To send a Slack message, call the MCP tool `request_slack_message` (server `slack-approval-gateway`): a desktop popup shows the exact message and destination for approval, and only the exact approved text is sent to the exact approved destination. Never send through the Slack MCP server's send tools (e.g. `slack_send_message`), the Mistral connector's Slack tools, curl, webhooks, SDKs, CLIs, scripts, or the browser."""
 
 # STYLE -> (parent key, entry builder). A parent key starting with "@" is a
 # single literal key (amp settings use the flat "amp.mcpServers" key, VS
@@ -73,7 +78,33 @@ JSON_STYLES = {
 }
 
 TOKEN_RE = re.compile(r"xox[bpcdea]-[A-Za-z0-9-]{10,}")
-MCP_PARENT_KEYS = {"mcpServers", "mcp", "context_servers", "mcp_servers"}
+MISTRAL_KEY_RE = re.compile(r"mstrl_[A-Za-z0-9_-]{10,}")
+MCP_PARENT_KEYS = {"mcpServers", "mcp", "context_servers", "mcp_servers", "amp.mcpServers"}
+# YAML parents whose 2-space-indented entries are MCP servers (goose uses
+# `extensions`, hermes `mcp_servers`).
+YAML_MCP_PARENTS = {"mcp_servers", "extensions", "context_servers", "mcp"}
+
+
+def classify_server(name, entry_text):
+    """Classify one MCP server entry for the exclusivity audit.
+
+    Returns one of:
+      "slack-mcp"  the official Slack MCP server (remote, OAuth; mcp.slack.com)
+      "mistral"    a Mistral MCP/connector server (exposes the Slack connector)
+      "direct"     a direct Slack server (a Slack token in the entry) or an
+                   unclassifiable slack-named server
+      "other"      unrelated
+    """
+    if TOKEN_RE.search(entry_text):
+        return "direct"
+    low = entry_text.lower()
+    if "mcp.slack.com" in low or "slack.com/mcp" in low:
+        return "slack-mcp"
+    if "mistral" in name.lower() or "mistral.ai" in low:
+        return "mistral"
+    if "slack" in name.lower():
+        return "direct"
+    return "other"
 
 
 # --------------------------------------------------------------------------- #
@@ -454,13 +485,96 @@ def _mask(token):
     return token[:12] + "…" + token[-4:]
 
 
+def _yaml_server_blocks(text):
+    """Yield (parent, name, block_text) for 2-space-indented `name:` entries
+    in a YAML-ish config (the block runs to the next entry at the same
+    indent; parent is the nearest indent-0 key)."""
+    lines = text.splitlines()
+    parent = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m0 = re.match(r"^([A-Za-z0-9_.-]+)\s*:", line)
+        if m0:
+            parent = m0.group(1)
+            i += 1
+            continue
+        m = re.match(r"^  ([A-Za-z0-9_.-]+)\s*:", line)
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if nxt.strip() == "":
+                j += 1
+                continue
+            indent = len(nxt) - len(nxt.lstrip())
+            if indent <= 2:
+                break
+            j += 1
+        yield parent, name, "\n".join(lines[i:j])
+        i = j
+
+
+_TOML_SERVER_RE = re.compile(
+    r"^\[mcp_servers\.([A-Za-z0-9_-]+)((?:\.[^\]\n]*)?)\]\n(?:(?!\[)[^\n]*\n?)*",
+    re.M,
+)
+
+
+def _toml_server_blocks(text):
+    """Yield (name, block_text) for [mcp_servers.NAME] tables in a TOML
+    config, with subtables ([mcp_servers.NAME.env]) folded into NAME's block."""
+    parts = {}
+    for m in _TOML_SERVER_RE.finditer(text):
+        parts.setdefault(m.group(1), []).append(m.group(0))
+    for name, chunks in parts.items():
+        yield name, "\n".join(chunks)
+
+
 def audit_file(path):
+    """Audit one agent config for the exclusivity boundary.
+
+    Reports, per file:
+      slack_mcp_servers          the official Slack MCP server (OAuth, remote)
+                                 — expected in agents (reading Slack context)
+      mistral_connector_servers  Mistral MCP/connector servers — expected in
+                                 agents (they expose the Slack connector)
+      direct_slack_servers       direct/token-based Slack servers and other
+                                 agent-side Slack paths the gateway does not
+                                 control (hermes platform_toolsets, …)
+      slack_tokens               masked Slack tokens (xox…) in the file
+      mistral_keys               masked Mistral API keys (mstrl_…) in the
+                                 file — an agent with one can call the Slack
+                                 connector's send tool directly
+    """
     text = read(path)
     if text is None:
         return None
-    finding = {"file": path, "direct_slack_servers": [], "slack_tokens": []}
+    finding = {
+        "file": path,
+        "slack_mcp_servers": [],
+        "mistral_connector_servers": [],
+        "direct_slack_servers": [],
+        "slack_tokens": [],
+        "mistral_keys": [],
+    }
     for m in TOKEN_RE.finditer(text):
         finding["slack_tokens"].append(_mask(m.group(0)))
+    for m in MISTRAL_KEY_RE.finditer(text):
+        finding["mistral_keys"].append(_mask(m.group(0)))
+
+    def classify(name, entry_text):
+        bucket = {
+            "slack-mcp": "slack_mcp_servers",
+            "mistral": "mistral_connector_servers",
+            "direct": "direct_slack_servers",
+        }.get(classify_server(name, entry_text))
+        if bucket and name not in finding[bucket]:
+            finding[bucket].append(name)
+
     try:
         data = json.loads(strip_jsonc(text))
     except ValueError:
@@ -472,10 +586,9 @@ def audit_file(path):
                     if (
                         parent_key in MCP_PARENT_KEYS
                         and isinstance(v, dict)
-                        and "slack" in k.lower()
                         and k != SERVER
                     ):
-                        finding["direct_slack_servers"].append(k)
+                        classify(k, json.dumps(v))
                     scan(v, k)
             elif isinstance(obj, list):
                 for v in obj:
@@ -483,20 +596,26 @@ def audit_file(path):
 
         scan(data, None)
     else:
-        # YAML / plain text: report slack-named keys under any 2+-space indent.
-        for m in re.finditer(
-            r"^\s{2,}([A-Za-z0-9_.-]*slack[A-Za-z0-9_.-]*)\s*:", text, re.M
-        ):
-            if m.group(1) != SERVER:
-                finding["direct_slack_servers"].append(m.group(1))
-    # TOML: [mcp_servers.<name>] tables with slack in the name (a .env
-    # subtable is part of its server, not a server of its own).
-    for m in re.finditer(
-        r"^\[mcp_servers\.([A-Za-z0-9_.-]*slack[A-Za-z0-9_.-]*)\]", text, re.M
-    ):
-        name = m.group(1).split(".")[0]
-        if name != SERVER and name not in finding["direct_slack_servers"]:
-            finding["direct_slack_servers"].append(name)
+        # YAML / plain text. Only MCP-server-shaped entries are classified
+        # (under an MCP parent key, or carrying url/command/cmd) — LLM
+        # provider entries like `providers.mistral` are not Slack paths.
+        for parent, name, block in _yaml_server_blocks(text):
+            if name == SERVER:
+                continue
+            if parent in YAML_MCP_PARENTS or re.search(
+                r"^\s+(url|command|cmd)\s*:", block, re.M
+            ):
+                classify(name, block)
+            elif "slack" in name.lower() and name not in finding["direct_slack_servers"]:
+                # A slack-named key that is not an MCP server entry (e.g.
+                # hermes platform_toolsets.slack): still an agent-side Slack
+                # path the gateway does not control.
+                finding["direct_slack_servers"].append(name)
+    # TOML: [mcp_servers.<name>] tables (a .env subtable is part of its
+    # server, not a server of its own).
+    for name, block in _toml_server_blocks(text):
+        if name != SERVER:
+            classify(name, block)
     return finding
 
 

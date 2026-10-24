@@ -507,6 +507,19 @@ approved send to finish before exiting. The window is created hidden
   runs the Slack MCP user-token OAuth flow (local callback on port 3118,
   verifies the token against the MCP endpoint, writes
   `<state-dir>/slack_mcp_token` chmod 600).
+- The installer's exclusivity audit (`agent_config.py audit`, run by
+  `install.sh` step 7) categorizes what agents have installed: the official
+  Slack MCP server (`mcp.slack.com`) and Mistral connector servers are
+  **expected** (agents read Slack context through them; the instruction
+  block routes all sending through the gateway); direct token-based Slack
+  servers (a `xox*` token in the entry, or an unclassifiable slack-named
+  server) are **violations**, as are Slack tokens and Mistral API keys
+  found in agent configs. LLM-provider entries that merely mention Mistral
+  (e.g. goose `providers.mistral`, hermes `providers.mistral-*` with
+  `base_url: https://api.mistral.ai/v1`) are not connector servers and are
+  not flagged as such. `--enforce` removes only the direct token-based
+  servers from the JSON/TOML configs it can edit and keeps the expected
+  ones; `--dry-run` changes nothing, including under `--enforce`.
 - First builds compile Tauri/wry and take several minutes; that's expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.
 - `cargo test` must pass (core + slack_tools unit tests, Slack MCP client

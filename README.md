@@ -100,9 +100,14 @@ This installs the gateway on this Mac end to end:
    starts the single gateway instance at login (`--serve`: UI + MCP socket,
    no agent on stdio). Logs: `~/.slack-approval-gateway/gateway.log`.
 5. Registers the MCP server `slack-approval-gateway` in every detected
-   coding agent (table below) and drops a managed instruction block ("send
-   Slack only through the gateway") into each agent's instruction file.
-6. Audits the exclusivity boundary (below) and prints findings.
+   coding agent (table below) and drops a managed instruction block ("read
+   Slack context via the Slack MCP server / Mistral Slack connector; send
+   only through the gateway") into each agent's instruction file.
+6. Audits the exclusivity boundary (below) and prints findings, categorized:
+   the official Slack MCP / Mistral connector servers in agent configs
+   (expected — agents read Slack context through them), direct token-based
+   Slack servers (violations), and Slack/Mistral credentials left in agent
+   configs.
 
 Flags: `--dry-run`, `--enforce`, `--uninstall [--purge]`, `--skip-build`,
 `--slack-mcp-token xoxp-...`, `--state-dir DIR`,
@@ -333,27 +338,46 @@ Agents call `request_slack_message` with the fields above and receive one
 of the verdicts. They do not need the gateway pre-running: the first spawn
 becomes the instance, later spawns bridge to it.
 
+Agents are **expected** to already have either the official Slack MCP
+server (`https://mcp.slack.com/mcp`, OAuth — see
+<https://docs.slack.dev/ai/slack-mcp-server/>) or a Mistral connector
+server installed; they use those to *read* Slack context (search messages,
+list channels, read profiles). The installer detects both, reports them as
+expected, and never removes them — the instruction block routes all
+*sending* through the gateway regardless. If you install the Slack MCP
+server into agents yourself, keep its OAuth grant **read-only** (no
+`chat:write` scope) so the agents' token cannot send; the gateway's token
+is the only one with `chat:write`.
+
 ## Enforcement boundaries (exclusive sending path)
 
 The gateway is the **only** component that holds a Slack credential and the
 only intended path that sends:
 
-- Agents receive **no** Slack credential (no user or bot token) and no Slack
-  MCP server. Their only way to send is the gateway's single
-  approval-gated tool. `scripts/install.sh`
-  also writes an instruction block into every agent's instruction file:
-  "send Slack only through `request_slack_message`; no Slack MCP servers,
-  curl, webhooks, SDKs, CLIs, scripts, or the browser".
-- `scripts/install.sh` **audits** this boundary on every run: it reports
-  direct Slack MCP servers and Slack tokens found in agent configs, checks
-  the state-dir/token-file permissions, and checks the legacy hook guard.
-  `scripts/install.sh --enforce` additionally **removes direct Slack MCP
-  servers** from agent configs (Claude Code, Codex, OpenCode, and any other
-  detected JSON/TOML config; originals restored from `.bak-sag` by
-  `--uninstall`). Removing them also removes agents' Slack *read* access
-  via those servers — that is the price of exclusivity; the tokens remain
-  in the `.bak-sag` backups, so rotate them in Slack if you want them gone
-  for good.
+- Agents receive **no** Slack credential (no user or bot token). They may
+  have the official Slack MCP server or a Mistral connector server — for
+  *reading* Slack context only. Their only way to *send* is the gateway's
+  single approval-gated tool. `scripts/install.sh` also writes an
+  instruction block into every agent's instruction file: "use the Slack MCP
+  server or the Mistral Slack connector to read Slack context; to send,
+  call `request_slack_message`; never send through the Slack MCP server's
+  send tools (e.g. `slack_send_message`), the Mistral connector's Slack
+  tools, curl, webhooks, SDKs, CLIs, scripts, or the browser".
+- `scripts/install.sh` **audits** this boundary on every run, in three
+  categories: (a) official Slack MCP servers and Mistral connector servers
+  in agent configs — **expected** (agents read Slack context through them),
+  reported so you can keep their grants read-only; (b) direct token-based
+  Slack servers — agents could send through them without the gateway, so
+  they are violations; (c) Slack tokens and Mistral API keys found in
+  agent configs (masked). The audit also checks the state-dir/token-file
+  permissions and the legacy hook guard. `scripts/install.sh --enforce`
+  **removes only the category-(b) direct token-based servers** from the
+  JSON/TOML agent configs it can edit (anything it cannot edit is reported
+  and skipped — remove it by hand); the expected category-(a) servers are
+  kept. Originals are restored from `.bak-sag` by `--uninstall`. Removing
+  (b) servers also removes agents' Slack *read* access via those servers —
+  that is the price of exclusivity; the tokens remain in the `.bak-sag`
+  backups, so rotate them in Slack if you want them gone for good.
 - A **legacy hook guard** (`~/.config/agent-guards/`, if installed) is the
   deny-by-default backstop for every *other* route: it intercepts tool
   calls that would write to Slack (curl, browser automation, SDKs) and

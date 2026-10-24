@@ -17,9 +17,12 @@
 #      pi, Gemini CLI, Copilot CLI, Zed, Amp, Hermes).
 #   6. Drops a managed instruction block into each agent's instruction file:
 #      "send Slack only through the gateway's request_slack_message tool".
-#   7. Audits the exclusivity boundary: direct Slack MCP servers, Slack
-#      tokens in agent configs, and the legacy hook guard. With --enforce it
-#      removes direct Slack MCP servers from agent configs (backups kept).
+#   7. Audits the exclusivity boundary: the official Slack MCP servers and
+#      Mistral connector servers agents are expected to have (reported,
+#      kept), direct (token-based) Slack MCP servers and Slack/Mistral
+#      credentials in agent configs, and the legacy hook guard. With
+#      --enforce it removes the direct token-based Slack MCP servers
+#      (backups kept).
 #
 # Every modified config file is backed up once to <file>.bak-sag.
 #
@@ -30,9 +33,13 @@
 #                      [--mistral-api-key KEY]
 #
 #   --dry-run     print what would happen, change nothing
-#   --enforce     also remove direct Slack MCP servers from agent configs
-#                 (agents then cannot send except through the gateway;
-#                 restores with: install.sh --uninstall)
+#   --enforce     also remove direct (token-based) Slack MCP servers from
+#                 agent configs (agents then cannot send except through the
+#                 gateway; restores with: install.sh --uninstall). The
+#                 official Slack MCP / Mistral connector servers are kept:
+#                 agents are expected to have them for reading Slack
+#                 context, and the instruction block + hook guard are the
+#                 boundary for their send tools.
 #   --uninstall   remove the MCP registrations, instruction blocks, the
 #                 LaunchAgent, and the installed binary (state dir kept)
 #   --purge       with --uninstall: also delete the state dir (cooldowns,
@@ -709,30 +716,53 @@ AUDIT_FILES=(
   "$HOME_DIR/.hermes/config.yaml"
 )
 AUDIT_JSON="$("$PY" "$AGENT_CONFIG" audit "${AUDIT_FILES[@]}" 2>/dev/null || echo '[]')"
-GAPS="$("$PY" - "$AUDIT_JSON" <<'EOF'
+# The audit categorizes what agents have installed. The official Slack MCP
+# server and Mistral connector servers are expected (agents read Slack
+# context through them); direct token-based Slack servers are violations.
+audit_pairs() { # audit_pairs <finding-field> — "[file, name]" lines
+  "$PY" - "$AUDIT_JSON" "$1" <<'EOF'
 import json, sys
 for f in json.loads(sys.argv[1]):
-    for name in f["direct_slack_servers"]:
+    for name in f.get(sys.argv[2], []):
         print(json.dumps([f["file"], name]))
 EOF
-)"
-TOKENS="$("$PY" - "$AUDIT_JSON" <<'EOF'
-import json, sys
-for f in json.loads(sys.argv[1]):
-    for tok in f["slack_tokens"]:
-        print(json.dumps([f["file"], tok]))
-EOF
-)"
-
-if [ -n "$GAPS" ]; then
-  say "  Direct Slack MCP servers found in agent configs (agents could send"
-  say "  without the gateway):"
+}
+report_pairs() { # report_pairs <pairs> — one "    - file (server: name)" per line
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     "$PY" -c 'import json,sys; p,n=json.loads(sys.argv[1]); print(f"    - {p}  (server: {n})")' "$line"
-  done <<< "$GAPS"
+  done <<< "$1"
+}
+EXPECTED_SLACK_MCP="$(audit_pairs slack_mcp_servers)"
+EXPECTED_MISTRAL="$(audit_pairs mistral_connector_servers)"
+GAPS="$(audit_pairs direct_slack_servers)"
+TOKENS="$(audit_pairs slack_tokens)"
+MISTRAL_KEYS="$(audit_pairs mistral_keys)"
+
+if [ -n "$EXPECTED_SLACK_MCP" ]; then
+  say "  Official Slack MCP servers in agent configs (expected: agents read"
+  say "  Slack context through them; the instruction block routes all sending"
+  say "  through the gateway):"
+  report_pairs "$EXPECTED_SLACK_MCP"
+fi
+if [ -n "$EXPECTED_MISTRAL" ]; then
+  say "  Mistral connector servers in agent configs (expected: same — they"
+  say "  expose the Slack connector for reading):"
+  report_pairs "$EXPECTED_MISTRAL"
+fi
+if [ -n "$EXPECTED_SLACK_MCP" ] || [ -n "$EXPECTED_MISTRAL" ]; then
+  say "  Both also expose send tools (slack_send_message), so the boundary for"
+  say "  them is the instruction block + the hook guard; for the Slack MCP"
+  say "  server, keep the agents' grant read-only (no chat:write scope) so"
+  say "  their token cannot send — the gateway's token is the only one with"
+  say "  chat:write. --enforce keeps these (agents are expected to have them)."
+fi
+if [ -n "$GAPS" ]; then
+  say "  Direct Slack MCP servers in agent configs (agents could send"
+  say "  without the gateway):"
+  report_pairs "$GAPS"
 else
-  say "  No direct Slack MCP servers in agent configs."
+  say "  No direct (token-based) Slack MCP servers in agent configs."
 fi
 if [ -n "$TOKENS" ]; then
   say "  Slack tokens found in agent configs (masked):"
@@ -743,6 +773,16 @@ if [ -n "$TOKENS" ]; then
   say "  (these belong to direct Slack MCP servers; --enforce removes the"
   say "   server entries but cannot scrub every copy — rotate the tokens in"
   say "   Slack if you want them gone for good)"
+fi
+if [ -n "$MISTRAL_KEYS" ]; then
+  say "  Mistral API keys found in agent configs (masked) — an agent with"
+  say "  one can call the Slack connector's send tool directly:"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    "$PY" -c 'import json,sys; p,t=json.loads(sys.argv[1]); print(f"    - {p}  ({t})")' "$line"
+  done <<< "$MISTRAL_KEYS"
+  say "  (remove them from agent configs, or rotate the keys, if you want"
+  say "   agents unable to reach the connector at all)"
 fi
 
 if [ -f "$HOME_DIR/.config/agent-guards/install.py" ]; then
@@ -762,11 +802,17 @@ fi
 if [ "$ENFORCE" = 1 ]; then
   if [ -z "$GAPS" ]; then
     say "  --enforce: nothing to remove (no direct Slack MCP servers found)."
+    say "  (the official Slack MCP / Mistral connector servers are kept —"
+    say "   agents are expected to have them for reading Slack context)"
   else
     say ""
     say "  --enforce: removing direct Slack MCP servers from agent configs"
     while IFS= read -r line; do
       [ -n "$line" ] || continue
+      if [ "$DRY_RUN" = 1 ]; then
+        "$PY" -c 'import json,sys; p,n=json.loads(sys.argv[1]); print(f"  [dry-run] would remove server {n} from {p}")' "$line"
+        continue
+      fi
       "$PY" - "$line" "$AGENT_CONFIG" <<'EOF'
 import json, os, subprocess, sys
 path, name = json.loads(sys.argv[1])
@@ -800,7 +846,11 @@ else:
     print(f"    [removed] {path} (server: {name}): {r.stdout.strip()}")
 EOF
     done <<< "$GAPS"
-    say "  Backups of the originals: <file>.bak-sag (restore: install.sh --uninstall)"
+    if [ "$DRY_RUN" = 0 ]; then
+      say "  Backups of the originals: <file>.bak-sag (restore: install.sh --uninstall)"
+    fi
+    say "  Kept (expected in agents): the official Slack MCP / Mistral"
+    say "  connector servers — see the report above."
   fi
 fi
 

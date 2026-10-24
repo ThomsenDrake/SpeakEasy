@@ -231,6 +231,86 @@ check("audit: toml gateway not flagged", ac.SERVER not in f["direct_slack_server
 
 check("audit: missing file skipped", ac.audit_file(os.path.join(d, "nope.json")) is None)
 
+# ------------------------------------- audit: expected vs violation categories
+check("classify: official slack mcp", ac.classify_server("slack", json.dumps({"url": "https://mcp.slack.com/mcp", "oauth": {}})) == "slack-mcp")
+check("classify: token in entry wins", ac.classify_server("slack", json.dumps({"env": {"SLACK_TOKEN": "xoxb-1234567890-abcdef"}})) == "direct")
+check("classify: mistral by url", ac.classify_server("mistral", json.dumps({"url": "https://api.mistral.ai/v1/mcp"})) == "mistral")
+check("classify: mistral by name", ac.classify_server("mistral-connectors", "{}") == "mistral")
+check("classify: unclassifiable slack server", ac.classify_server("my-slack", json.dumps({"command": "npx", "args": ["slack-mcp"]})) == "direct")
+check("classify: unrelated server", ac.classify_server("grafana", json.dumps({"command": "docker"})) == "other")
+
+p = os.path.join(d, "audit-expected.json")
+write(p, json.dumps({"mcpServers": {
+    "slack": {"type": "http", "url": "https://mcp.slack.com/mcp",
+              "oauth": {"clientId": "123.456", "callbackPort": 3118}},
+    "mistral": {"type": "http", "url": "https://api.mistral.ai/v1/mcp",
+                "env": {"MISTRAL_API_KEY": "mstrl_abcdefghij0123456789KLMNOP"}},
+    "grafana": {"type": "stdio", "command": "docker"},
+    ac.SERVER: {"type": "stdio", "command": CMD},
+}}))
+f = ac.audit_file(p)
+check("audit: official slack mcp is expected", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
+check("audit: mistral connector is expected", f["mistral_connector_servers"] == ["mistral"], json.dumps(f))
+check("audit: no direct servers", f["direct_slack_servers"] == [], json.dumps(f))
+check("audit: mistral key masked",
+      len(f["mistral_keys"]) == 1 and f["mistral_keys"][0].startswith("mstrl_abcdef")
+      and "…" in f["mistral_keys"][0] and "0123456789" not in f["mistral_keys"][0],
+      json.dumps(f))
+check("audit: unrelated server ignored",
+      "grafana" not in f["slack_mcp_servers"] + f["mistral_connector_servers"] + f["direct_slack_servers"],
+      json.dumps(f))
+
+p = os.path.join(d, "audit-codex-official.toml")
+write(p, '[mcp_servers.slack]\ntype = "http"\nurl = "https://mcp.slack.com/mcp"\n\n[mcp_servers.%s]\ncommand = "%s"\n' % (ac.SERVER, CMD))
+f = ac.audit_file(p)
+check("audit: toml official slack mcp is expected", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
+check("audit: toml direct servers empty", f["direct_slack_servers"] == [], json.dumps(f))
+check("audit: toml gateway not flagged", ac.SERVER not in f["slack_mcp_servers"] + f["direct_slack_servers"], json.dumps(f))
+
+p = os.path.join(d, "audit-goose.yaml")
+write(p, "extensions:\n  slack:\n    enabled: true\n    type: http\n    url: https://mcp.slack.com/mcp\n  chatrecall:\n    enabled: false\n")
+f = ac.audit_file(p)
+check("audit: yaml official slack mcp is expected", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
+check("audit: yaml unrelated extension ignored",
+      "chatrecall" not in f["direct_slack_servers"] + f["slack_mcp_servers"], json.dumps(f))
+
+p = os.path.join(d, "audit-amp.json")
+write(p, json.dumps({"amp.mcpServers": {
+    "slack": {"url": "https://mcp.slack.com/mcp"},
+    ac.SERVER: {"command": CMD},
+}}))
+f = ac.audit_file(p)
+check("audit: amp flat key scanned", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
+
+p = os.path.join(d, "audit-goose-providers.yaml")
+write(p, "active_provider: mistral\nproviders:\n  mistral:\n    enabled: true\n    model: zai-glm-5-2\n    context_limit: 1000000\n")
+f = ac.audit_file(p)
+check("audit: yaml llm provider is not a connector server",
+      f["mistral_connector_servers"] == [] and f["direct_slack_servers"] == [],
+      json.dumps(f))
+
+p = os.path.join(d, "audit-hermes-providers.yaml")
+write(p, "providers:\n  mistral-glm-5-2:\n    name: Mistral GLM 5.2\n    base_url: https://api.mistral.ai/v1\n    key_env: MISTRAL_API_KEY\n")
+f = ac.audit_file(p)
+check("audit: yaml provider with base_url is not a connector server",
+      f["mistral_connector_servers"] == [] and f["direct_slack_servers"] == [],
+      json.dumps(f))
+
+p = os.path.join(d, "audit-hermes-platform.yaml")
+write(p, "platform_toolsets:\n  slack:\n    - hermes-slack\nmcp_servers:\n  executor:\n    url: https://x\n")
+f = ac.audit_file(p)
+check("audit: hermes platform slack still reported as direct",
+      "slack" in f["direct_slack_servers"], json.dumps(f))
+check("audit: hermes executor not flagged", "executor" not in f["direct_slack_servers"], json.dumps(f))
+
+# ------------------------------------------------------------ instruction text
+check("instruction: read via slack mcp/connector, send via the gateway",
+      "read Slack context" in ac.INSTRUCTION
+      and "request_slack_message" in ac.INSTRUCTION
+      and "slack_send_message" in ac.INSTRUCTION
+      and "Mistral Slack connector" in ac.INSTRUCTION,
+      ac.INSTRUCTION)
+
 # ------------------------------------------------------------ strip_jsonc
 check("strip_jsonc: comments and trailing commas",
       json.loads(ac.strip_jsonc('{\n // c\n "a": [1, 2,], /* b */ "b": "x,y",\n}')) == {"a": [1, 2], "b": "x,y"})
