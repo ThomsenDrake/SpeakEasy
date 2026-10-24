@@ -11,61 +11,70 @@ agent ──MCP/stdio──> slack-approval-gateway ──human popup──> app
                             │ (only credential holder)
                             └──────────> Slack MCP server (https://mcp.slack.com/mcp)
                                          or the Mistral Slack Connector
+                                         or Korotovsky's Slack MCP server (stdio)
 ```
 
-## What agents can ask for
+![The approval popup](docs/screenshots/approval-popup.png)
 
-The MCP tool `request_slack_message` requires:
+**What you get:**
 
-| Field | Meaning |
-|---|---|
-| `message` | The exact proposed message text. Sent verbatim on approval. |
-| `destination` | Intended Slack recipient: channel (`#name` or ID) or user (`@name` or ID). |
-| `thread_ts` | Optional. Destination Slack thread timestamp for a reply. |
-| `reason` | Why the agent wants to send this. |
-| `agent` | Identity of the requesting agent. |
-| `conversation` | Context from the originating agent conversation: `title`, `id_or_link`, `summary`. |
+- **Nothing is sent without you.** Every agent-initiated message shows the
+  exact proposed text, the exact Slack destination, the reason, and the
+  agent conversation it came from — then waits for a human.
+- **Exact-send guarantee.** Approval applies only to that request: any
+  change to the content or destination requires fresh approval, and
+  repeated clicks or retries can never double-send.
+- **A real conversation with the agent.** *Give feedback* returns your
+  text to the agent (nothing is sent), so it can revise and ask again.
+- **Deny means stop.** Denying blocks the same purpose for 10 minutes —
+  including reworded requests and retries from other agents — persisted
+  across restarts, with no further popups during the cooldown.
+- **One gateway, every agent.** All coding agents on the machine share a
+  single gateway instance: one popup owner, one Slack client, one set of
+  cooldowns.
+- **Agents hold no credentials.** The gateway is the only component that
+  ever sees a Slack token or API key; the installer audits agent configs
+  and can remove direct Slack access from them.
 
-The popup shows all of the above, clearly separating the **Slack
-destination** (where the message would go) from the **originating agent
-conversation** (context only, not a Slack thread), and offers three actions:
-**Approve**, **Deny**, **Give feedback**.
+## The approval popup
 
-When the destination is a Slack ID (`U…`, `C…`, `G…`, `D…`), the popup shows
-the resolved **display name** next to the raw ID (e.g.
-`Drake Thomsen (@drake.thomsen)` `U09CV6A19EH`, or `#eng` `C0123`) — the
-gateway resolves it best-effort through the selected transport's lookup
-tools (slack-mcp transport: the Slack MCP server's user/channel lookup
-tools; connector transport: the connector's `slack_read_user_profile` /
-`slack_read_channel` tools). The raw ID is what gets sent; resolution is
-display-only and never changes the destination.
+When any agent asks to send a message, the popup appears (and the app
+comes to the front):
 
-Return values to the agent:
+![The approval popup: a DM request with the resolved recipient name and thread](docs/screenshots/approval-popup.png)
 
-| `status` | Meaning |
-|---|---|
-| `sent` | The exact approved message was sent to the exact approved destination. Includes `ts`, `permalink`, and `duplicate` (true when this was a retry of an already-sent identical request — nothing was resent). |
-| `denied` | Nothing was sent. The same purpose is blocked for `cooldown_remaining_secs` (600). |
-| `feedback` | Nothing was sent. The human's `feedback` text is returned; the agent may revise and submit a new request, which requires a new approval. |
-| `cooldown_blocked` | A matching deny cooldown is active. No popup was shown, nothing was sent; `cooldown_remaining_secs` tells the agent how long to wait. |
-| `error` | Nothing was sent. See `error` for details. |
+What you see, top to bottom:
 
-Semantics:
+- **The exact proposed message** — verbatim. What you approve is what is
+  sent.
+- **Destination (Slack)** — where the message would go, with the resolved
+  display name next to the raw ID (`Drake Thomsen (@drake.thomsen)`
+  `U0123SMOKE`, `#eng` `C0123SMOKE`), plus the destination thread if the
+  agent asked for a reply. This is clearly labeled as *not* the agent
+  conversation.
+- **Reason** — why the agent wants to send this.
+- **Originating agent conversation** — the title, link, and a summary of
+  the conversation the request came from (context only — it is never used
+  as a destination).
+- The requesting **agent**'s identity and the request id/time.
 
-- **Approval is per-request.** Any change to the message content or the
-  destination requires fresh approval.
-- **No duplicate sends.** An identical retry of an approved request returns
-  the cached result (`duplicate: true`) without resending — repeated clicks
-  or retries cannot double-send.
-- **Deny blocks the purpose for 10 minutes**, including reworded requests
-  and retries from *other* participating agents. The block is keyed by
-  destination + message-content similarity — never by agent identity, reason
-  string, or request ID — and is persisted across restarts. While a block is
-  active, matching requests get `cooldown_blocked` with the remaining time
-  and no popup.
-- **Feedback sends nothing** and returns the text to the requesting agent.
-- **Closing or ignoring the popup never approves.** If the app quits with
-  requests pending, the agents receive an error; nothing is sent.
+Three actions:
+
+- **Approve** — sends the exact message to the exact destination, once.
+  The agent receives the Slack permalink.
+- **Deny** — sends nothing and blocks the same purpose for 10 minutes.
+- **Give feedback** — opens a text field; *Submit feedback* returns your
+  text to the requesting agent without sending anything:
+
+![Giving feedback: the text field and Submit feedback button](docs/screenshots/approval-popup-feedback.png)
+
+A request to a channel instead of a person looks the same, with `#name`
+resolved:
+
+![The approval popup: a channel announcement](docs/screenshots/approval-popup-channel.png)
+
+Closing the window only **hides** it — it never approves anything. A
+menu-bar tray icon reopens the window or quits the gateway.
 
 ## Requirements
 
@@ -77,9 +86,9 @@ Semantics:
   (`SLACK_STDIO_COMMAND` can point at a server binary instead)
 - Agents that can run an MCP stdio server on the same machine
 
-## Setup
+## Install
 
-### 0. One-command install into every agent (recommended)
+### Quick start
 
 ```sh
 bash scripts/install.sh                       # optional: --slack-mcp-token xoxp-...
@@ -95,11 +104,8 @@ This installs the gateway on this Mac end to end:
    `mistral_api_key` for the Mistral Slack Connector transport, or
    `slack_transport` + `slack_bot_token` / `slack_user_token` for the
    korotovsky transport (below). Without a credential a placeholder is
-   written; sends then fail until you install a real one
-   (`scripts/slack_mcp_oauth.py --client-id ID --client-secret SECRET`,
-   `scripts/install.sh --transport mistral-connector --mistral-api-key ...`,
-   or `scripts/install.sh --transport korotovsky --slack-bot-token ...`;
-   the service restarts and reads the files at startup).
+   written; sends then fail until you install a real one (per-transport
+   setup below; the service restarts and reads the files at startup).
 4. Installs a LaunchAgent (`com.speakeasy.slack-approval-gateway`) that
    starts the single gateway instance at login (`--serve`: UI + MCP socket,
    no agent on stdio). Logs: `~/.slack-approval-gateway/gateway.log`.
@@ -139,32 +145,49 @@ Superset workspaces run these same agent CLIs as this user, so they pick up
 the registrations automatically — no per-workspace setup. Devin's CLI (when
 present) has no known user-level MCP config; register it manually.
 
-### Single instance, many agents
+### Verify the install
 
-Every agent spawns the binary over MCP stdio, but there is exactly one
-gateway *instance* per state dir: the first process takes `gateway.lock`
-and listens on `gateway.sock` (a Unix socket in the state dir); every later
-process becomes a byte-transparent *bridge* between the agent's stdio and
-that socket (`src/instance.rs`). So there is one popup owner, one Slack
-client, one pending-request queue, and one set of cooldowns/dedupe records
-(shared on disk in any case). The LaunchAgent instance runs with `--serve`
-(UI + socket, no stdio MCP); an instance started by an agent serves both
-its own stdio and the socket. A crashed instance leaves a stale lock/socket;
-the next starter detects it (the socket refuses connections) and takes
-over.
+Restart your agents (or start a new session) so they pick up the new MCP
+server, then ask any agent to send you a test message — a DM to yourself is
+a good first one:
 
-### Window lifecycle
+> "Send me a Slack DM saying 'gateway test'."
 
-The window starts hidden. A request arriving at any time shows and focuses
-it; once the queue drains after a decision the webview hides it again. A
-menu-bar tray icon offers **Show approval window** / **Quit gateway** (a
-left click on the icon also shows the window), and a Dock click reopens it.
-Closing the window only hides it — the gateway keeps serving MCP for every
-agent, and closing never approves anything. Only the tray's Quit (or
-`pkill -x slack-approval-gateway`) stops the app; pending requests then
-fail and the agents are told nothing was sent.
+A popup should appear with your name as the destination. Approve it: the
+message arrives, and the agent gets back a `sent` verdict with the Slack
+permalink. Deny it once to see the cooldown behavior (the agent is told
+`denied` and a reworded retry comes back `cooldown_blocked` with no popup).
 
-### 1. Slack authentication (the default `slack-mcp` transport)
+### Choose your sending transport
+
+The gateway sends the approved message through exactly one transport,
+selected once per install (or per process via `SLACK_TRANSPORT`):
+
+| | `slack-mcp` (default) | `mistral-connector` | `korotovsky` |
+|---|---|---|---|
+| Send path | the official Slack MCP server: MCP `tools/call` of `slack_send_message` at `https://mcp.slack.com/mcp` | Mistral Slack Connector tool call (`POST /v1/connectors/{c}/tools/{t}/call`) | Korotovsky's unofficial Slack MCP server (`@korotovsky/slack-mcp-server`), **spawned as a stdio child process**: MCP `tools/call` of `conversations_add_message` |
+| Credential the app holds | Slack **user** OAuth token (`slack_mcp_token` / `SLACK_MCP_TOKEN`) | Mistral API key (`mistral_api_key` / `MISTRAL_API_KEY`) | Slack **bot** token (`slack_bot_token` / `SLACK_BOT_TOKEN`, default) or **user** token (`slack_user_token` / `SLACK_USER_TOKEN`) |
+| Where Slack credentials live | the app's state dir (a user token) | the **Mistral console** (the connected Slack workspace) | the app's state dir (passed to the child process as `SLACK_MCP_XOXB_TOKEN` / `SLACK_MCP_XOXP_TOKEN`) |
+| Needs | a Slack app usable with the official Slack MCP server | a Mistral API key with the Slack connector | node/npx (or a server binary via `SLACK_STDIO_COMMAND`) |
+| Agent-facing behavior | identical — same popup, same verdicts, same dedupe/cooldowns | identical | identical |
+
+Which one should you pick?
+
+- **`slack-mcp` (default)** — no bot to install into channels; messages post
+  as *you*. Needs a Slack app (for the OAuth user token) whose app is
+  directory-published or internal.
+- **`mistral-connector`** — if you already use Mistral and want Slack
+  credentials off this machine entirely; they live in the Mistral console.
+- **`korotovsky`** — if you want a local, open-source Slack MCP server (or
+  already run one). Posts as a bot app; the bot must be invited to the
+  channels it may post to.
+
+All three enforce the same exclusive-sending path: agents reach Slack only
+through the gateway, and the exact approved message still goes to the exact
+approved destination (the gateway calls the send tool directly — no LLM in
+the send path).
+
+#### Option A: the official Slack MCP server (default)
 
 The gateway sends through the **official Slack MCP server** — a remote MCP
 server at `https://mcp.slack.com/mcp` (MCP over Streamable HTTP; JSON-RPC
@@ -219,26 +242,11 @@ Optional environment variables:
   `~/.slack-approval-gateway`). Holds `cooldowns.json`, `sent.json`, and lock
   files; everything persists across restarts.
 
-### 1b. Slack transport: Slack MCP server (default) vs Mistral Slack Connector
+#### Option B: the Mistral Slack Connector
 
-The gateway can send the approved message three ways, selected once per
-install (or per process via env):
-
-| | `slack-mcp` (default) | `mistral-connector` | `korotovsky` |
-|---|---|---|---|
-| Send path | the official Slack MCP server: MCP `tools/call` of `slack_send_message` at `https://mcp.slack.com/mcp` | Mistral Slack Connector tool call (`POST /v1/connectors/{c}/tools/{t}/call`) | Korotovsky's unofficial Slack MCP server (`@korotovsky/slack-mcp-server`), **spawned as a stdio child process**: MCP `tools/call` of `conversations_add_message` |
-| Credential the app holds | Slack **user** OAuth token (`slack_mcp_token` / `SLACK_MCP_TOKEN`) | Mistral API key (`mistral_api_key` / `MISTRAL_API_KEY`) | Slack **bot** token (`slack_bot_token` / `SLACK_BOT_TOKEN`, default) or **user** token (`slack_user_token` / `SLACK_USER_TOKEN`) |
-| Where Slack credentials live | the app's state dir (a user token) | the **Mistral console** (the connected Slack workspace) | the app's state dir (passed to the child process as `SLACK_MCP_XOXB_TOKEN` / `SLACK_MCP_XOXP_TOKEN`) |
-| Needs | a Slack app usable with the official Slack MCP server | a Mistral API key with the Slack connector | node/npx (or a server binary via `SLACK_STDIO_COMMAND`) |
-| Agent-facing behavior | identical — same popup, same verdicts, same dedupe/cooldowns | identical | identical |
-
-The connector transport is an **option**: it trades holding a Slack user
-token for holding a Mistral API key, and moves the Slack workspace
-connection into the Mistral console. The gateway calls the connector's send
-tool **directly** (no LLM in the send path), so the exact approved message
-still goes to the exact approved destination.
-
-Setup:
+The gateway calls the connector's Slack send tool **directly** (no LLM in
+the send path). Slack credentials live in the **Mistral console** — the app
+never holds them, only a Mistral API key.
 
 1. In the Mistral console, connect your Slack workspace to the **Slack
    connector** (the connector named `slack`). Until the workspace is
@@ -254,14 +262,7 @@ Setup:
    (mode 600) into the state dir and restarts the service. No Slack token
    is needed or written.
 
-3. Manual selection (same precedence): `SLACK_TRANSPORT=slack-mcp` (or
-   `mistral-connector` or `korotovsky`) in the gateway's environment, else
-   a one-line `slack_transport` file in the state dir, else `slack-mcp`.
-   The old `direct` transport (Slack API calls with a bot token held by the
-   gateway) was removed on purpose; selecting it now fails at startup with
-   an explanation.
-
-Optional environment variables (connector transport):
+Optional environment variables:
 
 - `MISTRAL_API_KEY` — the key, if not in `<state-dir>/mistral_api_key`.
 - `MISTRAL_API_BASE` — override the Mistral API endpoint (default
@@ -279,18 +280,12 @@ Optional environment variables (connector transport):
   `MISTRAL_SLACK_THREAD_ARG` override the detected names. A thread reply to
   a tool that declares no thread argument is refused (nothing is sent).
 
-The exclusivity boundary is unchanged: agents still reach Slack only through
-the gateway. With the connector transport the app never holds Slack
-credentials at all — they live in the Mistral console, and the gateway only
-holds a Mistral API key scoped to calling that connector's tools.
-
-### 1c. Slack transport: the korotovsky Slack MCP server (stdio)
+#### Option C: Korotovsky's Slack MCP server (stdio)
 
 [Korotovsky's `slack-mcp-server`](https://github.com/korotovsky/slack-mcp-server)
 is an unofficial, open-source Slack MCP server. The gateway spawns it as a
 **child process** and speaks MCP (newline-delimited JSON-RPC) over its
-stdio. This is the transport to pick if you would rather run a local Slack
-MCP server than use the official remote one or the Mistral connector.
+stdio.
 
 1. Get a token — the gateway holds it, agents never see it:
    - **bot token** (`xoxb-…`, the usual choice): create a Slack app at
@@ -343,7 +338,7 @@ channel and ts out and builds the permalink from them (set
 Destination display names in the popup come from the server's
 `channels_list` / `users_search` tools (CSV replies), best-effort.
 
-Optional environment variables (korotovsky transport):
+Optional environment variables:
 
 - `SLACK_BOT_TOKEN` / `SLACK_USER_TOKEN` — the tokens, if not in
   `<state-dir>/slack_bot_token` / `slack_user_token`.
@@ -355,55 +350,90 @@ Optional environment variables (korotovsky transport):
   `SLACK_STDIO_THREAD_ARG` — override the argument names detected from the
   tool's declared `inputSchema` (`channel_id` / `text` / `thread_ts`).
 
-The exclusivity boundary is unchanged: the token lives only in the app's
-state dir (mode 600) and is passed only to the child process the app
-spawns. An agent that has **its own** korotovsky server (with a token in
-its config) is exactly the "direct token-based Slack server" the audit
-reports as a violation — `--enforce` removes those entries.
+#### Manual transport selection
 
-### 2. Launching the app
+Same precedence everywhere: `SLACK_TRANSPORT` in the gateway's environment
+(`slack-mcp`, `mistral-connector` or `korotovsky`), else a one-line
+`slack_transport` file in the state dir, else `slack-mcp`. The old `direct`
+transport (Slack API calls with a bot token held by the gateway) was removed
+on purpose; selecting it now fails at startup with an explanation.
+
+## Using it day to day
+
+### The service
+
+The gateway runs as a login service
+(`com.speakeasy.slack-approval-gateway`, started by the installer):
 
 ```sh
-# Build the frontend once (Tauri embeds ui/dist into the binary)
-cd ui && npm install && npm run build && cd ..
-
-cargo build --release
-./target/release/slack-approval-gateway          # GUI mode (default)
-./target/release/slack-approval-gateway --serve  # service mode (LaunchAgent)
-./target/release/slack-approval-gateway --cli    # terminal approval (headless/SSH)
+launchctl kickstart -k gui/$(id -u)/com.speakeasy.slack-approval-gateway   # restart
+launchctl bootout gui/$(id -u)/com.speakeasy.slack-approval-gateway       # stop
+tail -f ~/.slack-approval-gateway/gateway.log                              # logs
 ```
 
-With `scripts/install.sh` done, the app is already running as a login
-service; you normally never launch it by hand.
+After changing a credential file, restart the service — it reads the files at
+startup. A menu-bar tray icon offers **Show approval window** / **Quit
+gateway** (a left click on the icon also shows the window), and a Dock click
+reopens it.
 
-- **GUI mode (default)**: spawned by an agent over MCP stdio. If an
-  instance is already running (the login service), the process bridges to
-  it; otherwise it becomes the instance. The Tauri webview popup is built
-  with the OSS **Once UI** design system (`@once-ui-system/core`) plus
-  animated primitives vendored from **Motion Primitives**
-  (`ui/src/components/motion-primitives/`, added with
-  `npx motion-primitives add <name>`) — React 19 + Tailwind 4. The MCP
-  server runs on a background
-  thread speaking newline-delimited JSON-RPC on stdio, and the instance
-  also serves MCP on `gateway.sock` for bridged agents. stdout carries
-  protocol only; diagnostics go to stderr. The binary is self-contained:
-  the UI is embedded (Tauri `custom-protocol` feature), so no dev server is
-  needed at runtime.
-- **Service mode (`--serve`)**: like GUI mode but with no MCP on stdio —
-  used by the LaunchAgent so the single instance starts at login.
-- **Development**: after changing `ui/`, run `npm run build` in `ui/` and
-  rebuild the binary; `npm run dev` in `ui/` serves the frontend with hot
-  reload for iterating on components.
-- **CLI mode**: approvals happen on the controlling terminal
-  (`a` approve, `d` deny, `f <feedback>`). Concurrent prompts are
-  serialized so an answer always reaches the right request. `--cli` also
-  becomes the instance and serves the socket (used by the smoke test).
+### What the agent receives
 
-### 3. Agent integration
+| `status` | Meaning |
+|---|---|
+| `sent` | The exact approved message was sent to the exact approved destination. Includes `ts`, `permalink`, and `duplicate` (true when this was a retry of an already-sent identical request — nothing was resent). |
+| `denied` | Nothing was sent. The same purpose is blocked for `cooldown_remaining_secs` (600). |
+| `feedback` | Nothing was sent. The human's `feedback` text is returned; the agent may revise and submit a new request, which requires a new approval. |
+| `cooldown_blocked` | A matching deny cooldown is active. No popup was shown, nothing was sent; `cooldown_remaining_secs` tells the agent how long to wait. |
+| `error` | Nothing was sent. See `error` for details. |
+
+### The rules the gateway enforces
+
+- **Approval is per-request.** Any change to the message content or the
+  destination requires fresh approval.
+- **No duplicate sends.** An identical retry of an approved request returns
+  the cached result (`duplicate: true`) without resending — repeated clicks
+  or retries cannot double-send. Sent records persist across restarts.
+- **Deny blocks the purpose for 10 minutes**, including reworded requests
+  and retries from *other* participating agents. The block is keyed by
+  destination + message-content similarity — never by agent identity, reason
+  string, or request ID — and is persisted across restarts. While a block is
+  active, matching requests get `cooldown_blocked` with the remaining time
+  and no popup.
+- **Feedback sends nothing** and returns the text to the requesting agent.
+- **Closing or ignoring the popup never approves.** If the app quits with
+  requests pending, the agents receive an error; nothing is sent.
+
+### One instance, many agents
+
+Every agent spawns the binary over MCP stdio, but there is exactly one
+gateway *instance* per state dir: the first process takes `gateway.lock`
+and listens on `gateway.sock` (a Unix socket in the state dir); every later
+process becomes a byte-transparent *bridge* between the agent's stdio and
+that socket (`src/instance.rs`). So there is one popup owner, one Slack
+client, one pending-request queue, and one set of cooldowns/dedupe records
+(shared on disk in any case). The LaunchAgent instance runs with `--serve`
+(UI + socket, no stdio MCP); an instance started by an agent serves both
+its own stdio and the socket. A crashed instance leaves a stale lock/socket;
+the next starter detects it (the socket refuses connections) and takes
+over.
+
+### Headless / CLI mode
+
+```sh
+slack-approval-gateway --cli
+```
+
+Approvals happen on the controlling terminal (`a` approve, `d` deny,
+`f <feedback>`). Concurrent prompts are serialized so an answer always
+reaches the right request. `--cli` also becomes the instance and serves the
+socket (used by the smoke test). Use this on headless hosts; the popup
+needs the desktop app running with access to the window server.
+
+## Agent integration
 
 `scripts/install.sh` registers the MCP server in every agent (table in
-§0). Manually, each participating agent's MCP client gets a stdio server,
-e.g.:
+*Install*). Manually, each participating agent's MCP client gets a stdio
+server, e.g.:
 
 ```json
 {
@@ -416,11 +446,45 @@ e.g.:
 }
 ```
 
-The per-agent config key/shape differs (see the table in §0 and
+The per-agent config key/shape differs (see the table in *Install* and
 `scripts/agent_config.py`); `scripts/install.sh` handles all of them.
-Agents call `request_slack_message` with the fields above and receive one
-of the verdicts. They do not need the gateway pre-running: the first spawn
-becomes the instance, later spawns bridge to it.
+Agents call `request_slack_message` and receive one of the verdicts above.
+They do not need the gateway pre-running: the first spawn becomes the
+instance, later spawns bridge to it.
+
+The tool requires:
+
+| Field | Meaning |
+|---|---|
+| `message` | The exact proposed message text. Sent verbatim on approval. |
+| `destination` | Intended Slack recipient: channel (`#name` or ID) or user (`@name` or ID). |
+| `thread_ts` | Optional. Destination Slack thread timestamp for a reply. |
+| `reason` | Why the agent wants to send this. |
+| `agent` | Identity of the requesting agent. |
+| `conversation` | Context from the originating agent conversation: `title`, `id_or_link`, `summary`. |
+
+Example agent-side call and reply:
+
+```json
+{
+  "name": "request_slack_message",
+  "arguments": {
+    "message": "The staging deploy finished and all smoke tests passed.",
+    "destination": "U09CV6A19EH",
+    "reason": "Tell Drake the staging deploy is ready for review",
+    "agent": "codex",
+    "conversation": {
+      "title": "Staging deploy review",
+      "id_or_link": "https://github.com/acme/app/pull/482",
+      "summary": "PR #482 passed CI; the staging deploy finished at 14:32 UTC."
+    }
+  }
+}
+```
+
+```json
+{ "status": "sent", "ts": "1700000000.000100", "permalink": "https://acme.slack.com/archives/U09CV6A19EH/p1700000000000100", "duplicate": false }
+```
 
 Agents are **expected** to already have either the official Slack MCP
 server (`https://mcp.slack.com/mcp`, OAuth — see
@@ -433,7 +497,7 @@ server into agents yourself, keep its OAuth grant **read-only** (no
 `chat:write` scope) so the agents' token cannot send; the gateway's token
 is the only one with `chat:write`.
 
-## Enforcement boundaries (exclusive sending path)
+## Security: the exclusive sending path
 
 The gateway is the **only** component that holds a Slack credential and the
 only intended path that sends:
@@ -514,6 +578,115 @@ only intended path that sends:
 - Approval popups require the desktop app to be running with access to the
   window server; use `--cli` for headless hosts.
 
+## FAQ
+
+**Why does every agent message need a human click?**
+That is the point: agents cannot message anyone on Slack without you seeing
+the exact text and the exact destination first.
+
+**Can I pre-approve an agent, a channel, or a kind of message?**
+No — every send is individually approved. The closest thing is *Deny*,
+which blocks the same purpose for 10 minutes (see below).
+
+**What happens if I close the popup instead of choosing?**
+Nothing is sent. Closing only hides the window; the request stays pending
+and the agent keeps waiting. Only quitting the gateway fails pending
+requests (the agent is told nothing was sent). Reopen the window from the
+menu-bar tray icon.
+
+**What does the agent see when I deny?**
+`denied`, plus a 10-minute cooldown on that purpose (destination +
+message-content similarity). Reworded retries — and retries from *other*
+agents — come back `cooldown_blocked` with the remaining seconds and get no
+popup. The block survives restarts.
+
+**What does "Give feedback" do?**
+Nothing is sent to Slack. Your text is returned to the requesting agent,
+which can revise its proposal and submit a new request — that new request
+needs a fresh approval, like any other.
+
+**Can repeated clicks or retries double-send a message?**
+No. An identical retry of an already-approved request returns the cached
+result with `duplicate: true`; nothing is resent. This persists across
+restarts.
+
+**Does approving once cover future similar messages?**
+No. Approval is per-request: any change to the message content or the
+destination requires fresh approval.
+
+**Which transport should I pick?**
+Default `slack-mcp` posts as *you* and needs no bot in channels (but needs
+a Slack app for the OAuth token). `mistral-connector` keeps Slack
+credentials off this machine entirely (Mistral console holds them). Pick
+`korotovsky` if you want a local open-source Slack MCP server — it posts as
+a bot app that must be invited to channels.
+
+**Do I need to create a Slack app?**
+`slack-mcp`: yes (for the OAuth user token). `korotovsky`: yes (for the bot
+token). `mistral-connector`: no.
+
+**The popup shows a raw ID (`U0123…`) instead of a name — why?**
+Display-name resolution is best-effort: it needs the read scopes
+(`users:read`, `channels:read`, …) and a working lookup tool on the
+selected transport. The raw ID is what gets sent either way; resolution is
+display-only. With the korotovsky transport the server's caches also warm up
+in the background at startup, so the first request after a restart may show
+raw IDs.
+
+**The send fails with `channel_not_found` (korotovsky).**
+A bot token sees invited channels only — invite the bot to the channel (or
+use a user token). With the official Slack MCP server the *user* must be a
+member of the channel.
+
+**Why does my message look different in Slack than I approved?**
+The gateway sends the exact text as `text/plain` — no markdown
+interpretation, no reformatting. (With the korotovsky transport you can opt
+into markdown rendering via `SLACK_STDIO_CONTENT_TYPE=text/markdown`.)
+
+**Is my message content sent through an LLM?**
+No. The gateway calls the Slack send tool directly (Slack MCP server,
+Mistral connector tool call, or the korotovsky server's tool) — no LLM is
+in the send path.
+
+**How do I rotate a token or API key?**
+Re-run the installer with the flag (it writes the credential file and
+restarts the service), e.g.
+`scripts/install.sh --transport mistral-connector --mistral-api-key NEW_KEY`,
+or edit the file in `~/.slack-approval-gateway/` (mode 600) and restart:
+`launchctl kickstart -k gui/$(id -u)/com.speakeasy.slack-approval-gateway`.
+
+**How do I stop or uninstall?**
+Stop: `launchctl bootout gui/$(id -u)/com.speakeasy.slack-approval-gateway`
+(or the tray icon's Quit). Uninstall:
+`scripts/install.sh --uninstall` (removes the registrations, instruction
+blocks, LaunchAgent, and binary; restores agent configs from their
+`.bak-sag` backups). Add `--purge` to also delete the state dir
+(cooldowns, sent records, credential files).
+
+**Can an agent bypass the gateway and send directly?**
+It has no credentials to do so. The installer audits agent configs and
+`--enforce` removes direct (token-based) Slack MCP servers from them; the
+instruction block forbids every other route; and the legacy hook guard
+blocks direct Slack writes (curl, browser automation, SDKs) unless you
+approve them. See *Security* — and its honest limitations — for what is and
+isn't enforceable on a single-user machine.
+
+**Does it work on Linux or headless?**
+macOS is the primary, tested target; Linux should work. For headless hosts
+run `slack-approval-gateway --cli` — approvals happen on the terminal
+instead of the popup.
+
+**Can I use it on another machine or for a team?**
+One install per machine: agents must run on the same machine as the gateway
+(MCP is stdio plus a local Unix socket), and the state dir is per-user
+(`~/.slack-approval-gateway`).
+
+**Where are logs and state?**
+Logs: `~/.slack-approval-gateway/gateway.log`. State (mode 700): cooldowns
+(`cooldowns.json`), sent-message dedupe records (`sent.json`), credential
+files (mode 600), lock/socket, and the korotovsky caches. Everything
+persists across restarts.
+
 ## Development
 
 ```sh
@@ -531,11 +704,11 @@ bash scripts/install.sh --dry-run    # preview the agent install
 ```
 
 `docs/SPEC.md` is the module contract (`core` = gateway/cooldowns/dedupe,
-`slack` = transport selection + the only credential plumbing, `slack_mcp` =
-the Slack MCP server client (default transport), `slack_stdio` = the
-korotovsky stdio transport (spawns and drives the unofficial Slack MCP
-server as a child process), `slack_tools` = shared tool-call plumbing,
-`mistral_slack` = the connector transport, `mcp` =
+`slack` = transport selection + the only credential plumbing,
+`slack_mcp` = the Slack MCP server client (default transport),
+`slack_stdio` = the korotovsky stdio transport (spawns and drives the
+unofficial Slack MCP server as a child process), `slack_tools` = shared
+tool-call plumbing, `mistral_slack` = the connector transport, `mcp` =
 JSON-RPC server, `instance` = single-instance coordination + stdio bridges,
 `ui` = the Tauri webview bridge). GUI behavior is verified by build + spec
 review plus the IPC bridge unit tests; the decision flows are covered by
@@ -550,7 +723,7 @@ manual run of the installed service.
 ├── src/core.rs       gateway: validation, purpose fingerprinting, persisted
 │                     deny cooldowns, persisted sent-record dedupe, decision flow
 ├── src/slack.rs      transport selection + the only credential plumbing
-│                     (env/file secret readers shared by both transports)
+│                     (env/file secret readers shared by all transports)
 ├── src/slack_mcp.rs  Slack MCP server client — the default transport
 │                     (remote MCP at https://mcp.slack.com/mcp with a Slack
 │                     user token; also resolves Slack IDs for the popup)
@@ -577,6 +750,8 @@ manual run of the installed service.
 ├── tests/            unit/integration/e2e tests (mock Slack MCP server,
 │                     mock korotovsky stdio server, scripted humans,
 │                     socket-level instance tests)
+├── docs/SPEC.md      behavioral + module contract
+├── docs/screenshots/ the approval popup screenshots used in this README
 ├── scripts/install.sh         one-command install into every agent + LaunchAgent
 ├── scripts/slack_mcp_oauth.py  Slack MCP user-token OAuth helper (browser flow
 │                             + token verification + chmod 600 token file)
@@ -585,7 +760,6 @@ manual run of the installed service.
 ├── scripts/mock_korotovsky.py  mock of Korotovsky's Slack MCP server (stdio
 │                             MCP) for tests + the smoke test
 ├── scripts/smoke_test.py      end-to-end test of the real binary (incl. bridges)
-├── docs/SPEC.md      behavioral + module contract
 ├── tauri.conf.json, capabilities/, icons/, build.rs   Tauri shell
 └── README.md
 ```
