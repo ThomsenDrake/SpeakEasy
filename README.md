@@ -71,8 +71,10 @@ Semantics:
 
 - macOS (developed and tested on macOS arm64; Linux should work)
 - Rust 1.98+ (`rustup`), Node 24+ (`npm`)
-- A Slack **user** OAuth token for the Slack MCP server (default transport),
-  or a Mistral API key (connector transport)
+- A Slack **user** OAuth token for the Slack MCP server (default
+  transport), a Mistral API key (connector transport), or a Slack **bot**
+  or **user** token plus node/npx for the korotovsky transport
+  (`SLACK_STDIO_COMMAND` can point at a server binary instead)
 - Agents that can run an MCP stdio server on the same machine
 
 ## Setup
@@ -89,12 +91,14 @@ This installs the gateway on this Mac end to end:
 2. Installs the binary to `~/.local/bin/slack-approval-gateway`.
 3. Creates `~/.slack-approval-gateway/` (mode 700) and writes the credential
    files (mode 600) — the only place a credential lives: `slack_mcp_token`
-   for the default Slack MCP transport, or `slack_transport` +
-   `mistral_api_key` for the Mistral Slack Connector transport (below).
-   Without a credential a placeholder is written; sends then fail until you
-   install a real one (`scripts/slack_mcp_oauth.py --client-id ID
-   --client-secret SECRET`, or
-   `scripts/install.sh --transport mistral-connector --mistral-api-key ...`;
+   for the default Slack MCP transport, `slack_transport` +
+   `mistral_api_key` for the Mistral Slack Connector transport, or
+   `slack_transport` + `slack_bot_token` / `slack_user_token` for the
+   korotovsky transport (below). Without a credential a placeholder is
+   written; sends then fail until you install a real one
+   (`scripts/slack_mcp_oauth.py --client-id ID --client-secret SECRET`,
+   `scripts/install.sh --transport mistral-connector --mistral-api-key ...`,
+   or `scripts/install.sh --transport korotovsky --slack-bot-token ...`;
    the service restarts and reads the files at startup).
 4. Installs a LaunchAgent (`com.speakeasy.slack-approval-gateway`) that
    starts the single gateway instance at login (`--serve`: UI + MCP socket,
@@ -111,8 +115,9 @@ This installs the gateway on this Mac end to end:
 
 Flags: `--dry-run`, `--enforce`, `--uninstall [--purge]`, `--skip-build`,
 `--slack-mcp-token xoxp-...`, `--state-dir DIR`,
-`--transport slack-mcp|mistral-connector`,
-`--mistral-api-key KEY`. Every modified config file is backed
+`--transport slack-mcp|mistral-connector|korotovsky`,
+`--mistral-api-key KEY`, `--slack-bot-token xoxb-...`,
+`--slack-user-token xoxp-...`. Every modified config file is backed
 up once to `<file>.bak-sag`; `--uninstall` restores them.
 
 | Agent | Detected via | Config written |
@@ -216,15 +221,16 @@ Optional environment variables:
 
 ### 1b. Slack transport: Slack MCP server (default) vs Mistral Slack Connector
 
-The gateway can send the approved message two ways, selected once per
+The gateway can send the approved message three ways, selected once per
 install (or per process via env):
 
-| | `slack-mcp` (default) | `mistral-connector` |
-|---|---|---|
-| Send path | the official Slack MCP server: MCP `tools/call` of `slack_send_message` at `https://mcp.slack.com/mcp` | Mistral Slack Connector tool call (`POST /v1/connectors/{c}/tools/{t}/call`) |
-| Credential the app holds | Slack **user** OAuth token (`slack_mcp_token` / `SLACK_MCP_TOKEN`) | Mistral API key (`mistral_api_key` / `MISTRAL_API_KEY`) |
-| Where Slack credentials live | the app's state dir (a user token — the app is not a Slack app and holds no bot token) | the **Mistral console** (the connected Slack workspace) |
-| Agent-facing behavior | identical — same popup, same verdicts, same dedupe/cooldowns | identical |
+| | `slack-mcp` (default) | `mistral-connector` | `korotovsky` |
+|---|---|---|---|
+| Send path | the official Slack MCP server: MCP `tools/call` of `slack_send_message` at `https://mcp.slack.com/mcp` | Mistral Slack Connector tool call (`POST /v1/connectors/{c}/tools/{t}/call`) | Korotovsky's unofficial Slack MCP server (`@korotovsky/slack-mcp-server`), **spawned as a stdio child process**: MCP `tools/call` of `conversations_add_message` |
+| Credential the app holds | Slack **user** OAuth token (`slack_mcp_token` / `SLACK_MCP_TOKEN`) | Mistral API key (`mistral_api_key` / `MISTRAL_API_KEY`) | Slack **bot** token (`slack_bot_token` / `SLACK_BOT_TOKEN`, default) or **user** token (`slack_user_token` / `SLACK_USER_TOKEN`) |
+| Where Slack credentials live | the app's state dir (a user token) | the **Mistral console** (the connected Slack workspace) | the app's state dir (passed to the child process as `SLACK_MCP_XOXB_TOKEN` / `SLACK_MCP_XOXP_TOKEN`) |
+| Needs | a Slack app usable with the official Slack MCP server | a Mistral API key with the Slack connector | node/npx (or a server binary via `SLACK_STDIO_COMMAND`) |
+| Agent-facing behavior | identical — same popup, same verdicts, same dedupe/cooldowns | identical | identical |
 
 The connector transport is an **option**: it trades holding a Slack user
 token for holding a Mistral API key, and moves the Slack workspace
@@ -249,10 +255,11 @@ Setup:
    is needed or written.
 
 3. Manual selection (same precedence): `SLACK_TRANSPORT=slack-mcp` (or
-   `mistral-connector`) in the gateway's environment, else a one-line
-   `slack_transport` file in the state dir, else `slack-mcp`. The old
-   `direct` transport (a Slack bot token held by the gateway) was removed on
-   purpose; selecting it now fails at startup with an explanation.
+   `mistral-connector` or `korotovsky`) in the gateway's environment, else
+   a one-line `slack_transport` file in the state dir, else `slack-mcp`.
+   The old `direct` transport (Slack API calls with a bot token held by the
+   gateway) was removed on purpose; selecting it now fails at startup with
+   an explanation.
 
 Optional environment variables (connector transport):
 
@@ -276,6 +283,83 @@ The exclusivity boundary is unchanged: agents still reach Slack only through
 the gateway. With the connector transport the app never holds Slack
 credentials at all — they live in the Mistral console, and the gateway only
 holds a Mistral API key scoped to calling that connector's tools.
+
+### 1c. Slack transport: the korotovsky Slack MCP server (stdio)
+
+[Korotovsky's `slack-mcp-server`](https://github.com/korotovsky/slack-mcp-server)
+is an unofficial, open-source Slack MCP server. The gateway spawns it as a
+**child process** and speaks MCP (newline-delimited JSON-RPC) over its
+stdio. This is the transport to pick if you would rather run a local Slack
+MCP server than use the official remote one or the Mistral connector.
+
+1. Get a token — the gateway holds it, agents never see it:
+   - **bot token** (`xoxb-…`, the usual choice): create a Slack app at
+     <https://api.slack.com/apps>, add the **bot** scopes `chat:write`,
+     `channels:read`, `users:read` (plus `groups:read` for private
+     channels), install the app to the workspace, and invite the bot to the
+     channels it may post to (a bot token sees invited channels only);
+     or
+   - **user token** (`xoxp-…`) with the same scopes as a user token.
+2. Install with the korotovsky transport:
+
+   ```sh
+   scripts/install.sh --transport korotovsky --slack-bot-token "$SLACK_BOT_TOKEN"
+   ```
+
+   This writes `slack_transport` (`korotovsky`) and `slack_bot_token`
+   (mode 600) into the state dir and restarts the service. A user token
+   works the same way: `--slack-user-token xoxp-…` (file
+   `slack_user_token`). If the server's own `SLACK_MCP_XOX*` variables are
+   already in the gateway's environment, the child inherits them and no
+   gateway-side token file is needed.
+3. The server itself: the gateway runs `npx -y @korotovsky/slack-mcp-server`
+   by default (needs node/npx). Point `SLACK_STDIO_COMMAND` at any other
+   command line (e.g. an installed binary path; whitespace-separated, no
+   quoting).
+
+What the gateway does for you when spawning the server:
+
+- sets `SLACK_MCP_ADD_MESSAGE_TOOL=true` — the server's
+  `conversations_add_message` tool is **disabled by default for safety**,
+  and the gateway fails at startup if the tool is not listed (your own
+  `SLACK_MCP_ADD_MESSAGE_TOOL` value wins if you set one, e.g. to restrict
+  posting to specific channels);
+- sets `SLACK_MCP_LOG_LEVEL=error` (the server logs to stderr in stdio mode;
+  the gateway tolerates non-JSON lines on stdout anyway);
+- points the server's user/channel caches (`SLACK_MCP_USERS_CACHE`,
+  `SLACK_MCP_CHANNELS_CACHE`) into the state dir, so they stay under the
+  app's control and never collide with agent-side instances of the same
+  server;
+- passes the token as `SLACK_MCP_XOXB_TOKEN` / `SLACK_MCP_XOXP_TOKEN`.
+
+Sending: the send tool is `conversations_add_message` (`channel_id`,
+`thread_ts`, `text`, `content_type`). The gateway sends the exact approved
+text with `content_type: text/plain` — Slack then renders the exact text,
+without markdown interpretation (`SLACK_STDIO_CONTENT_TYPE=text/markdown`
+opts into markdown). The server replies with plain text
+(`Successfully posted message to channel … (ts=…)`); the gateway parses the
+channel and ts out and builds the permalink from them (set
+`SLACK_WORKSPACE_DOMAIN` to your workspace's domain for exact links).
+Destination display names in the popup come from the server's
+`channels_list` / `users_search` tools (CSV replies), best-effort.
+
+Optional environment variables (korotovsky transport):
+
+- `SLACK_BOT_TOKEN` / `SLACK_USER_TOKEN` — the tokens, if not in
+  `<state-dir>/slack_bot_token` / `slack_user_token`.
+- `SLACK_STDIO_COMMAND` — the server command line (default
+  `npx -y @korotovsky/slack-mcp-server`).
+- `SLACK_STDIO_CONTENT_TYPE` — `text/plain` (default) or `text/markdown`.
+- `SLACK_STDIO_TOOL` — pin the exact send-tool name (skips discovery).
+- `SLACK_STDIO_CHANNEL_ARG`, `SLACK_STDIO_TEXT_ARG`,
+  `SLACK_STDIO_THREAD_ARG` — override the argument names detected from the
+  tool's declared `inputSchema` (`channel_id` / `text` / `thread_ts`).
+
+The exclusivity boundary is unchanged: the token lives only in the app's
+state dir (mode 600) and is passed only to the child process the app
+spawns. An agent that has **its own** korotovsky server (with a token in
+its config) is exactly the "direct token-based Slack server" the audit
+reports as a violation — `--enforce` removes those entries.
 
 ### 2. Launching the app
 
@@ -393,6 +477,13 @@ only intended path that sends:
   the Mistral console — so the file to protect is the Mistral API key.
 - MCP is stdio (plus the local Unix socket for bridges), so agents must run
   on the same machine as the gateway.
+- The korotovsky transport spawns a third-party server process
+  (`@korotovsky/slack-mcp-server`) as a child of the gateway: it needs
+  node/npx on PATH (or `SLACK_STDIO_COMMAND` pointing at a binary), runs on
+  the gateway's machine, and is driven through its MCP tool surface
+  (`conversations_add_message`, `channels_list`, `users_search`) — an
+  upstream tool rename or reply-format change needs a gateway update (the
+  tests pin the expected shapes).
 - Keep the token file `chmod 600` (the installer does this).
 
 ### Environment limitations (honest list)
@@ -428,25 +519,30 @@ only intended path that sends:
 ```sh
 cd ui && npm install && npm run build && cd ..   # frontend (required once)
 cargo build --release    # first build compiles Tauri/wry; takes minutes
-cargo test               # 74 lib + 14 MCP e2e + 3 instance-socket + 22 Slack
-                         # MCP + 18 Mistral-connector tests
+cargo test               # 81 lib + 14 MCP e2e + 3 instance-socket + 22 Slack
+                         # MCP + 18 Mistral-connector + 10 korotovsky-stdio
+                         # tests
 cargo test -- --ignored  # also the ~30s MCP timeout test
 python3 scripts/smoke_test.py        # drives the real binary (mock Slack MCP
-                                     # server + mock Mistral API + pty + bridges)
+                                     # server + mock Mistral API + mock
+                                     # korotovsky stdio server + pty + bridges)
 python3 scripts/test_agent_config.py # installer config-edit helper tests
 bash scripts/install.sh --dry-run    # preview the agent install
 ```
 
 `docs/SPEC.md` is the module contract (`core` = gateway/cooldowns/dedupe,
 `slack` = transport selection + the only credential plumbing, `slack_mcp` =
-the Slack MCP server client (default transport), `slack_tools` = shared
-tool-call plumbing, `mistral_slack` = the connector transport, `mcp` =
+the Slack MCP server client (default transport), `slack_stdio` = the
+korotovsky stdio transport (spawns and drives the unofficial Slack MCP
+server as a child process), `slack_tools` = shared tool-call plumbing,
+`mistral_slack` = the connector transport, `mcp` =
 JSON-RPC server, `instance` = single-instance coordination + stdio bridges,
 `ui` = the Tauri webview bridge). GUI behavior is verified by build + spec
 review plus the IPC bridge unit tests; the decision flows are covered by
 the test suite, the smoke script (which also exercises the bridge path
-against a live instance and the connector transport against a mock Mistral
-API), and a manual run of the installed service.
+against a live instance, the connector transport against a mock Mistral
+API, and the korotovsky transport against a mock stdio server), and a
+manual run of the installed service.
 
 ## Layout
 
@@ -458,6 +554,11 @@ API), and a manual run of the installed service.
 ├── src/slack_mcp.rs  Slack MCP server client — the default transport
 │                     (remote MCP at https://mcp.slack.com/mcp with a Slack
 │                     user token; also resolves Slack IDs for the popup)
+├── src/slack_stdio.rs  korotovsky transport — spawns the unofficial Slack
+│                     MCP server (@korotovsky/slack-mcp-server) as a stdio
+│                     child process and drives it over MCP (bot or user
+│                     token held by the gateway; resolves Slack IDs via
+│                     the server's channels_list/users_search CSV tools)
 ├── src/slack_tools.rs  shared tool-call plumbing: send-tool discovery with
 │                     schema-adapted argument names + tolerant reply parsing
 ├── src/mistral_slack.rs  Mistral Slack Connector client (alternative
@@ -474,12 +575,15 @@ API), and a manual run of the installed service.
 │   ├── src/lib/utils.ts   cn() helper used by the motion-primitives files
 │   └── src/components/motion-primitives/   vendored animated primitives
 ├── tests/            unit/integration/e2e tests (mock Slack MCP server,
-│                     scripted humans, socket-level instance tests)
+│                     mock korotovsky stdio server, scripted humans,
+│                     socket-level instance tests)
 ├── scripts/install.sh         one-command install into every agent + LaunchAgent
 ├── scripts/slack_mcp_oauth.py  Slack MCP user-token OAuth helper (browser flow
 │                             + token verification + chmod 600 token file)
 ├── scripts/agent_config.py    per-agent MCP config editor (backup + idempotent)
 ├── scripts/test_agent_config.py   tests for the config editor
+├── scripts/mock_korotovsky.py  mock of Korotovsky's Slack MCP server (stdio
+│                             MCP) for tests + the smoke test
 ├── scripts/smoke_test.py      end-to-end test of the real binary (incl. bridges)
 ├── docs/SPEC.md      behavioral + module contract
 ├── tauri.conf.json, capabilities/, icons/, build.rs   Tauri shell

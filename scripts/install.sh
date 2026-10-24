@@ -29,8 +29,10 @@
 # Usage:
 #   scripts/install.sh [--dry-run] [--enforce] [--uninstall] [--purge]
 #                      [--skip-build] [--slack-mcp-token xoxp-...]
-#                      [--state-dir DIR] [--transport slack-mcp|mistral-connector]
-#                      [--mistral-api-key KEY]
+#                      [--state-dir DIR]
+#                      [--transport slack-mcp|mistral-connector|korotovsky]
+#                      [--mistral-api-key KEY] [--slack-bot-token xoxb-...]
+#                      [--slack-user-token xoxp-...]
 #
 #   --dry-run     print what would happen, change nothing
 #   --enforce     also remove direct (token-based) Slack MCP servers from
@@ -57,18 +59,32 @@
 #   --transport   how the gateway sends to Slack (default: slack-mcp):
 #                 slack-mcp         the official Slack MCP server
 #                                    (https://mcp.slack.com/mcp, remote MCP)
-#                                    with the user token above — the gateway
-#                                    holds no Slack bot token;
+#                                    with the user token above;
 #                 mistral-connector  the Mistral Slack Connector — Slack
 #                                    credentials live in the Mistral console
 #                                    (connect the workspace there first), and
-#                                    the gateway only holds a Mistral API key.
+#                                    the gateway only holds a Mistral API key;
+#                 korotovsky       Korotovsky's unofficial Slack MCP server
+#                                    (@korotovsky/slack-mcp-server, spawned
+#                                    as a stdio child process) with a Slack
+#                                    bot token (xoxb-..., default) or user
+#                                    token (xoxp-...) — see the flags below.
 #   --mistral-api-key  Mistral API key, stored only in
 #                 <state-dir>/mistral_api_key (chmod 600). Falls back to
 #                 $MISTRAL_API_KEY. Required for the mistral-connector
 #                 transport; without it a placeholder is written and sends
 #                 fail until you set a real key (an existing key file is
 #                 kept unless this flag is given).
+#   --slack-bot-token  Slack bot token (xoxb-...) for the korotovsky
+#                 transport. Stored only in <state-dir>/slack_bot_token
+#                 (chmod 600). Falls back to $SLACK_BOT_TOKEN. The gateway
+#                 passes it to the server it spawns; agents never see it.
+#   --slack-user-token  Slack user token (xoxp-...) for the korotovsky
+#                 transport, stored only in <state-dir>/slack_user_token
+#                 (chmod 600). Falls back to $SLACK_USER_TOKEN. Either this
+#                 or --slack-bot-token is required for the korotovsky
+#                 transport (a bot token is the usual choice: the server
+#                 posts as the app).
 
 set -euo pipefail
 
@@ -92,6 +108,8 @@ MCP_TOKEN_ARG=""
 STATE_DIR="$DEFAULT_STATE_DIR"
 TRANSPORT_ARG=""
 MISTRAL_KEY_ARG=""
+BOT_TOKEN_ARG=""
+USER_TOKEN_ARG=""
 
 expect_value=""
 for arg in "$@"; do
@@ -101,6 +119,8 @@ for arg in "$@"; do
       --state-dir) STATE_DIR="$arg" ;;
       --transport) TRANSPORT_ARG="$arg" ;;
       --mistral-api-key) MISTRAL_KEY_ARG="$arg" ;;
+      --slack-bot-token) BOT_TOKEN_ARG="$arg" ;;
+      --slack-user-token) USER_TOKEN_ARG="$arg" ;;
     esac
     expect_value=""
     continue
@@ -111,12 +131,15 @@ for arg in "$@"; do
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
-    --slack-mcp-token|--state-dir|--transport|--mistral-api-key) expect_value="$arg" ;;
+    --slack-mcp-token|--state-dir|--transport|--mistral-api-key|--slack-bot-token|--slack-user-token)
+      expect_value="$arg" ;;
     --slack-mcp-token=*) MCP_TOKEN_ARG="${arg#--slack-mcp-token=}" ;;
     --state-dir=*) STATE_DIR="${arg#--state-dir=}" ;;
     --transport=*) TRANSPORT_ARG="${arg#--transport=}" ;;
     --mistral-api-key=*) MISTRAL_KEY_ARG="${arg#--mistral-api-key=}" ;;
-    -h|--help) sed -n '2,62p' "$0"; exit 0 ;;
+    --slack-bot-token=*) BOT_TOKEN_ARG="${arg#--slack-bot-token=}" ;;
+    --slack-user-token=*) USER_TOKEN_ARG="${arg#--slack-user-token=}" ;;
+    -h|--help) sed -n '2,70p' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -270,12 +293,12 @@ hr
 run mkdir -p "$STATE_DIR"
 if [ "$DRY_RUN" = 0 ]; then chmod 700 "$STATE_DIR"; fi
 
-# --- transport selection (--transport slack-mcp|mistral-connector)
+# --- transport selection (--transport slack-mcp|mistral-connector|korotovsky)
 TRANSPORT="$TRANSPORT_ARG"
 if [ -z "$TRANSPORT" ]; then TRANSPORT="slack-mcp"; fi
 case "$TRANSPORT" in
-  slack-mcp|mistral-connector) ;;
-  *) say "unknown --transport value: $TRANSPORT (expected slack-mcp or mistral-connector)" >&2; exit 2 ;;
+  slack-mcp|mistral-connector|korotovsky) ;;
+  *) say "unknown --transport value: $TRANSPORT (expected slack-mcp, mistral-connector or korotovsky)" >&2; exit 2 ;;
 esac
 TRANSPORT_FILE="$STATE_DIR/slack_transport"
 if [ -n "$TRANSPORT_ARG" ]; then
@@ -291,7 +314,7 @@ elif [ -f "$TRANSPORT_FILE" ]; then
   # and the summary below key off $TRANSPORT, so resolve it here.
   EXISTING_TRANSPORT="$(cat "$TRANSPORT_FILE")"
   case "$EXISTING_TRANSPORT" in
-    slack-mcp|mistral-connector)
+    slack-mcp|mistral-connector|korotovsky)
       TRANSPORT="$EXISTING_TRANSPORT"
       say "  keeping existing transport selection in $TRANSPORT_FILE ($EXISTING_TRANSPORT)"
       ;;
@@ -397,8 +420,80 @@ if [ "$TRANSPORT" = "slack-mcp" ]; then
     say "  (the service restarts automatically; it reads the file at startup)"
   fi
 else
-  say "  connector transport selected: no Slack MCP token needed"
-  say "  (Slack credentials live in the Mistral console's Slack connector)"
+  say "  $TRANSPORT transport selected: no Slack MCP token needed"
+fi
+
+# --- Slack bot/user token (the korotovsky transport)
+# Precedence: the --slack-bot-token/--slack-user-token flags, then existing
+# token files, then $SLACK_BOT_TOKEN/$SLACK_USER_TOKEN. An ambient env var
+# must never clobber a working file. Either token is enough; the gateway
+# passes it to the server it spawns (agents never see it).
+BOT_TOKEN_FILE="$STATE_DIR/slack_bot_token"
+USER_TOKEN_FILE="$STATE_DIR/slack_user_token"
+if [ "$TRANSPORT" = "korotovsky" ]; then
+  if [ -n "$BOT_TOKEN_ARG" ]; then
+    BOT_TOKEN="$BOT_TOKEN_ARG"
+  elif [ ! -f "$BOT_TOKEN_FILE" ]; then
+    BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
+  else
+    BOT_TOKEN=""
+  fi
+  if [ -n "$USER_TOKEN_ARG" ]; then
+    USER_TOKEN="$USER_TOKEN_ARG"
+  elif [ ! -f "$USER_TOKEN_FILE" ]; then
+    USER_TOKEN="${SLACK_USER_TOKEN:-}"
+  else
+    USER_TOKEN=""
+  fi
+  if [ -n "$BOT_TOKEN" ]; then
+    if [ "$DRY_RUN" = 0 ]; then
+      umask 077
+      printf '%s\n' "$BOT_TOKEN" > "$BOT_TOKEN_FILE"
+      chmod 600 "$BOT_TOKEN_FILE"
+    else
+      say "  [dry-run] write $BOT_TOKEN_FILE (chmod 600)"
+    fi
+    say "  wrote $BOT_TOKEN_FILE (chmod 600) — the only place the Slack bot token lives"
+  elif [ -f "$BOT_TOKEN_FILE" ]; then
+    say "  keeping existing $BOT_TOKEN_FILE (pass --slack-bot-token to replace it)"
+  fi
+  if [ -n "$USER_TOKEN" ]; then
+    if [ "$DRY_RUN" = 0 ]; then
+      umask 077
+      printf '%s\n' "$USER_TOKEN" > "$USER_TOKEN_FILE"
+      chmod 600 "$USER_TOKEN_FILE"
+    else
+      say "  [dry-run] write $USER_TOKEN_FILE (chmod 600)"
+    fi
+    say "  wrote $USER_TOKEN_FILE (chmod 600) — the only place the Slack user token lives"
+  elif [ -f "$USER_TOKEN_FILE" ]; then
+    say "  keeping existing $USER_TOKEN_FILE (pass --slack-user-token to replace it)"
+  fi
+  if [ -z "$BOT_TOKEN" ] && [ -z "$USER_TOKEN" ] \
+     && [ ! -f "$BOT_TOKEN_FILE" ] && [ ! -f "$USER_TOKEN_FILE" ]; then
+    if [ "$DRY_RUN" = 0 ]; then
+      umask 077
+      printf '%s\n' "xoxb-placeholder-get-a-real-token" > "$BOT_TOKEN_FILE"
+      chmod 600 "$BOT_TOKEN_FILE"
+    else
+      say "  [dry-run] write placeholder $BOT_TOKEN_FILE"
+    fi
+    say "  WARNING: no Slack token given (--slack-bot-token xoxb-... or --slack-user-token"
+    say "  xoxp-..., or SLACK_BOT_TOKEN/SLACK_USER_TOKEN). Wrote a placeholder to"
+    say "  $BOT_TOKEN_FILE — approval popups work, but sends fail until you install"
+    say "  a real token. For the korotovsky transport you need either:"
+    say "    - a Slack app bot token (xoxb-...): create an app at"
+    say "      https://api.slack.com/apps, add the bot scopes chat:write,"
+    say "      channels:read, users:read (plus groups:read for private"
+    say "      channels), install the app to the workspace, and invite the bot"
+    say "      to the channels it may post to (bot tokens see invited channels"
+    say "      only); or"
+    say "    - a Slack user token (xoxp-...) with the same scopes as a user."
+    say "  The gateway spawns @korotovsky/slack-mcp-server as a child process"
+    say "  (needs node/npx, or set SLACK_STDIO_COMMAND to a server binary) and"
+    say "  passes it the token — see README.md."
+    say "  (the service restarts automatically; it reads the file at startup)"
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -918,6 +1013,12 @@ if [ "$TRANSPORT" = "mistral-connector" ]; then
   say "     connector (the gateway calls it; it holds the Slack credentials),"
   say "     and set a real Mistral API key if you have not:"
   say "       scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_KEY"
+  say "     (the service restarts and reads the file at startup)"
+elif [ "$TRANSPORT" = "korotovsky" ]; then
+  say "  1. Install a Slack token for the korotovsky transport if you have not:"
+  say "       scripts/install.sh --transport korotovsky --slack-bot-token xoxb-your-bot-token"
+  say "     (or --slack-user-token xoxp-...; see the scopes in README.md — the"
+  say "      gateway spawns @korotovsky/slack-mcp-server, which needs node/npx)"
   say "     (the service restarts and reads the file at startup)"
 else
   say "  1. Get a Slack user token for the Slack MCP server (one-time):"

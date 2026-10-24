@@ -23,7 +23,12 @@ with SLACK_TRANSPORT=mistral-connector to verify the connector transport
 end to end (exact message sent through the connector tool call, no Slack
 MCP call). A final section checks that a Slack user ID in the destination
 resolves to a display name in the prompt while the send still carries the
-exact raw ID.
+exact raw ID. A korotovsky section runs the approve flow with
+SLACK_TRANSPORT=korotovsky against a mock of Korotovsky's unofficial Slack
+MCP server (scripts/mock_korotovsky.py) spawned as a stdio child: the
+gateway enables the server's conversations_add_message tool, sends the
+exact approved text to the exact destination as text/plain, and builds the
+permalink from the reply (no Slack MCP or connector call is made).
 """
 import fcntl
 import http.server
@@ -262,6 +267,7 @@ proc = subprocess.Popen(
 )
 os.close(slave)
 spawned = [proc]  # every instance process, for the finally cleanup
+bridges = []     # every bridge process, for the finally cleanup
 
 tty_out = bytearray()
 
@@ -440,31 +446,46 @@ try:
           and send_count() == 1,
           json.dumps(v))
 
-    # 7. concurrency: two requests, prompts serialized, answers matched
+    # 7. concurrency: two requests, prompts serialized, answers matched.
+    # The two prompts race for the CLI lock, so whichever request prompts
+    # first is answered first; the answers are matched to the right
+    # requests by the prompt text (verified through the per-request
+    # verdicts and the send log).
     tool_call(8, "Concurrent request alpha")
     tool_call(9, "Concurrent request beta")
-    wait_tty("Concurrent request alpha")
-    answer("a")  # approves alpha
-    r = wait_response(8)
-    v8 = verdict(r)
-    wait_tty("Concurrent request beta")
-    answer("f not now")  # feedback for beta
-    r = wait_response(9)
-    v9 = verdict(r)
+
+    def wait_tty_either(patterns, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for pattern in patterns:
+                if pattern.encode() in tty_out:
+                    return pattern
+            time.sleep(0.05)
+        raise AssertionError(
+            f"timeout waiting for tty patterns {patterns!r}; tty tail: {bytes(tty_out[-1500:])!r}"
+        )
+
+    first = wait_tty_either(["Concurrent request alpha", "Concurrent request beta"])
+    other = ("Concurrent request beta" if first == "Concurrent request alpha"
+             else "Concurrent request alpha")
+    answer("a")  # approves whichever request prompted first
+    wait_tty(other)  # the second prompt: the other request
+    answer("f not now")  # feedback for it
+    v8 = verdict(wait_response(8))
+    v9 = verdict(wait_response(9))
+    approved, feedback = (v8, v9) if first == "Concurrent request alpha" else (v9, v8)
     check("concurrent requests do not mix up decisions",
-          v8.get("status") == "sent" and not v8.get("duplicate")
-          and v9.get("status") == "feedback" and v9.get("feedback") == "not now"
+          approved.get("status") == "sent" and not approved.get("duplicate")
+          and feedback.get("status") == "feedback" and feedback.get("feedback") == "not now"
           and send_count() == 2,
           f"v8={json.dumps(v8)} v9={json.dumps(v9)} sends={send_count()}")
-    alpha_sends = [b for b in send_calls()
-                   if send_arguments(b).get("message") == "Concurrent request alpha"]
-    check("alpha was the message actually sent", len(alpha_sends) == 1)
+    approved_sends = [b for b in send_calls()
+                      if send_arguments(b).get("message") == first]
+    check("the approved request was the message actually sent", len(approved_sends) == 1)
 
     # 7b. bridge: a second agent process (default mode, no --cli) must not
     # start its own instance — it bridges to the running one over the
     # state-dir socket and its MCP session is served by that instance.
-    bridges = []
-
     def spawn_bridge():
         bp = subprocess.Popen(
             [BINARY],
@@ -910,6 +931,183 @@ try:
 
     proc4.stdin.close()
     proc4.wait(timeout=15)
+
+    # 8d. Korotovsky stdio transport: SLACK_TRANSPORT=korotovsky must spawn
+    # the (mock) korotovsky Slack MCP server as a stdio child process, enable
+    # its conversations_add_message tool, and send the approved message
+    # through it — the exact text to the exact destination, as text/plain.
+    state_dir5 = tempfile.mkdtemp(prefix="sag-smoke-koro-")
+    koro_log = os.path.join(state_dir5, "mock-korotovsky.log")
+    env5 = dict(os.environ)
+    env5["SLACK_GATEWAY_STATE_DIR"] = state_dir5
+    env5["SLACK_TRANSPORT"] = "korotovsky"
+    env5["SLACK_BOT_TOKEN"] = "xoxb-smoke-test"
+    env5["SLACK_WORKSPACE_DOMAIN"] = "smokeworkspace"
+    env5["SLACK_STDIO_COMMAND"] = (
+        f"env MOCK_KOROTOVSKY_LOG={koro_log} python3 {ROOT}/scripts/mock_korotovsky.py"
+    )
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        env5.pop(k, None)
+    env5["NO_PROXY"] = "127.0.0.1,localhost"
+
+    def koro_entries():
+        entries = []
+        if not os.path.exists(koro_log):
+            return entries
+        with open(koro_log, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+        return entries
+
+    def koro_calls():
+        return [e for e in koro_entries() if e.get("tool")]
+
+    def koro_env_record():
+        for e in reversed(koro_entries()):
+            if e.get("env") is not None:
+                return e["env"]
+        return {}
+
+    master5, slave5 = pty.openpty()
+
+    def make_ctty5():
+        os.setsid()
+        fcntl.ioctl(slave5, 0x20007461, 0)
+
+    proc5 = subprocess.Popen(
+        [BINARY, "--cli"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env5, pass_fds=(slave5,), preexec_fn=make_ctty5,
+    )
+    spawned.append(proc5)
+    os.close(slave5)
+    tty_out5 = bytearray()
+
+    def tty_reader5():
+        while True:
+            try:
+                chunk = os.read(master5, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            tty_out5.extend(chunk)
+
+    threading.Thread(target=tty_reader5, daemon=True).start()
+    responses5 = {}
+    resp5_lock = threading.Lock()
+
+    def stdout_reader5():
+        for raw in proc5.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg:
+                with resp5_lock:
+                    responses5[msg["id"]] = msg
+
+    threading.Thread(target=stdout_reader5, daemon=True).start()
+
+    def rpc5(id_, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": id_, "method": method}
+        if params is not None:
+            msg["params"] = params
+        proc5.stdin.write((json.dumps(msg) + "\n").encode())
+        proc5.stdin.flush()
+
+    def wait_response5(id_, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with resp5_lock:
+                if id_ in responses5:
+                    return responses5[id_]
+            if proc5.poll() is not None:
+                raise AssertionError(f"gateway exited early (code {proc5.returncode})")
+            time.sleep(0.05)
+        raise AssertionError(f"timeout waiting for response id={id_} (korotovsky)")
+
+    def wait_tty5(pattern, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pattern.encode() in tty_out5:
+                return
+            time.sleep(0.05)
+        raise AssertionError(
+            f"timeout waiting for tty pattern {pattern!r}; tty tail: {bytes(tty_out5[-1500:])!r}"
+        )
+
+    def answer5(text):
+        os.write(master5, (text + "\n").encode())
+
+    posts_before_koro = send_count()
+    conn_before_koro = connector_call_count()
+    rpc5(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": {"name": "smoke-korotovsky", "version": "0"}})
+    wait_response5(1)
+    koro_env = koro_env_record()
+    check("korotovsky transport: the gateway enabled the server's send tool",
+          koro_env.get("SLACK_MCP_ADD_MESSAGE_TOOL") == "true"
+          and koro_env.get("SLACK_MCP_XOXB_TOKEN") == "xoxb-smoke-test",
+          json.dumps(koro_env))
+    rpc5(2, "tools/call", {"name": "request_slack_message", "arguments": {
+        "message": "Sent via the korotovsky stdio server",
+        "destination": "C0123SMOKE",
+        "reason": "smoke test (korotovsky transport)",
+        "agent": "smoke-agent",
+        "conversation": {"title": "Smoke test conversation", "id_or_link": "smoke-koro",
+                         "summary": "Verifying the korotovsky stdio transport."},
+    }})
+    wait_tty5("Sent via the korotovsky stdio server")
+    wait_tty5("Approve [a]")
+    answer5("a")
+    r = wait_response5(2)
+    v = verdict(r)
+    check("korotovsky transport: approve returns sent with the built permalink",
+          v.get("status") == "sent"
+          and v.get("permalink") == "https://smokeworkspace.slack.com/archives/C0123SMOKE/p1700000000000100",
+          json.dumps(v))
+    calls = [c for c in koro_calls()
+             if c.get("arguments", {}).get("text") == "Sent via the korotovsky stdio server"]
+    check("korotovsky transport: conversations_add_message got the exact message and destination",
+          len(calls) == 1
+          and calls[0]["tool"] == "conversations_add_message"
+          and calls[0]["arguments"].get("channel_id") == "C0123SMOKE"
+          and calls[0]["arguments"].get("content_type") == "text/plain",
+          json.dumps(koro_calls()))
+    check("korotovsky transport: no Slack MCP or connector call was made",
+          send_count() == posts_before_koro and connector_call_count() == conn_before_koro,
+          f"sends={send_count()} conn={connector_call_count()}")
+
+    # A Slack user ID destination resolves to a display name in the prompt
+    # (via the server's users_search CSV), while the send carries the raw ID.
+    rpc5(3, "tools/call", {"name": "request_slack_message", "arguments": {
+        "message": "Korotovsky display name resolution",
+        "destination": "U0123SMOKE",
+        "reason": "smoke test (korotovsky display)",
+        "agent": "smoke-agent",
+        "conversation": {"title": "Smoke test conversation", "id_or_link": "smoke-koro-disp",
+                         "summary": "Verifying korotovsky ID resolution in the prompt."},
+    }})
+    wait_tty5("Destination:   Drake Thomsen (@drake.thomsen) (U0123SMOKE)")
+    answer5("a")
+    r = wait_response5(3)
+    v = verdict(r)
+    disp_calls = [c for c in koro_calls()
+                  if c.get("arguments", {}).get("text") == "Korotovsky display name resolution"]
+    check("korotovsky transport: prompt resolves the name, the send carries the raw ID",
+          v.get("status") == "sent"
+          and len(disp_calls) == 1
+          and disp_calls[0]["arguments"].get("channel_id") == "U0123SMOKE",
+          json.dumps(v))
+
+    proc5.stdin.close()
+    proc5.wait(timeout=15)
 
     # 9. invalid params -> JSON-RPC error
     print()

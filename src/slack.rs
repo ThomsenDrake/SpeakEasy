@@ -1,24 +1,29 @@
 //! Slack sending. This module is the ONLY place Slack credentials live.
 //! Agents never see the token; they only talk to the gateway over MCP.
 //!
-//! Two transports implement [`SlackClient`]:
+//! Three transports implement [`SlackClient`]:
 //! - [`crate::slack_mcp::SlackMcpClient`] (default) sends through the
 //!   official Slack MCP server (remote, HTTP) using a Slack **user** OAuth
 //!   token held by this process (`SLACK_MCP_TOKEN` or
-//!   `<state_dir>/slack_mcp_token`). The gateway never holds a Slack bot
-//!   token: it is not a Slack app and cannot post as one.
+//!   `<state_dir>/slack_mcp_token`).
 //! - [`crate::mistral_slack::MistralConnectorSlackClient`] sends through the
 //!   Mistral Slack Connector; the Slack credentials then live in the Mistral
 //!   console and this process only holds a Mistral API key.
+//! - [`crate::slack_stdio::KorotovskyClient`] sends through Korotovsky's
+//!   unofficial Slack MCP server (stdio, spawned as a child process) using a
+//!   Slack **bot** token (`xoxb-…`, default) or **user** token (`xoxp-…`)
+//!   held by this process (`SLACK_BOT_TOKEN`/`SLACK_USER_TOKEN` or
+//!   `<state_dir>/slack_bot_token`/`slack_user_token`).
 //!
 //! [`resolve_transport`] picks one from `SLACK_TRANSPORT` (or
-//! `<state_dir>/slack_transport`) and [`build_client`] constructs it; both
+//! `<state_dir>/slack_transport`) and [`build_client`] constructs it; all
 //! transports enforce the same exclusive-sending path: agents reach Slack
 //! only through the gateway.
 
 use crate::core::{SlackClient, SlackError};
 use crate::mistral_slack::MistralConnectorSlackClient;
 use crate::slack_mcp::SlackMcpClient;
+use crate::slack_stdio::KorotovskyClient;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -105,14 +110,16 @@ pub enum SlackTransport {
     SlackMcp,
     /// Mistral Slack Connector; Slack credentials live in the Mistral console.
     MistralConnector,
+    /// Korotovsky's unofficial Slack MCP server (stdio, spawned as a child
+    /// process) with a Slack bot or user token held by this process.
+    Korotovsky,
 }
 
 /// The transport selected for this run: `SLACK_TRANSPORT` env var, else a
 /// one-line `<state_dir>/slack_transport` file, else
 /// [`SlackTransport::SlackMcp`]. Accepted values: `slack-mcp` (also `mcp` /
-/// `slack_mcp`) and `mistral-connector` (also `mistral_connector` /
-/// `connector`). The old `direct` transport (a Slack bot token held by the
-/// gateway) was removed on purpose: the gateway is not a Slack app.
+/// `slack_mcp`), `mistral-connector` (also `mistral_connector` /
+/// `connector`) and `korotovsky` (also `slack-mcp-stdio` / `stdio`).
 pub fn resolve_transport(state_dir: &Path) -> Result<SlackTransport, SlackError> {
     let selected = match non_empty_env("SLACK_TRANSPORT") {
         Some(value) => Some(value),
@@ -140,25 +147,30 @@ pub fn resolve_transport(state_dir: &Path) -> Result<SlackTransport, SlackError>
         Some("mistral-connector") | Some("mistral_connector") | Some("connector") => {
             Ok(SlackTransport::MistralConnector)
         }
+        Some("korotovsky") | Some("slack-mcp-stdio") | Some("stdio") => Ok(SlackTransport::Korotovsky),
         Some(other @ ("direct" | "bot-token" | "token")) => Err(SlackError(format!(
-            "the '{other}' transport (a Slack bot token held by the gateway) was removed: \
-             the gateway now sends through the official Slack MCP server or the Mistral \
-             Slack Connector; use 'slack-mcp' (default) or 'mistral-connector'"
+            "the '{other}' transport (Slack API calls with a bot token held by the gateway) \
+             was removed: the gateway sends through the official Slack MCP server, the \
+             Mistral Slack Connector, or the korotovsky Slack MCP server; use 'slack-mcp' \
+             (default), 'mistral-connector' or 'korotovsky'"
         ))),
         Some(other) => Err(SlackError(format!(
-            "unknown SLACK_TRANSPORT value '{other}' (expected 'slack-mcp' or 'mistral-connector')"
+            "unknown SLACK_TRANSPORT value '{other}' (expected 'slack-mcp', 'mistral-connector' \
+             or 'korotovsky')"
         ))),
     }
 }
 
 /// Build the Slack client for the selected transport. The credential error
 /// names what the chosen transport needs: a Slack MCP user token for
-/// `slack-mcp`, a Mistral API key for `mistral-connector`.
+/// `slack-mcp`, a Mistral API key for `mistral-connector`, a Slack bot or
+/// user token for `korotovsky`.
 pub fn build_client(state_dir: &Path) -> Result<Arc<dyn SlackClient>, SlackError> {
     match resolve_transport(state_dir)? {
         SlackTransport::SlackMcp => Ok(Arc::new(SlackMcpClient::from_env(state_dir)?)),
         SlackTransport::MistralConnector => Ok(Arc::new(MistralConnectorSlackClient::from_env(
             state_dir,
         )?)),
+        SlackTransport::Korotovsky => Ok(Arc::new(KorotovskyClient::from_env(state_dir)?)),
     }
 }

@@ -111,6 +111,9 @@ fn build_gateway(provider: Arc<dyn DecisionProvider>, dir: &PathBuf) -> Gateway 
             eprintln!("Mistral Slack Connector transport (SLACK_TRANSPORT=mistral-connector): set MISTRAL_API_KEY,");
             eprintln!("or create {}/mistral_api_key (chmod 600), and connect the Slack workspace to the", dir.display());
             eprintln!("Slack connector in the Mistral console.");
+            eprintln!("Korotovsky Slack MCP transport (SLACK_TRANSPORT=korotovsky): set SLACK_BOT_TOKEN (xoxb-…)");
+            eprintln!("or SLACK_USER_TOKEN (xoxp-…), or create {}/slack_bot_token / slack_user_token", dir.display());
+            eprintln!("(chmod 600) — see README.md.");
             std::process::exit(1);
         }
     };
