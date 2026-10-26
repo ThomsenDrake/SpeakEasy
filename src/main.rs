@@ -21,7 +21,7 @@ use slack_approval_gateway::core::{
 };
 use slack_approval_gateway::slack;
 use slack_approval_gateway::ui;
-use slack_approval_gateway::{instance, mcp};
+use slack_approval_gateway::{hook, instance, mcp};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -45,6 +45,34 @@ struct CliDecisionProvider;
 static CLI_PROMPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl DecisionProvider for CliDecisionProvider {
+    /// A terminal prompt cannot be withdrawn, so a hook's request is asked
+    /// as usual and its answer is discarded when the deadline passed or the
+    /// hook went away meanwhile (the agent was already told no).
+    fn request_decision_until(
+        &self,
+        request: &MessageRequest,
+        deadline: std::time::Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Decision, ProviderError> {
+        use std::sync::atomic::Ordering;
+        let gone = || cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline;
+        if gone() {
+            return Err(ProviderError("the hook that asked stopped waiting".into()));
+        }
+        let decision = self.request_decision(request)?;
+        if gone() {
+            if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+                let _ = writeln!(
+                    tty,
+                    "That request expired before you answered; your answer was not used \
+                     (the agent was told the call was blocked)."
+                );
+            }
+            return Err(ProviderError("no one answered the approval request in time".into()));
+        }
+        Ok(decision)
+    }
+
     fn request_decision(&self, request: &MessageRequest) -> Result<Decision, ProviderError> {
         let _guard = CLI_PROMPT_LOCK
             .lock()
@@ -311,6 +339,19 @@ fn run_demo() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Pre-tool hook mode: answer one agent hook call and exit. Checked
+    // first: it never becomes the instance or a bridge.
+    if let Some(parsed) = hook::parse_args(&args) {
+        match parsed {
+            Ok(hook_args) => hook::main(hook_args, &state_dir()),
+            Err(problem) => {
+                // A misconfigured hook must not let a Slack call through:
+                // exit 2 blocks in every Claude-style agent.
+                eprintln!("slack-approval-gateway: {problem}");
+                std::process::exit(2);
+            }
+        }
+    }
     let cli_mode = args.iter().any(|a| a == "--cli");
     let serve_mode = args.iter().any(|a| a == "--serve");
     let demo_mode = args.iter().any(|a| a == "--demo");

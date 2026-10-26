@@ -19,8 +19,13 @@
 //! `<state_dir>/slack_transport`) and [`build_client`] constructs it; all
 //! transports enforce the same exclusive-sending path: agents reach Slack
 //! only through the gateway.
+//!
+//! A fourth setting, `hooks-only`, gives SpeakEasy no Slack connection at
+//! all ([`NoSlackClient`]): agents keep sending with their own Slack MCP
+//! tools, and a pre-tool hook (`src/hook.rs`) asks the human through
+//! SpeakEasy before each send runs.
 
-use crate::core::{SlackClient, SlackError};
+use crate::core::{SlackClient, SlackError, SlackSend};
 use crate::mistral_slack::MistralConnectorSlackClient;
 use crate::slack_mcp::SlackMcpClient;
 use crate::slack_stdio::KorotovskyClient;
@@ -69,7 +74,7 @@ pub(crate) fn read_secret_file(
 }
 
 #[cfg(unix)]
-fn warn_if_readable_by_others(path: &Path) {
+pub(crate) fn warn_if_readable_by_others(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.permissions().mode() & 0o077 != 0 {
@@ -82,7 +87,7 @@ fn warn_if_readable_by_others(path: &Path) {
 }
 
 #[cfg(not(unix))]
-fn warn_if_readable_by_others(_path: &Path) {}
+pub(crate) fn warn_if_readable_by_others(_path: &Path) {}
 
 /// Normalize a workspace domain: trim, drop a scheme, a trailing slash and
 /// a `.slack.com` suffix (`https://acme.slack.com/` → `acme`).
@@ -144,13 +149,17 @@ pub enum SlackTransport {
     /// Korotovsky's unofficial Slack MCP server (stdio, spawned as a child
     /// process) with a Slack bot or user token held by this process.
     Korotovsky,
+    /// No Slack connection: SpeakEasy only approves agents' own Slack tool
+    /// calls (hook mode) and `request_slack_message` cannot send.
+    HooksOnly,
 }
 
 /// The transport selected for this run: `SLACK_TRANSPORT` env var, else a
 /// one-line `<state_dir>/slack_transport` file, else
 /// [`SlackTransport::SlackMcp`]. Accepted values: `slack-mcp` (also `mcp` /
 /// `slack_mcp`), `mistral-connector` (also `mistral_connector` /
-/// `connector`) and `korotovsky` (also `slack-mcp-stdio` / `stdio`).
+/// `connector`), `korotovsky` (also `slack-mcp-stdio` / `stdio`) and
+/// `hooks-only` (also `hooks` / `none`).
 pub fn resolve_transport(state_dir: &Path) -> Result<SlackTransport, SlackError> {
     let selected = match non_empty_env("SLACK_TRANSPORT") {
         Some(value) => Some(value),
@@ -179,6 +188,7 @@ pub fn resolve_transport(state_dir: &Path) -> Result<SlackTransport, SlackError>
             Ok(SlackTransport::MistralConnector)
         }
         Some("korotovsky") | Some("slack-mcp-stdio") | Some("stdio") => Ok(SlackTransport::Korotovsky),
+        Some("hooks-only") | Some("hooks") | Some("none") => Ok(SlackTransport::HooksOnly),
         Some(other @ ("direct" | "bot-token" | "token")) => Err(SlackError(format!(
             "the '{other}' transport (Slack API calls with a bot token held by the gateway) \
              was removed: the gateway sends through the official Slack MCP server, the \
@@ -186,8 +196,8 @@ pub fn resolve_transport(state_dir: &Path) -> Result<SlackTransport, SlackError>
              (default), 'mistral-connector' or 'korotovsky'"
         ))),
         Some(other) => Err(SlackError(format!(
-            "unknown SLACK_TRANSPORT value '{other}' (expected 'slack-mcp', 'mistral-connector' \
-             or 'korotovsky')"
+            "unknown SLACK_TRANSPORT value '{other}' (expected 'slack-mcp', 'mistral-connector', \
+             'korotovsky' or 'hooks-only')"
         ))),
     }
 }
@@ -203,5 +213,27 @@ pub fn build_client(state_dir: &Path) -> Result<Arc<dyn SlackClient>, SlackError
             state_dir,
         )?)),
         SlackTransport::Korotovsky => Ok(Arc::new(KorotovskyClient::from_env(state_dir)?)),
+        SlackTransport::HooksOnly => Ok(Arc::new(NoSlackClient)),
+    }
+}
+
+/// The `hooks-only` client: SpeakEasy holds no Slack credential and cannot
+/// send. Agents send with their own Slack tools after a hook approval.
+pub struct NoSlackClient;
+
+impl SlackClient for NoSlackClient {
+    fn post_message(
+        &self,
+        _destination: &str,
+        _thread_ts: Option<&str>,
+        _text: &str,
+    ) -> Result<SlackSend, SlackError> {
+        Err(SlackError(
+            "SpeakEasy has no Slack connection (SLACK_TRANSPORT=hooks-only)".into(),
+        ))
+    }
+
+    fn can_send(&self) -> bool {
+        false
     }
 }

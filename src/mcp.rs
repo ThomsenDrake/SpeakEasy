@@ -3,13 +3,23 @@
 //! Exposes exactly one tool, `request_slack_message`, which agents call to
 //! request approval for a Slack message. Protocol messages are the only
 //! thing written to the output stream; diagnostics go to stderr.
+//!
+//! One extra method, [`APPROVE_METHOD`], is not a tool: SpeakEasy's own
+//! pre-tool hook (`src/hook.rs`) calls it on the instance socket to ask the
+//! human about an agent's own Slack tool call. It only returns a decision
+//! and never sends anything.
 
-use crate::core::{ConversationContext, Gateway, IncomingRequest, RequestVerdict};
+use crate::core::{
+    ApprovalOptions, ApprovalVerdict, ConversationContext, Gateway, IncomingRequest,
+    RequestVerdict,
+};
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// The single tool agents may call.
 pub const TOOL_NAME: &str = "request_slack_message";
@@ -37,6 +47,17 @@ const ARGUMENT_FIELDS: [&str; 6] = [
 
 const CONVERSATION_FIELDS: [&str; 3] = ["title", "id_or_link", "summary"];
 
+/// The approval-only method used by SpeakEasy's pre-tool hook. Its params
+/// are the tool arguments plus `wait_secs` (1..=[`MAX_APPROVAL_WAIT_SECS`]):
+/// how long the human has before the request is withdrawn; an optional
+/// `share_key` (identifies one agent tool call; hooks stopping the same call
+/// share one decision); and an optional `cooldown` (default true; false
+/// when the call names no destination).
+pub const APPROVE_METHOD: &str = "speakeasy/approve";
+
+/// Upper bound for `wait_secs`.
+pub const MAX_APPROVAL_WAIT_SECS: u64 = 24 * 3600;
+
 const COOLDOWN_NOTE: &str =
     "a similar request was denied recently; nothing was sent and no approval prompt was shown";
 
@@ -51,6 +72,10 @@ pub fn run<W: Write + Send + 'static>(
     output: W,
 ) -> std::io::Result<()> {
     let output = Arc::new(Mutex::new(output));
+    // Set when `input` ends: approval requests from this connection are then
+    // withdrawn (the hook that asked is gone).
+    let closed = Arc::new(AtomicBool::new(false));
+    let _mark_closed = CloseOnDrop(Arc::clone(&closed));
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -75,7 +100,7 @@ pub fn run<W: Write + Send + 'static>(
                 continue;
             }
         };
-        if let Some(response) = dispatch(&gateway, &output, message) {
+        if let Some(response) = dispatch(&gateway, &output, &closed, message) {
             write_message(&output, &response)?;
         }
     }
@@ -90,6 +115,7 @@ pub fn run<W: Write + Send + 'static>(
 fn dispatch<W: Write + Send + 'static>(
     gateway: &Arc<Gateway>,
     output: &Arc<Mutex<W>>,
+    closed: &Arc<AtomicBool>,
     message: Value,
 ) -> Option<Value> {
     let Value::Object(mut message) = message else {
@@ -165,6 +191,26 @@ fn dispatch<W: Write + Send + 'static>(
             &id,
             json!({ "tools": [tool_definition()] }),
         )),
+        APPROVE_METHOD => match parse_approval(&params) {
+            Ok((request, wait, share_key, cooldown)) => {
+                spawn_approval(
+                    Arc::clone(gateway),
+                    Arc::clone(output),
+                    Arc::clone(closed),
+                    id,
+                    request,
+                    wait,
+                    share_key,
+                    cooldown,
+                );
+                None
+            }
+            Err(problem) => Some(error_response(
+                &id,
+                INVALID_PARAMS,
+                format!("Invalid params: {problem}"),
+            )),
+        },
         "tools/call" => match parse_tool_call(&params) {
             Ok(request) => {
                 spawn_tool_call(Arc::clone(gateway), Arc::clone(output), id, request);
@@ -290,8 +336,52 @@ fn parse_tool_call(params: &Value) -> Result<IncomingRequest, String> {
         None => return Err(format!("missing `arguments` for `{TOOL_NAME}`")),
     };
 
+    parse_arguments(arguments, &ARGUMENT_FIELDS)
+}
+
+/// Validate `speakeasy/approve` params: the tool arguments plus
+/// `wait_secs`.
+type ApprovalParams = (IncomingRequest, u64, Option<String>, bool);
+
+fn parse_approval(params: &Value) -> Result<ApprovalParams, String> {
+    let Value::Object(params) = params else {
+        return Err("`params` must be an object".into());
+    };
+    let mut allowed = ARGUMENT_FIELDS.to_vec();
+    allowed.extend(["wait_secs", "share_key", "cooldown"]);
+    let share_key = match params.get("share_key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) => Some(c.clone()),
+        Some(_) => return Err("`share_key` must be a string".into()),
+    };
+    let cooldown = match params.get("cooldown") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("`cooldown` must be a boolean".into()),
+    };
+    let wait = match params.get("wait_secs") {
+        Some(w) => match w.as_u64() {
+            Some(w) if (1..=MAX_APPROVAL_WAIT_SECS).contains(&w) => Ok(w),
+            _ => Err(format!(
+                "`wait_secs` must be an integer from 1 to {MAX_APPROVAL_WAIT_SECS}"
+            )),
+        },
+        None => Err("missing required argument `wait_secs`".to_string()),
+    };
+    match (parse_arguments(params, &allowed), wait) {
+        (Ok(request), Ok(wait)) => Ok((request, wait, share_key, cooldown)),
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+        (Err(problem), _) | (_, Err(problem)) => Err(problem),
+    }
+}
+
+/// Validate the request fields shared by the tool and the approval method.
+fn parse_arguments(
+    arguments: &Map<String, Value>,
+    allowed: &[&str],
+) -> Result<IncomingRequest, String> {
     let mut problems = Vec::new();
-    reject_unknown_fields(arguments, &ARGUMENT_FIELDS, "", &mut problems);
+    reject_unknown_fields(arguments, allowed, "", &mut problems);
     let message = required_string(arguments, "message", "message", &mut problems);
     let destination = required_string(arguments, "destination", "destination", &mut problems);
     let thread_ts = optional_thread_ts(arguments, &mut problems);
@@ -410,7 +500,7 @@ fn optional_thread_ts(
 }
 
 /// Slack message timestamps look like `1700000000.000100`.
-fn is_slack_ts(ts: &str) -> bool {
+pub(crate) fn is_slack_ts(ts: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     ts.split_once('.')
         .is_some_and(|(secs, micros)| digits(secs) && digits(micros))
@@ -454,6 +544,86 @@ fn spawn_tool_call<W: Write + Send + 'static>(
         if let Err(e) = write_message(&output, &response) {
             log(format_args!("cannot write tools/call response: {e}"));
         }
+    }
+}
+
+/// Handle a validated `speakeasy/approve` on its own thread (it blocks until
+/// the human decides or `wait_secs` pass).
+#[allow(clippy::too_many_arguments)]
+fn spawn_approval<W: Write + Send + 'static>(
+    gateway: Arc<Gateway>,
+    output: Arc<Mutex<W>>,
+    closed: Arc<AtomicBool>,
+    id: Value,
+    request: IncomingRequest,
+    wait_secs: u64,
+    share_key: Option<String>,
+    cooldown: bool,
+) {
+    let worker_output = Arc::clone(&output);
+    let worker_id = id.clone();
+    let spawned = thread::Builder::new()
+        .name("speakeasy-approve".into())
+        .spawn(move || {
+            let opts = ApprovalOptions {
+                deadline: Instant::now() + Duration::from_secs(wait_secs),
+                share_key,
+                cooldown,
+            };
+            let verdict = panic::catch_unwind(AssertUnwindSafe(|| {
+                gateway.handle_approval(request, &opts, &closed)
+            }))
+                    .unwrap_or_else(|_| {
+                        ApprovalVerdict::Error("internal gateway error while asking the human".into())
+                    });
+            let response = result_response(&worker_id, approval_result(verdict));
+            if let Err(e) = write_message(&worker_output, &response) {
+                log(format_args!("cannot write {APPROVE_METHOD} response: {e}"));
+            }
+        });
+    if let Err(e) = spawned {
+        log(format_args!("cannot start an approval worker: {e}"));
+        let response = error_response(
+            &id,
+            INTERNAL_ERROR,
+            "Internal error: the gateway could not start a worker; no decision was made",
+        );
+        if let Err(e) = write_message(&output, &response) {
+            log(format_args!("cannot write {APPROVE_METHOD} response: {e}"));
+        }
+    }
+}
+
+/// Sets the flag when dropped (the connection's read loop ended, by EOF or
+/// error).
+struct CloseOnDrop(Arc<AtomicBool>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The `speakeasy/approve` result: `{"decision": …}` plus details.
+fn approval_result(verdict: ApprovalVerdict) -> Value {
+    match verdict {
+        ApprovalVerdict::Approved => json!({ "decision": "approved" }),
+        ApprovalVerdict::Denied {
+            cooldown_remaining_secs,
+        } => json!({ "decision": "denied", "cooldown_remaining_secs": cooldown_remaining_secs }),
+        ApprovalVerdict::Feedback { feedback } => {
+            json!({ "decision": "feedback", "feedback": feedback })
+        }
+        ApprovalVerdict::CooldownBlocked {
+            cooldown_remaining_secs,
+        } => json!({
+            "decision": "cooldown_blocked",
+            "cooldown_remaining_secs": cooldown_remaining_secs,
+        }),
+        ApprovalVerdict::AlreadySent { ts, permalink } => {
+            json!({ "decision": "already_sent", "ts": ts, "permalink": permalink })
+        }
+        ApprovalVerdict::Error(error) => json!({ "decision": "error", "error": error }),
     }
 }
 

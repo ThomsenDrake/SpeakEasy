@@ -10,8 +10,9 @@ use std::collections::HashSet;
 use std::fs::{self, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -140,6 +141,22 @@ impl std::error::Error for ProviderError {}
 /// same request must be ignored by the caller.
 pub trait DecisionProvider: Send + Sync {
     fn request_decision(&self, request: &MessageRequest) -> Result<Decision, ProviderError>;
+
+    /// Like [`Self::request_decision`], but give up at `deadline` or when
+    /// `cancel` is set (the requester went away): the request is withdrawn
+    /// from the human (no decision can be made for it afterwards) and an
+    /// error is returned. A decision made before the
+    /// withdrawal is returned as usual. Providers that cannot withdraw a
+    /// request wait without a deadline (the default).
+    fn request_decision_until(
+        &self,
+        request: &MessageRequest,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Decision, ProviderError> {
+        let _ = (deadline, cancel);
+        self.request_decision(request)
+    }
 }
 
 /// A successfully sent Slack message.
@@ -182,6 +199,13 @@ pub trait SlackClient: Send + Sync {
         let _ = destination;
         None
     }
+
+    /// False when this client cannot send at all (the hooks-only setup,
+    /// where agents send with their own Slack tools and SpeakEasy only
+    /// approves). `request_slack_message` then fails before any popup.
+    fn can_send(&self) -> bool {
+        true
+    }
 }
 
 /// The outcome of handling one agent request, serialized back to the agent.
@@ -208,6 +232,59 @@ pub enum RequestVerdict {
     Error(String),
 }
 
+/// The outcome of an approval-only request: an agent's own Slack tool call
+/// stopped by a pre-tool hook. SpeakEasy never sends anything for it; on
+/// [`ApprovalVerdict::Approved`] the hook lets the agent's tool call run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApprovalVerdict {
+    /// The human approved this exact call.
+    Approved,
+    /// The human denied it; the same purpose is blocked for
+    /// `cooldown_remaining_secs` (initially [`COOLDOWN_SECS`]).
+    Denied { cooldown_remaining_secs: u64 },
+    /// The human gave feedback for the agent instead of approving.
+    Feedback { feedback: String },
+    /// A matching deny cooldown is active; no popup was shown.
+    CooldownBlocked { cooldown_remaining_secs: u64 },
+    /// SpeakEasy already sent this exact message to this destination (and
+    /// thread); no popup was shown.
+    AlreadySent { ts: String, permalink: String },
+    /// Something failed, or no one decided before the deadline. Never an
+    /// approval.
+    Error(String),
+}
+
+/// How an approval-only request is handled (see [`Gateway::handle_approval`]).
+#[derive(Debug, Clone)]
+pub struct ApprovalOptions {
+    /// When the request is withdrawn from the popup if no one has decided.
+    pub deadline: Instant,
+    /// Identifies one agent tool call (computed by the hook from the agent,
+    /// session, tool, arguments and the agent's call ID). Hooks that stop
+    /// the same call share one popup and one decision.
+    pub share_key: Option<String>,
+    /// Whether the deny cooldown applies. False when the call names no
+    /// destination: a placeholder destination would make unrelated calls
+    /// look like the same purpose.
+    pub cooldown: bool,
+}
+
+/// Which pre-checks apply to a request.
+#[derive(Clone, Copy)]
+struct Checks {
+    /// Slack's message-length limit (only for messages SpeakEasy sends).
+    send_limits: bool,
+    /// The deny cooldown.
+    cooldown: bool,
+}
+
+/// Why a request was settled before reaching the human.
+enum Precheck {
+    Invalid(String),
+    CooldownBlocked(u64),
+    AlreadySent(Box<SentRecord>),
+}
+
 /// The approval gateway. Holds the Slack client, the decision provider, and
 /// the persisted state (deny cooldowns and sent-approval records).
 pub struct Gateway {
@@ -221,8 +298,44 @@ pub struct Gateway {
     /// and the end of the send critical section. Used by
     /// [`Gateway::wait_until_no_send_in_progress`] at shutdown.
     approvals_in_flight: AtomicUsize,
+    /// Approval-only requests by (agent call ID, message hash), so two hooks
+    /// that stop the same tool call share one popup and one decision.
+    approvals: Mutex<HashMap<String, Arc<ApprovalSlot>>>,
     state_dir: PathBuf,
 }
+
+/// One approval decision shared by every hook that stopped the same call.
+#[derive(Default)]
+struct ApprovalSlot {
+    verdict: Mutex<Option<(ApprovalVerdict, Instant)>>,
+    decided: Condvar,
+}
+
+impl ApprovalSlot {
+    fn fill(&self, verdict: ApprovalVerdict) {
+        let mut slot = self.verdict.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some((verdict, Instant::now()));
+        }
+        self.decided.notify_all();
+    }
+}
+
+/// Fills the slot with an error if the first hook's handling unwinds, so
+/// the hooks sharing it are not left waiting.
+struct FillOnUnwind<'a>(&'a ApprovalSlot);
+
+impl Drop for FillOnUnwind<'_> {
+    fn drop(&mut self) {
+        self.0.fill(ApprovalVerdict::Error(
+            "internal gateway error while asking the human".into(),
+        ));
+    }
+}
+
+/// How long a decision is shared with a duplicate hook that arrives after
+/// it was made (duplicates normally arrive while the first is pending).
+const APPROVAL_SHARE_AFTER: Duration = Duration::from_secs(30);
 
 struct GatewayState {
     cooldowns: Vec<CooldownEntry>,
@@ -274,6 +387,7 @@ impl Gateway {
             state: Mutex::new(state),
             send_lock: Mutex::new(()),
             approvals_in_flight: AtomicUsize::new(0),
+            approvals: Mutex::new(HashMap::new()),
             state_dir,
         })
     }
@@ -316,54 +430,220 @@ impl Gateway {
         id: String,
         received_at: u64,
     ) -> RequestVerdict {
-        if let Err(problem) = validate(&req) {
-            return RequestVerdict::Error(format!("{problem}; nothing was sent"));
+        if !self.slack.can_send() {
+            return RequestVerdict::Error(
+                "SpeakEasy has no Slack connection of its own (hooks-only setup): send with \
+                 your own Slack tool instead, and SpeakEasy will ask the human to approve that \
+                 call before it runs; nothing was sent"
+                    .into(),
+            );
         }
+        let checks = Checks {
+            send_limits: true,
+            cooldown: true,
+        };
+        let (normalized, hash) = match self.precheck(&req, checks) {
+            Ok(keys) => keys,
+            Err(Precheck::Invalid(problem)) => {
+                return RequestVerdict::Error(format!("{problem}; nothing was sent"))
+            }
+            Err(Precheck::CooldownBlocked(remaining)) => {
+                return RequestVerdict::CooldownBlocked {
+                    cooldown_remaining_secs: remaining,
+                }
+            }
+            Err(Precheck::AlreadySent(record)) => return duplicate_verdict(&record),
+        };
+
+        // 3. Ask the human (see `ask`), then 4. act on the decision.
+        // Anything but an explicit approval sends nothing.
+        let (req, decision) = self.ask(req, id, received_at, None);
+        match decision {
+            Ok(Decision::Approve) => self.send_approved(&req, hash),
+            Ok(Decision::Deny) => RequestVerdict::Denied {
+                cooldown_remaining_secs: self.record_denial(&req, normalized),
+            },
+            Ok(Decision::Feedback(feedback)) => RequestVerdict::Feedback { feedback },
+            Err(ProviderError(e)) => RequestVerdict::Error(e),
+        }
+    }
+
+    /// Handle an approval-only request: an agent's own Slack tool call,
+    /// stopped by a pre-tool hook until the human decides. The same
+    /// cooldown (unless `opts.cooldown` is false) and dedupe checks as
+    /// [`Self::handle_request`] apply, and a deny starts the same cooldown,
+    /// but SpeakEasy sends nothing: on approval the agent's tool call runs.
+    /// No decision by `opts.deadline`, or `cancel` set (the hook went
+    /// away), withdraws the request from the popup and is an error.
+    ///
+    /// Hooks that stop the same call (same `opts.share_key` and exact
+    /// message) share the first one's popup and decision instead of asking
+    /// twice — Cursor, for example, runs both its own hook and the Claude
+    /// Code hooks it imports. A decision is shared only while it is pending
+    /// and for [`APPROVAL_SHARE_AFTER`] afterwards.
+    pub fn handle_approval(
+        &self,
+        req: IncomingRequest,
+        opts: &ApprovalOptions,
+        cancel: &AtomicBool,
+    ) -> ApprovalVerdict {
+        let Some(share_key) = opts.share_key.as_deref().filter(|k| !k.trim().is_empty()) else {
+            return self.ask_approval(req, opts, cancel);
+        };
+        let key = format!(
+            "{share_key}\n{}",
+            message_hash(&req.message, &req.destination, req.thread_ts.as_deref())
+        );
+        let (slot, first) = {
+            let mut approvals = self.approvals.lock().unwrap_or_else(PoisonError::into_inner);
+            approvals.retain(|_, slot| {
+                match &*slot.verdict.lock().unwrap_or_else(PoisonError::into_inner) {
+                    Some((_, at)) => at.elapsed() <= APPROVAL_SHARE_AFTER,
+                    None => true,
+                }
+            });
+            match approvals.get(&key) {
+                Some(slot) => (Arc::clone(slot), false),
+                None => {
+                    let slot = Arc::new(ApprovalSlot::default());
+                    approvals.insert(key, Arc::clone(&slot));
+                    (slot, true)
+                }
+            }
+        };
+        if first {
+            let guard = FillOnUnwind(&slot);
+            let verdict = self.ask_approval(req, opts, cancel);
+            slot.fill(verdict.clone());
+            drop(guard);
+            return verdict;
+        }
+        let mut guard = slot.verdict.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some((verdict, _)) = guard.as_ref() {
+                return verdict.clone();
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return ApprovalVerdict::Error("the hook that asked stopped waiting".into());
+            }
+            let left = opts.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return ApprovalVerdict::Error(
+                    "no one answered the approval request in time; no decision was made".into(),
+                );
+            }
+            guard = slot
+                .decided
+                .wait_timeout(guard, left.min(Duration::from_millis(200)))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    fn ask_approval(
+        &self,
+        req: IncomingRequest,
+        opts: &ApprovalOptions,
+        cancel: &AtomicBool,
+    ) -> ApprovalVerdict {
+        let checks = Checks {
+            send_limits: false,
+            cooldown: opts.cooldown,
+        };
+        let normalized = match self.precheck(&req, checks) {
+            Ok((normalized, _)) => normalized,
+            Err(Precheck::Invalid(problem)) => return ApprovalVerdict::Error(problem),
+            Err(Precheck::CooldownBlocked(remaining)) => {
+                return ApprovalVerdict::CooldownBlocked {
+                    cooldown_remaining_secs: remaining,
+                }
+            }
+            Err(Precheck::AlreadySent(record)) => {
+                return ApprovalVerdict::AlreadySent {
+                    ts: record.ts,
+                    permalink: record.permalink,
+                }
+            }
+        };
+        let now = now_secs();
+        let id = format!(
+            "req-{now}-{}",
+            NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let (req, decision) = self.ask(req, id, now, Some((opts.deadline, cancel)));
+        match decision {
+            Ok(Decision::Approve) => ApprovalVerdict::Approved,
+            Ok(Decision::Deny) => ApprovalVerdict::Denied {
+                cooldown_remaining_secs: if opts.cooldown {
+                    self.record_denial(&req, normalized)
+                } else {
+                    0
+                },
+            },
+            Ok(Decision::Feedback(feedback)) => ApprovalVerdict::Feedback { feedback },
+            Err(ProviderError(e)) => ApprovalVerdict::Error(e),
+        }
+    }
+
+    /// Steps 1–2 of the decision flow: validation, the cooldown check and
+    /// the dedupe check. Returns the request's normalized text and message
+    /// hash when it should go to the human.
+    fn precheck(
+        &self,
+        req: &IncomingRequest,
+        checks: Checks,
+    ) -> Result<(String, String), Precheck> {
+        validate(req, checks.send_limits).map_err(Precheck::Invalid)?;
 
         let now = now_secs();
         let normalized = normalize_text(&req.message);
         let hash = message_hash(&req.message, &req.destination, req.thread_ts.as_deref());
 
-        {
-            let mut state = self.lock_state();
-            if let Err(e) = self.reload(&mut state, now) {
-                // The send path re-checks strictly; a deny or feedback
-                // needs no sent records.
-                eprintln!("slack-approval-gateway: cannot reload sent records: {e}");
-            }
-
-            // 1. Cooldown check. The key is (destination, purpose) only: agent
-            // identity, reason, request ID and thread are deliberately ignored
-            // so reworded requests and retries from other agents still match.
-            // With several matching entries the longest remaining wait wins.
-            let destination = destination_key(&req.destination);
-            let remaining = state
-                .cooldowns
-                .iter()
-                .filter(|c| {
-                    cooldown_active(c, now)
-                        && destination_key(&c.destination) == destination
-                        && same_purpose(&c.normalized, &normalized)
-                })
-                .map(|c| c.expires_at - now)
-                .max();
-            if let Some(remaining) = remaining {
-                // A deny recorded after `now` was taken can be 1s "longer".
-                return RequestVerdict::CooldownBlocked {
-                    cooldown_remaining_secs: remaining.min(COOLDOWN_SECS),
-                };
-            }
-
-            // 2. Dedupe check: an identical approved request was already sent.
-            if let Some(record) = find_sent(&state.sent, &hash, &req) {
-                return duplicate_verdict(record);
-            }
+        let mut state = self.lock_state();
+        if let Err(e) = self.reload(&mut state, now) {
+            // The send path re-checks strictly; a deny or feedback
+            // needs no sent records.
+            eprintln!("slack-approval-gateway: cannot reload sent records: {e}");
         }
 
-        // 3. Ask the human. The state lock is released: this may block for a
-        // long time and other requests must keep flowing. The destination's
-        // display name is resolved best-effort for the popup; a failure
-        // changes nothing (the raw destination is shown).
+        // 1. Cooldown check. The key is (destination, purpose) only: agent
+        // identity, reason, request ID and thread are deliberately ignored
+        // so reworded requests and retries from other agents still match.
+        // With several matching entries the longest remaining wait wins.
+        let destination = destination_key(&req.destination);
+        let remaining = state
+            .cooldowns
+            .iter()
+            .filter(|c| {
+                cooldown_active(c, now)
+                    && destination_key(&c.destination) == destination
+                    && same_purpose(&c.normalized, &normalized)
+            })
+            .map(|c| c.expires_at - now)
+            .max();
+        if let Some(remaining) = remaining.filter(|_| checks.cooldown) {
+            // A deny recorded after `now` was taken can be 1s "longer".
+            return Err(Precheck::CooldownBlocked(remaining.min(COOLDOWN_SECS)));
+        }
+
+        // 2. Dedupe check: an identical approved request was already sent.
+        if let Some(record) = find_sent(&state.sent, &hash, req) {
+            return Err(Precheck::AlreadySent(Box::new(record.clone())));
+        }
+        Ok((normalized, hash))
+    }
+
+    /// Step 3: ask the human. The state lock is not held: this may block for
+    /// a long time and other requests must keep flowing. The destination's
+    /// display name is resolved best-effort for the popup; a failure changes
+    /// nothing (the raw destination is shown).
+    fn ask(
+        &self,
+        req: IncomingRequest,
+        id: String,
+        received_at: u64,
+        deadline: Option<(Instant, &AtomicBool)>,
+    ) -> (IncomingRequest, Result<Decision, ProviderError>) {
         let destination_display = self.slack.resolve_destination(&req.destination);
         let msg = MessageRequest {
             id,
@@ -371,16 +651,11 @@ impl Gateway {
             received_at,
             destination_display,
         };
-        let decision = self.provider.request_decision(&msg);
-        let req = msg.incoming;
-
-        // 4. Act on the decision. Anything but an explicit approval sends nothing.
-        match decision {
-            Ok(Decision::Approve) => self.send_approved(&req, hash),
-            Ok(Decision::Deny) => self.record_denial(&req, normalized),
-            Ok(Decision::Feedback(feedback)) => RequestVerdict::Feedback { feedback },
-            Err(ProviderError(e)) => RequestVerdict::Error(e),
-        }
+        let decision = match deadline {
+            Some((deadline, cancel)) => self.provider.request_decision_until(&msg, deadline, cancel),
+            None => self.provider.request_decision(&msg),
+        };
+        (msg.incoming, decision)
     }
 
     /// Currently active deny cooldowns as `(destination, excerpt, remaining_secs)`.
@@ -480,8 +755,9 @@ impl Gateway {
         }
     }
 
-    /// Record a deny cooldown for the request's (destination, purpose).
-    fn record_denial(&self, req: &IncomingRequest, normalized: String) -> RequestVerdict {
+    /// Record a deny cooldown for the request's (destination, purpose) and
+    /// return its length in seconds.
+    fn record_denial(&self, req: &IncomingRequest, normalized: String) -> u64 {
         // The cooldown starts at the human's decision, not at receipt: the
         // popup may have been open longer than COOLDOWN_SECS, and the agent
         // is told the full COOLDOWN_SECS remain.
@@ -503,9 +779,7 @@ impl Gateway {
                  (it is lost on restart unless a later write succeeds): {e}"
             );
         }
-        RequestVerdict::Denied {
-            cooldown_remaining_secs: COOLDOWN_SECS,
-        }
+        COOLDOWN_SECS
     }
 
     fn lock_state(&self) -> MutexGuard<'_, GatewayState> {
@@ -566,13 +840,14 @@ impl Gateway {
     }
 }
 
-/// Reject requests that cannot be sent exactly as approved.
-fn validate(req: &IncomingRequest) -> Result<(), String> {
+/// Reject requests that cannot be sent exactly as approved. Slack's length
+/// limit applies only to what SpeakEasy itself sends (`send_limits`).
+fn validate(req: &IncomingRequest, send_limits: bool) -> Result<(), String> {
     let visible = |c: char| !c.is_whitespace() && !is_invisible_or_mark(c);
     if !req.message.chars().any(visible) {
         return Err("message has no visible text".into());
     }
-    if req.message.chars().count() > MAX_MESSAGE_CHARS {
+    if send_limits && req.message.chars().count() > MAX_MESSAGE_CHARS {
         return Err(format!(
             "message is longer than Slack's {MAX_MESSAGE_CHARS}-character limit and would be truncated"
         ));
@@ -1103,6 +1378,25 @@ mod tests {
                 .unwrap()
                 .recv_timeout(WAIT)
                 .map_err(|e| ProviderError(e.to_string()))
+        }
+    }
+
+    fn approval_opts(share_key: Option<&str>, cooldown: bool) -> ApprovalOptions {
+        ApprovalOptions {
+            deadline: Instant::now() + WAIT,
+            share_key: share_key.map(str::to_string),
+            cooldown,
+        }
+    }
+
+    /// Panics inside `request_decision` once the test lets it.
+    struct PanicsWhenReleased(Mutex<mpsc::Receiver<()>>, Mutex<mpsc::Sender<()>>);
+
+    impl DecisionProvider for PanicsWhenReleased {
+        fn request_decision(&self, _: &MessageRequest) -> Result<Decision, ProviderError> {
+            self.1.lock().unwrap().send(()).unwrap();
+            let _ = self.0.lock().unwrap().recv_timeout(WAIT);
+            panic!("provider failed");
         }
     }
 
@@ -2730,5 +3024,130 @@ mod tests {
 
         assert!(reader.join().unwrap() > 0);
         assert_no_temp_files(&dir);
+    }
+
+    #[test]
+    fn an_approval_without_cooldown_records_no_block() {
+        let dir = TempDir::new("approval-no-cooldown");
+        let slack = MockSlack::new();
+        let provider = ScriptedProvider::new(vec![Ok(Decision::Deny), Ok(Decision::Deny)]);
+        let gw = gateway(&dir, &slack, &provider);
+        let no = AtomicBool::new(false);
+        let req = || request("(the whole program)", "(see the program)", None);
+        let first = gw.handle_approval(req(), &approval_opts(None, false), &no);
+        assert_eq!(first, ApprovalVerdict::Denied { cooldown_remaining_secs: 0 });
+        let second = gw.handle_approval(req(), &approval_opts(None, false), &no);
+        assert_eq!(second, ApprovalVerdict::Denied { cooldown_remaining_secs: 0 });
+        assert_eq!(provider.calls(), 2, "no cooldown: the human is asked again");
+        assert!(gw.active_cooldowns().is_empty());
+        assert!(slack.calls().is_empty(), "an approval never sends");
+    }
+
+    #[test]
+    fn approvals_are_not_held_to_slacks_message_length() {
+        let dir = TempDir::new("approval-length");
+        let slack = MockSlack::new();
+        let provider = ScriptedProvider::new(vec![Ok(Decision::Approve)]);
+        let gw = gateway(&dir, &slack, &provider);
+        let long = "x".repeat(MAX_MESSAGE_CHARS + 10);
+        let verdict = gw.handle_approval(
+            request(&long, "C1", None),
+            &approval_opts(None, true),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(verdict, ApprovalVerdict::Approved);
+    }
+
+    #[test]
+    fn hooks_stopping_one_call_share_a_decision_only_by_their_key() {
+        let dir = TempDir::new("approval-share");
+        let slack = MockSlack::new();
+        let provider =
+            ScriptedProvider::new(vec![Ok(Decision::Approve), Ok(Decision::Deny)]);
+        let gw = gateway(&dir, &slack, &provider);
+        let no = AtomicBool::new(false);
+        let a = gw.handle_approval(request("hi", "C1", None), &approval_opts(Some("k1"), true), &no);
+        let again = gw.handle_approval(request("hi", "C1", None), &approval_opts(Some("k1"), true), &no);
+        assert_eq!((a, again), (ApprovalVerdict::Approved, ApprovalVerdict::Approved));
+        assert_eq!(provider.calls(), 1, "the duplicate hook shares the decision");
+        let other = gw.handle_approval(request("hi", "C1", None), &approval_opts(Some("k2"), true), &no);
+        assert!(matches!(other, ApprovalVerdict::Denied { .. }), "another call asks again");
+        assert_eq!(provider.calls(), 2);
+    }
+
+    #[test]
+    fn a_panic_while_asking_releases_the_hooks_sharing_it() {
+        let dir = TempDir::new("approval-panic");
+        let slack = MockSlack::new();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let provider: Arc<dyn DecisionProvider> = Arc::new(PanicsWhenReleased(
+            Mutex::new(release_rx),
+            Mutex::new(entered_tx),
+        ));
+        let gw = Arc::new(Gateway::new(slack.clone(), provider, dir.path().to_path_buf()).unwrap());
+        let first = {
+            let gw = Arc::clone(&gw);
+            thread::spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gw.handle_approval(
+                        request("hi", "C1", None),
+                        &approval_opts(Some("k"), true),
+                        &AtomicBool::new(false),
+                    )
+                }))
+            })
+        };
+        entered_rx.recv_timeout(WAIT).unwrap();
+        let follower = {
+            let gw = Arc::clone(&gw);
+            thread::spawn(move || {
+                gw.handle_approval(
+                    request("hi", "C1", None),
+                    &approval_opts(Some("k"), true),
+                    &AtomicBool::new(false),
+                )
+            })
+        };
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_err(), "the first hook's handling panicked");
+        let verdict = follower.join().unwrap();
+        assert!(matches!(verdict, ApprovalVerdict::Error(_)), "{verdict:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "the follower did not wait out its deadline");
+    }
+
+    #[test]
+    fn a_waiting_duplicate_hook_leaves_when_its_own_agent_goes_away() {
+        let dir = TempDir::new("approval-follower-cancel");
+        let slack = MockSlack::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let provider: Arc<dyn DecisionProvider> = Arc::new(GatedProvider {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        });
+        let gw = Arc::new(Gateway::new(slack.clone(), provider, dir.path().to_path_buf()).unwrap());
+        let first = {
+            let gw = Arc::clone(&gw);
+            thread::spawn(move || {
+                gw.handle_approval(request("hi", "C1", None), &approval_opts(Some("k"), true), &AtomicBool::new(false))
+            })
+        };
+        entered_rx.recv_timeout(WAIT).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let follower = {
+            let gw = Arc::clone(&gw);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                gw.handle_approval(request("hi", "C1", None), &approval_opts(Some("k"), true), &cancel)
+            })
+        };
+        thread::sleep(Duration::from_millis(100));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(follower.join().unwrap(), ApprovalVerdict::Error(_)));
+        release_tx.send(Decision::Approve).unwrap();
+        assert_eq!(first.join().unwrap(), ApprovalVerdict::Approved);
     }
 }

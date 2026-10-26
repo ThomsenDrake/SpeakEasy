@@ -38,8 +38,10 @@ pub mod theme;
 
 use crate::core::{Decision, DecisionProvider, Gateway, MessageRequest, ProviderError};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc::Sender, Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Why a decision submission was rejected by the bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,9 @@ struct BridgeInner {
     pending: HashMap<String, Sender<Result<Decision, ProviderError>>>,
     /// Requests delivered by workers but not yet pulled by the UI.
     outbox: Vec<MessageRequest>,
+    /// IDs of requests the UI already pulled that were withdrawn since
+    /// (their deadline passed); the UI drops them from its queue.
+    withdrawn: Vec<String>,
     /// Set by `quit`: no new requests are accepted, submissions fail.
     quitting: bool,
 }
@@ -108,6 +113,7 @@ impl UiState {
             inner: Mutex::new(BridgeInner {
                 pending: HashMap::new(),
                 outbox: Vec::new(),
+                withdrawn: Vec::new(),
                 quitting: false,
             }),
             hooks: Mutex::new(UiHooks::default()),
@@ -174,6 +180,31 @@ impl UiState {
             return Vec::new();
         }
         std::mem::take(&mut inner.outbox)
+    }
+
+    /// Gateway worker side: withdraw an undecided request (its deadline
+    /// passed), so no decision can be made for it any more. Returns false
+    /// when the request was already decided (or the gateway is quitting):
+    /// the decision is then waiting on the worker's channel.
+    fn withdraw(&self, request_id: &str) -> bool {
+        let mut inner = self.lock_inner();
+        if inner.pending.remove(request_id).is_none() {
+            return false;
+        }
+        eprintln!("slack-approval-gateway: request {request_id} expired; withdrawing it");
+        inner.outbox.retain(|r| r.id != request_id);
+        // Tell the UI either way: it drops the request if it already pulled
+        // it, and hides a window that was revealed for nothing.
+        inner.withdrawn.push(request_id.to_string());
+        if let Some(notify) = self.lock_hooks().notify.as_ref() {
+            notify();
+        }
+        true
+    }
+
+    /// UI side: take the IDs of requests withdrawn since the last call.
+    pub fn drain_withdrawn(&self) -> Vec<String> {
+        std::mem::take(&mut self.lock_inner().withdrawn)
     }
 
     /// UI side: record the human's decision. The first decision wins; repeat
@@ -273,13 +304,51 @@ impl DecisionProvider for GuiDecisionProvider {
     fn request_decision(&self, request: &MessageRequest) -> Result<Decision, ProviderError> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.state.enqueue(request.id.clone(), tx, request.clone())?;
-        match rx.recv() {
-            Ok(result) => result,
-            Err(_) => Err(ProviderError(
-                "gateway UI is not available; no decision was made".into(),
-            )),
+        rx.recv().unwrap_or_else(|_| Err(ui_unavailable()))
+    }
+
+    fn request_decision_until(
+        &self,
+        request: &MessageRequest,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Decision, ProviderError> {
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(ProviderError(
+                "the hook that asked stopped waiting before the request was shown".into(),
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.state.enqueue(request.id.clone(), tx, request.clone())?;
+        // Wake up regularly to notice a requester that went away.
+        const POLL: Duration = Duration::from_millis(200);
+        let why = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break "no one answered the approval request in time";
+            }
+            if cancel.load(Ordering::Relaxed) {
+                break "the hook that asked stopped waiting";
+            }
+            match rx.recv_timeout(left.min(POLL)) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Disconnected) => return Err(ui_unavailable()),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        };
+        if self.state.withdraw(&request.id) {
+            Err(ProviderError(format!(
+                "{why}; the request was withdrawn and no decision was made"
+            )))
+        } else {
+            // Decided (or quitting) just as it was withdrawn.
+            rx.recv().unwrap_or_else(|_| Err(ui_unavailable()))
         }
     }
+}
+
+fn ui_unavailable() -> ProviderError {
+    ProviderError("gateway UI is not available; no decision was made".into())
 }
 
 #[cfg(test)]
@@ -353,6 +422,80 @@ mod tests {
         fn drain_outbox_len(&self) -> usize {
             self.lock_inner().outbox.len()
         }
+    }
+
+    #[test]
+    fn an_undecided_request_is_withdrawn_at_its_deadline() {
+        let state = Arc::new(UiState::new());
+        let provider = GuiDecisionProvider::new(Arc::clone(&state));
+
+        // Still in the outbox at the deadline: it simply disappears.
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result =
+            provider.request_decision_until(&sample_request("req-w1"), deadline, &AtomicBool::new(false));
+        assert!(result.is_err(), "an expired request is never a decision");
+        assert!(state.drain_outbox().is_empty());
+        assert_eq!(state.drain_withdrawn(), vec!["req-w1".to_string()]);
+        assert_eq!(state.pending_count(), 0);
+
+        // Already pulled by the UI: the UI is told to drop it, and a late
+        // click is rejected.
+        let worker = {
+            let provider = provider.clone_state();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(300);
+                provider.request_decision_until(&sample_request("req-w2"), deadline, &AtomicBool::new(false))
+            })
+        };
+        wait_for_outbox(&state, 1);
+        assert_eq!(state.drain_outbox().len(), 1);
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(state.drain_withdrawn(), vec!["req-w2".to_string()]);
+        assert_eq!(
+            state.submit("req-w2", Decision::Approve),
+            Err(SubmitError::UnknownOrStale)
+        );
+    }
+
+    #[test]
+    fn a_request_whose_requester_left_is_withdrawn_early() {
+        let state = Arc::new(UiState::new());
+        let provider = GuiDecisionProvider::new(Arc::clone(&state));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let provider = provider.clone_state();
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                provider.request_decision_until(&sample_request("req-c1"), deadline, &cancel)
+            })
+        };
+        wait_for_outbox(&state, 1);
+        state.drain_outbox();
+        let started = Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        let result = worker.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(result.is_err());
+        assert_eq!(state.drain_withdrawn(), vec!["req-c1".to_string()]);
+    }
+
+    #[test]
+    fn a_decision_before_the_deadline_is_returned() {
+        let state = Arc::new(UiState::new());
+        let provider = GuiDecisionProvider::new(Arc::clone(&state));
+        let worker = {
+            let provider = provider.clone_state();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                provider.request_decision_until(&sample_request("req-d1"), deadline, &AtomicBool::new(false))
+            })
+        };
+        wait_for_outbox(&state, 1);
+        state.drain_outbox();
+        state.submit("req-d1", Decision::Approve).unwrap();
+        assert!(matches!(worker.join().unwrap(), Ok(Decision::Approve)));
+        assert!(state.drain_withdrawn().is_empty());
     }
 
     #[test]

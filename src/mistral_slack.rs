@@ -59,7 +59,9 @@ impl MistralConnectorSlackClient {
     /// at `<state_dir>/mistral_api_key` (one line, trimmed; create it with
     /// `chmod 600`). `MISTRAL_API_BASE` overrides the API base URL (default
     /// `https://api.mistral.ai`) and exists for tests.
-    /// `MISTRAL_SLACK_CONNECTOR` selects the connector (default `slack`).
+    /// `MISTRAL_SLACK_CONNECTOR` selects the connector, else a one-line
+    /// `<state_dir>/mistral_slack_connector` file (written when the
+    /// installer takes over an agent's connector), else `slack`.
     pub fn from_env(state_dir: &Path) -> Result<Self, SlackError> {
         let api_key = match non_empty_env("MISTRAL_API_KEY") {
             Some(key) => key,
@@ -77,8 +79,14 @@ impl MistralConnectorSlackClient {
         }
         let api_base =
             non_empty_env("MISTRAL_API_BASE").unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-        let connector =
-            non_empty_env("MISTRAL_SLACK_CONNECTOR").unwrap_or_else(|| DEFAULT_CONNECTOR.to_string());
+        let connector = non_empty_env("MISTRAL_SLACK_CONNECTOR")
+            .or_else(|| {
+                std::fs::read_to_string(state_dir.join("mistral_slack_connector"))
+                    .ok()
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+            })
+            .unwrap_or_else(|| DEFAULT_CONNECTOR.to_string());
         let tool = non_empty_env("MISTRAL_SLACK_TOOL");
         let channel_arg = non_empty_env("MISTRAL_SLACK_CHANNEL_ARG");
         let text_arg = non_empty_env("MISTRAL_SLACK_TEXT_ARG");

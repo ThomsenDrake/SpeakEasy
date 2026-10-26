@@ -488,6 +488,22 @@ fn from_env_reads_key_file_and_arg_overrides() {
     let last = mock.tool_calls().pop().unwrap();
     assert_eq!(last.authorization.as_deref(), Some("Bearer mistral-from-env"));
 
+    // The connector: a <state_dir>/mistral_slack_connector file (written
+    // when the installer takes over an agent's connector) is used, and
+    // MISTRAL_SLACK_CONNECTOR wins over it.
+    std::fs::write(dir.join("mistral_slack_connector"), "my_slack\n").unwrap();
+    let client = MistralConnectorSlackClient::from_env(&dir).expect("connector file should be read");
+    client.post_message("C3", None, "via file connector").expect("post_message should succeed");
+    let last = mock.tool_calls().pop().unwrap();
+    assert!(last.path.contains("/connectors/my_slack/"), "path was {}", last.path);
+    std::env::set_var("MISTRAL_SLACK_CONNECTOR", "env_slack");
+    let client = MistralConnectorSlackClient::from_env(&dir).expect("env connector should be used");
+    client.post_message("C4", None, "via env connector").expect("post_message should succeed");
+    let last = mock.tool_calls().pop().unwrap();
+    assert!(last.path.contains("/connectors/env_slack/"), "path was {}", last.path);
+    std::env::remove_var("MISTRAL_SLACK_CONNECTOR");
+    std::fs::remove_file(dir.join("mistral_slack_connector")).unwrap();
+
     // A key with whitespace is rejected.
     std::env::set_var("MISTRAL_API_KEY", "two tokens");
     let err = MistralConnectorSlackClient::from_env(&dir)

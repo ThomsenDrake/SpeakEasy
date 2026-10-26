@@ -5,8 +5,10 @@
 //! The server command resolves from `SLACK_STDIO_COMMAND`, else a one-line
 //! `<state_dir>/slack_stdio_command` file, else `slack-mcp-server` found on
 //! PATH (run with `--transport stdio`, the server's documented stdio
-//! invocation). SpeakEasy never installs or downloads the server; when none
-//! of these resolves, startup fails with instructions.
+//! invocation). SpeakEasy never installs the server itself; when none of
+//! these resolves, startup fails with instructions. (A command taken over
+//! from an agent's config runs as configured, so an `npx` line still
+//! fetches the package the way it does for that agent.)
 //!
 //! The third [`SlackClient`] transport: the gateway spawns the server as a
 //! child process and speaks MCP (newline-delimited JSON-RPC) over its
@@ -32,7 +34,9 @@
 //! domain (`SLACK_WORKSPACE_DOMAIN`, else `<state_dir>/slack_workspace_domain`).
 
 use crate::core::{SlackClient, SlackError, SlackSend};
-use crate::slack::{fallback_permalink_with_domain, non_empty_env, workspace_domain};
+use crate::slack::{
+    fallback_permalink_with_domain, non_empty_env, warn_if_readable_by_others, workspace_domain,
+};
 use crate::slack_tools::{
     is_send_message_tool, pick_argument, schema_properties, send_arguments, send_outcome,
     text_content, tool_result_error, SendToolSpec, CHANNEL_ARG_CANDIDATES, THREAD_ARG_CANDIDATES,
@@ -115,12 +119,17 @@ impl KorotovskyClient {
     /// Build from the environment: `SLACK_BOT_TOKEN` and/or `SLACK_USER_TOKEN`
     /// (or the token files at `<state_dir>/slack_bot_token` /
     /// `slack_user_token`, one line, trimmed, chmod 600). At least one
-    /// credential is required, unless the server's own `SLACK_MCP_XOX*`
-    /// variables are already in the environment (the child inherits them).
+    /// credential is required, unless the server's own tokens
+    /// (`SLACK_MCP_XOXP_TOKEN`, `SLACK_MCP_XOXB_TOKEN`, or the browser-session
+    /// pair `SLACK_MCP_XOXC_TOKEN` + `SLACK_MCP_XOXD_TOKEN`) are in the
+    /// environment or in `<state_dir>/slack_stdio_env` — the settings the
+    /// installer copies when it takes over a korotovsky server an agent
+    /// already uses. The child gets that file's variables; the operator's
+    /// environment wins over it.
     /// The server command resolves from `SLACK_STDIO_COMMAND`, else a
     /// one-line `<state_dir>/slack_stdio_command` file, else
     /// `slack-mcp-server` on PATH (run with `--transport stdio`); SpeakEasy
-    /// never installs the server. `SLACK_STDIO_CONTENT_TYPE`
+    /// never installs the server itself. `SLACK_STDIO_CONTENT_TYPE`
     /// picks `text/plain` (default) or `text/markdown`. The MCP handshake
     /// runs here so a bad token or a missing server fails at startup, not
     /// after an approval.
@@ -133,16 +142,30 @@ impl KorotovskyClient {
             Some(token) => Some(token),
             None => read_optional_secret(&state_dir.join("slack_user_token"), "Slack user token")?,
         };
-        // The child inherits the operator's environment; server-side token
-        // variables already set there need no gateway-side copy.
-        let inherited = ["SLACK_MCP_XOXB_TOKEN", "SLACK_MCP_XOXP_TOKEN", "SLACK_MCP_XOXC_TOKEN"]
-            .iter()
-            .any(|name| non_empty_env(name).is_some());
-        if bot.is_none() && user.is_none() && !inherited {
+        // The installer's placeholders are not credentials: passed to the
+        // server, a placeholder bot token would win over a real browser
+        // session (the server prefers xoxp, then xoxb, then xoxc/xoxd).
+        let bot = real_token(bot);
+        let user = real_token(user);
+        // The server's own token variables count too: inherited from the
+        // operator's environment, or taken over from an agent's MCP config
+        // into <state_dir>/slack_stdio_env by the installer. A browser
+        // session (xoxc + xoxd) needs no Slack app.
+        let server_env = read_stdio_env(state_dir)?;
+        let server_var = |name: &str| {
+            non_empty_env(name).is_some()
+                || server_env.iter().any(|(k, v)| k == name && !v.trim().is_empty())
+        };
+        let server_credential = server_var("SLACK_MCP_XOXP_TOKEN")
+            || server_var("SLACK_MCP_XOXB_TOKEN")
+            || (server_var("SLACK_MCP_XOXC_TOKEN") && server_var("SLACK_MCP_XOXD_TOKEN"));
+        if bot.is_none() && user.is_none() && !server_credential {
             return Err(SlackError(format!(
-                "no Slack token for the korotovsky transport: set SLACK_BOT_TOKEN (xoxb-…) or \
-                 SLACK_USER_TOKEN (xoxp-…), or create {}/slack_bot_token or \
-                 {}/slack_user_token (chmod 600)",
+                "no Slack token for the korotovsky transport: run the installer to take over \
+                 the korotovsky server you already use (it copies its tokens into \
+                 {}/slack_stdio_env), set SLACK_BOT_TOKEN (xoxb-…) or SLACK_USER_TOKEN \
+                 (xoxp-…), or create {}/slack_bot_token or {}/slack_user_token (chmod 600)",
+                state_dir.display(),
                 state_dir.display(),
                 state_dir.display()
             )));
@@ -180,12 +203,23 @@ impl KorotovskyClient {
         let content_type = validate_content_type(content_type)?;
         let (program, args) = split_command(command)?;
         let workspace_domain = workspace_domain(state_dir);
+        let server_env = read_stdio_env(state_dir)?;
 
         let mut cmd = Command::new(&program);
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The server's own settings taken over from an agent's MCP config
+        // (tokens included); the operator's environment wins over the file.
+        for (key, value) in &server_env {
+            if std::env::var_os(key).is_none() {
+                cmd.env(key, value);
+            }
+        }
+        let is_set = |key: &str| {
+            std::env::var_os(key).is_some() || server_env.iter().any(|(k, _)| k == key)
+        };
         // The credential(s) the gateway holds. They are passed explicitly so
         // the gateway's files are the only place they live.
         if let Some(token) = &bot_token {
@@ -194,25 +228,26 @@ impl KorotovskyClient {
         if let Some(token) = &user_token {
             cmd.env("SLACK_MCP_XOXP_TOKEN", token);
         }
-        // Defaults the gateway controls; the operator's own values win.
+        // Defaults the gateway controls; the operator's own values (and the
+        // taken-over server settings) win.
         // `conversations_add_message` is disabled unless this is set, and a
         // quiet log level keeps the stdio stream clean.
-        if std::env::var_os("SLACK_MCP_ADD_MESSAGE_TOOL").is_none() {
+        if !is_set("SLACK_MCP_ADD_MESSAGE_TOOL") {
             cmd.env("SLACK_MCP_ADD_MESSAGE_TOOL", "true");
         }
-        if std::env::var_os("SLACK_MCP_LOG_LEVEL").is_none() {
+        if !is_set("SLACK_MCP_LOG_LEVEL") {
             cmd.env("SLACK_MCP_LOG_LEVEL", "error");
         }
         // Keep the server's caches inside the gateway's state dir: they hold
         // workspace data, and they must not collide with agent-side
         // instances of the same server.
-        if std::env::var_os("SLACK_MCP_USERS_CACHE").is_none() {
+        if !is_set("SLACK_MCP_USERS_CACHE") {
             cmd.env(
                 "SLACK_MCP_USERS_CACHE",
                 state_dir.join("korotovsky_users_cache.json"),
             );
         }
-        if std::env::var_os("SLACK_MCP_CHANNELS_CACHE").is_none() {
+        if !is_set("SLACK_MCP_CHANNELS_CACHE") {
             cmd.env(
                 "SLACK_MCP_CHANNELS_CACHE",
                 state_dir.join("korotovsky_channels_cache.json"),
@@ -571,6 +606,55 @@ fn read_optional_secret(path: &Path, what: &str) -> Result<Option<String>, Slack
     Ok(Some(secret.to_string()))
 }
 
+/// The token, unless it is one of the installer's placeholders
+/// (`xoxb-placeholder-…`, `xoxp-placeholder-…`).
+fn real_token(token: Option<String>) -> Option<String> {
+    token.filter(|t| !t.starts_with("xoxb-placeholder-") && !t.starts_with("xoxp-placeholder-"))
+}
+
+/// `KEY=VALUE` lines from `<state_dir>/slack_stdio_env`: the server's own
+/// environment (`SLACK_MCP_*` tokens and settings), written by the
+/// installer when it takes over a korotovsky server an agent already uses.
+/// A missing file is no settings; blank lines and `#` comments are skipped.
+fn read_stdio_env(state_dir: &Path) -> Result<Vec<(String, String)>, SlackError> {
+    let path = state_dir.join("slack_stdio_env");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(SlackError(format!(
+                "cannot read the Slack MCP server settings file {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    warn_if_readable_by_others(&path);
+    let mut vars = Vec::new();
+    for (i, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(SlackError(format!(
+                "{} line {}: expected KEY=VALUE",
+                path.display(),
+                i + 1
+            )));
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(SlackError(format!(
+                "{} line {}: '{key}' is not a variable name",
+                path.display(),
+                i + 1
+            )));
+        }
+        vars.push((key.to_string(), value.trim().to_string()));
+    }
+    Ok(vars)
+}
+
 /// `text/plain` (the default) or `text/markdown`.
 fn validate_content_type(value: &str) -> Result<String, SlackError> {
     let value = value.trim();
@@ -583,8 +667,9 @@ fn validate_content_type(value: &str) -> Result<String, SlackError> {
     }
 }
 
-/// Resolve the Slack MCP server command. SpeakEasy never installs or
-/// downloads the server — it must already be installed. Precedence:
+/// Resolve the Slack MCP server command. SpeakEasy never installs the
+/// server itself — it runs a command it is given or one already on PATH.
+/// Precedence:
 ///   1. `SLACK_STDIO_COMMAND` (a full command line, e.g.
 ///      `slack-mcp-server --transport stdio`);
 ///   2. a one-line `<state_dir>/slack_stdio_command` file (same format);

@@ -286,6 +286,7 @@ const STDIO_ENV: &[&str] = &[
     "SLACK_MCP_XOXB_TOKEN",
     "SLACK_MCP_XOXP_TOKEN",
     "SLACK_MCP_XOXC_TOKEN",
+    "SLACK_MCP_XOXD_TOKEN",
     "SLACK_MCP_ADD_MESSAGE_TOOL",
     "SLACK_MCP_LOG_LEVEL",
     "SLACK_MCP_USERS_CACHE",
@@ -341,12 +342,15 @@ fn from_env_credentials_transport_resolution_and_server_env() {
     assert!(err.0.contains("slack_user_token"), "{}", err.0);
 
     // The server's own env vars count as a credential (the child inherits
-    // them; the gateway needs no copy).
+    // them; the gateway needs no copy). A browser session needs both halves.
     std::env::set_var("SLACK_MCP_XOXC_TOKEN", "xoxc-inherited");
     let command = mock_command(&log, &[]);
     std::env::set_var("SLACK_STDIO_COMMAND", &command);
-    KorotovskyClient::from_env(&dir).expect("an inherited server token must be enough");
+    KorotovskyClient::from_env(&dir).expect_err("xoxc without xoxd must not be enough");
+    std::env::set_var("SLACK_MCP_XOXD_TOKEN", "xoxd-inherited");
+    KorotovskyClient::from_env(&dir).expect("an inherited server session must be enough");
     std::env::remove_var("SLACK_MCP_XOXC_TOKEN");
+    std::env::remove_var("SLACK_MCP_XOXD_TOKEN");
 
     // A bot token file is picked up; an env var beats the file.
     std::fs::write(dir.join("slack_bot_token"), "xoxb-from-file\n").unwrap();
@@ -459,4 +463,71 @@ fn from_env_credentials_transport_resolution_and_server_env() {
         .expect("post_message through the trait object");
     assert_eq!(send.ts, "1700000000.000100");
     std::env::remove_var("SLACK_TRANSPORT");
+    drop(client);
+
+    // --- a korotovsky server taken over from an agent's MCP config: its
+    // settings (here a browser session, xoxc + xoxd, which needs no Slack
+    // app) live in <state_dir>/slack_stdio_env and reach the child
+    for name in ["slack_bot_token", "slack_user_token"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    std::env::remove_var("SLACK_BOT_TOKEN");
+    std::env::remove_var("SLACK_USER_TOKEN");
+    let env_file = dir.join("slack_stdio_env");
+    std::fs::write(
+        &env_file,
+        "# taken over from ~/.cursor/mcp.json (server: slack)\n\
+         SLACK_MCP_XOXC_TOKEN=xoxc-1111-2222-session\n\
+         SLACK_MCP_XOXD_TOKEN=xoxd-cookie%2Bvalue=\n\
+         SLACK_MCP_ADD_MESSAGE_TOOL=C0FROMFILE\n",
+    )
+    .unwrap();
+    // An installer placeholder bot token must not reach the server, where
+    // it would win over the session.
+    std::fs::write(dir.join("slack_bot_token"), "xoxb-placeholder-get-a-real-token\n").unwrap();
+    let client = KorotovskyClient::from_env(&dir).expect("a taken-over session must be enough");
+    drop(client);
+    let env = recorded_env(&dir);
+    std::fs::remove_file(dir.join("slack_bot_token")).unwrap();
+    assert_eq!(
+        env.get("SLACK_MCP_XOXC_TOKEN").and_then(Value::as_str),
+        Some("xoxc-1111-2222-session")
+    );
+    assert_eq!(
+        env.get("SLACK_MCP_XOXD_TOKEN").and_then(Value::as_str),
+        Some("xoxd-cookie%2Bvalue="),
+        "a value may contain '=' after the first one"
+    );
+    assert_eq!(
+        env.get("SLACK_MCP_ADD_MESSAGE_TOOL").and_then(Value::as_str),
+        Some("C0FROMFILE"),
+        "the taken-over settings win over the gateway's defaults"
+    );
+    assert_eq!(env.get("SLACK_MCP_XOXB_TOKEN"), Some(&Value::Null));
+
+    // The operator's environment wins over the file.
+    std::env::set_var("SLACK_MCP_ADD_MESSAGE_TOOL", "true");
+    let client = KorotovskyClient::from_env(&dir).expect("from_env must build the client");
+    drop(client);
+    assert_eq!(
+        recorded_env(&dir).get("SLACK_MCP_ADD_MESSAGE_TOOL").and_then(Value::as_str),
+        Some("true")
+    );
+    std::env::remove_var("SLACK_MCP_ADD_MESSAGE_TOOL");
+
+    // xoxc without its xoxd cookie is not a credential.
+    std::fs::write(&env_file, "SLACK_MCP_XOXC_TOKEN=xoxc-1111-2222-session\n").unwrap();
+    let err = KorotovskyClient::from_env(&dir).expect_err("xoxc alone must not be enough");
+    assert!(err.0.contains("no Slack token"), "{}", err.0);
+    assert!(err.0.contains("slack_stdio_env"), "{}", err.0);
+
+    // A malformed line is an error naming the file and line.
+    std::fs::write(
+        &env_file,
+        "SLACK_MCP_XOXP_TOKEN=xoxp-1111-2222\nnot a setting\n",
+    )
+    .unwrap();
+    let err = KorotovskyClient::from_env(&dir).expect_err("a malformed line must be an error");
+    assert!(err.0.contains("slack_stdio_env line 2"), "{}", err.0);
+    std::fs::remove_file(&env_file).unwrap();
 }

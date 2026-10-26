@@ -43,6 +43,13 @@ signatures, do not rename items, do not touch files you do not own.
 Keep it lightweight. Handle concurrent requests without mixing up approvals
 or feedback. Closing or ignoring a popup must never authorize sending.
 
+7. **Hooks for the agents' own Slack tools**: an agent whose Slack MCP
+   SpeakEasy cannot take over (Claude Code's Slack plugin owns its OAuth
+   session) keeps sending with its own tools, and a pre-tool hook stops
+   each Slack write until the human approves it in the same popup
+   (`src/hook.rs`). Same popup, cooldown and dedupe rules; SpeakEasy sends
+   nothing for these and needs no credential (the `hooks-only` transport).
+
 ## Module contracts
 
 ### `src/core.rs` — gateway, cooldowns, dedupe, fingerprinting
@@ -102,6 +109,22 @@ Public API is fully declared in the stub. Implement:
   5. Persistence is JSON via serde; write atomically (write `<file>.tmp`,
      then `rename`). Persist under the state lock.
 - `active_cooldowns`: active entries as `(destination, excerpt, remaining_secs)`.
+- `Gateway::handle_approval(req, &ApprovalOptions { deadline, share_key,
+  cooldown }, cancel) -> ApprovalVerdict` — the
+  approval-only flow for a hook-stopped tool call: the same validation,
+  cooldown check (→ `CooldownBlocked`, no popup) and dedupe check (an
+  identical message SpeakEasy already sent → `AlreadySent { ts, permalink }`,
+  no popup), then `provider.request_decision_until(&msg, deadline, cancel)`.
+  `Approve` → `Approved` (nothing is sent: the agent's own tool call runs);
+  `Deny` → the same cooldown entry as above and `Denied`; `Feedback` →
+  `Feedback`; a provider error or a passed deadline → `Error` (never an
+  approval). Nothing is recorded as sent.
+- `DecisionProvider::request_decision_until(request, deadline, cancel)`: default
+  waits without a deadline (`request_decision`); the GUI provider withdraws
+  the request from the popup at the deadline (see `src/ui.rs`).
+- `SlackClient::can_send()` (default true): false for the `hooks-only`
+  client; `handle_request` then returns `Error` before any popup, telling
+  the agent to use its own Slack tool.
 
   Concurrency rule: the state lock is never held across provider calls or
   Slack network calls; `send_lock` covers only the dedupe-recheck + send +
@@ -146,6 +169,9 @@ token (`xoxb-…`, default) or **user** token (`xoxp-…`) for the
   (`direct` / `bot-token` / `token`) are an error explaining the removal and
   pointing at the new transports; unknown values are an error naming the
   accepted ones.
+- `hooks-only` (aliases `hooks`, `none`) selects `NoSlackClient`: no
+  credential, `post_message` always fails and `can_send()` is false. The
+  instance still runs (popup, socket) to answer hook approvals.
 - `build_client(state_dir) -> Result<Arc<dyn SlackClient>, SlackError>`:
   dispatch on the selected transport; `src/main.rs` calls this once at
   startup and exits with usage hints (naming what the selected transport
@@ -233,7 +259,10 @@ Korotovsky's unofficial Slack MCP server**
 (`slack-mcp-server`, <https://github.com/korotovsky/slack-mcp-server>)
 as a child process and speaking MCP (newline-delimited JSON-RPC 2.0 over
 its stdin/stdout). The user installs the server; SpeakEasy never installs
-or downloads it. The command resolves from `SLACK_STDIO_COMMAND`, else a
+it. A command taken over from an agent's config runs as configured, so an
+`npx … slack-mcp-server@latest` line can download the package at each
+start; the installer substitutes an installed `slack-mcp-server` when one is
+on PATH. The command resolves from `SLACK_STDIO_COMMAND`, else a
 one-line `<state_dir>/slack_stdio_command` file, else `slack-mcp-server`
 found on PATH (run with `--transport stdio`); when none resolves, startup
 fails with a "not installed" error. Message links use the workspace domain
@@ -244,10 +273,17 @@ credential is a Slack **bot token** (`xoxb-…`, default) or **user token**
 
 - `from_env(state_dir)`: bot token from `SLACK_BOT_TOKEN` else
   `<state_dir>/slack_bot_token`, user token from `SLACK_USER_TOKEN` else
-  `<state_dir>/slack_user_token` (either one suffices; the server's own
-  `SLACK_MCP_XOX*` variables already in the environment are inherited by
-  the child and count as a credential); at least one credential is
-  required, else an error naming both files. The server command (see
+  `<state_dir>/slack_user_token` (either one suffices). The server's own
+  token variables also count — `SLACK_MCP_XOXP_TOKEN`,
+  `SLACK_MCP_XOXB_TOKEN`, or the browser-session pair
+  `SLACK_MCP_XOXC_TOKEN` + `SLACK_MCP_XOXD_TOKEN` (no Slack app) — whether
+  inherited from the environment or listed in `<state_dir>/slack_stdio_env`
+  (`KEY=VALUE` lines, chmod 600, written when the installer takes over a
+  korotovsky server an agent already uses). `new` passes that file's
+  variables to the child, except where the operator's environment sets
+  them. The installer's placeholder tokens (`xoxb-placeholder-…`,
+  `xoxp-placeholder-…`) are ignored, so they never outrank a session. At least one credential is required, else an error naming the
+  files. The server command (see
   above; whitespace-split, no quoting), `SLACK_STDIO_CONTENT_TYPE`
   (`text/plain` default / `text/markdown`), `SLACK_STDIO_TOOL` (pin the
   send tool) and argument renames `SLACK_STDIO_CHANNEL_ARG` /
@@ -352,7 +388,10 @@ with the Slack MCP transport in `src/slack_tools.rs`.
 - `from_env(state_dir)`: key from `MISTRAL_API_KEY`, else
   `<state_dir>/mistral_api_key` (via the shared `read_secret_file`).
   `MISTRAL_API_BASE` (default `https://api.mistral.ai`),
-  `MISTRAL_SLACK_CONNECTOR` (default `slack`), `MISTRAL_SLACK_TOOL` (pin
+  `MISTRAL_SLACK_CONNECTOR` (else a one-line
+  `<state_dir>/mistral_slack_connector` file, written when the installer
+  takes over a connector that isn't named `slack`; default `slack`),
+  `MISTRAL_SLACK_TOOL` (pin
   the send tool), and argument renames `MISTRAL_SLACK_CHANNEL_ARG` /
   `MISTRAL_SLACK_TEXT_ARG` / `MISTRAL_SLACK_THREAD_ARG` (defaults
   `channel` / `text` / `thread_ts`).
@@ -442,6 +481,15 @@ with the Slack MCP transport in `src/slack_tools.rs`.
     - `{"status":"cooldown_blocked","cooldown_remaining_secs":N,"note":"a similar request was denied recently; nothing was sent and no approval prompt was shown"}`
     - `{"status":"error","error":"..."}` (with `result.isError = true`)
     Also include `result.structuredContent` mirroring the same object.
+  - `speakeasy/approve` (not a tool; called by `--hook` processes on the
+    instance socket): params are the `request_slack_message` arguments
+    plus `wait_secs` (1..=86400, required); unknown fields → `-32602`.
+    Optional `share_key` (string) and `cooldown` (bool, default true).
+    Runs `gateway.handle_approval(req, opts, closed)` on a worker
+    thread and answers `{"decision": "approved" | "denied" | "feedback" |
+    "cooldown_blocked" | "already_sent" | "error", …}` with
+    `cooldown_remaining_secs`, `feedback`, `ts`/`permalink` or `error` as
+    applicable. It never sends anything.
   - unknown method → `-32601`; malformed JSON → `-32700` (id null);
     JSON-RPC message not an object / missing id on a request → `-32600`.
 - Concurrency: handle each `tools/call` on a spawned thread; serialize all
@@ -534,6 +582,14 @@ transport with typed Rust calls):
   reported to the UI as an actionable error and the request is *retained*
   so the human can try again — the queue only advances after an accepted
   decision.
+- `GuiDecisionProvider::request_decision_until(request, deadline, cancel)`: like
+  `request_decision`, but at the deadline, or when `cancel` is set (polled
+  every 200 ms), the request is withdrawn (`UiState::withdraw`: removed
+  from the pending map and the outbox, and listed for
+  `UiState::drain_withdrawn`, which the UI drains every pass to drop it
+  from its queue and hide an emptied window). A request whose hook left
+  before it was shown is never queued. A late click is rejected as stale.
+  A decision submitted before the withdrawal wins and is returned.
 - `UiState::hide_if_drained`: hides the window once the queue has drained
   (checked under the bridge lock, so it never races a newly arriving
   request into a hidden window with something pending).
@@ -575,10 +631,111 @@ transport with typed Rust calls):
 | `sys.rs` | macOS integration: NSPasteboard copy, dock/reveal, reduced-motion + on-screen queries |
 | `demo.rs` | `--demo` synthetic fixtures (isolated state dir, mock Slack — never sends) |
 
+### `src/hook.rs` — pre-tool hook mode (`--hook <agent> [--wait SECS]`)
+
+An agent hook runs the binary before a tool call with the agent's hook
+payload on stdin. The mode:
+
+1. Reads the payload (field spellings of every supported agent:
+   `tool_name`/`toolName`/`tool`, `tool_input`/`toolArgs`/`args`/
+   `arguments`/`input` — a JSON string is parsed —, `session_id`, `cwd`,
+   `mcp_server.name`). An unreadable payload is blocked only when it
+   mentions Slack; otherwise the answer is neutral.
+2. Classifies the call. Splits MCP names (`mcp__server__tool`,
+   `mcp_server.tool`, `connector_x.tool`, `server__tool`, `MCP:tool`); a
+   call is a Slack call when its name or server contains `slack` or ends
+   with one of korotovsky's tool names (`conversations_add_message`,
+   `reactions_add`, …). SpeakEasy's own tool on its own server
+   (`slack-approval-gateway` / `slack_approval_gateway`) passes. A Slack
+   call is gated unless it is a read: a write word (send, post, schedule,
+   add, create, update, react, upload, join, mention, ping, …; `sends` →
+   `send`) always gates; otherwise a read verb (read, search, list, get,
+   history, …) passes, and no recognizable verb gates. A fixed list of
+   self-only tools passes (`slack_send_message_draft`, `conversations_mark`,
+   saved items, sign-in, `slack_get_file_upload_url`, `channels_me`).
+   Executor, recognized by its server or by "executor" in the full name
+   (`executor-call`, `mcp_executor_call`), is gated through its `call`
+   (by `path`) and `execute` (the program); goose's `execute_typescript`
+   likewise. Programs are checked after undoing `\u`/`\x` escapes and
+   `'a' + 'b'` joins: a Slack tool that writes, a computed tool name
+   (`tools…[…]`, `globalThis[…]`), `eval(` or `Function(` gates.
+3. Builds the popup request: destination from `channel_id`/`channel`/
+   `user_id`/… , the exact text from `message`/`text`/`payload`/…, a Slack
+   `thread_ts`; other arguments are listed in the reason. The text is shown
+   as the exact message only when it is unambiguous — one text argument, at
+   most one destination and thread argument, no rich content (`blocks`,
+   `attachments`, `sections`); otherwise the message shown is every
+   argument as pretty JSON, and every destination-like value is named.
+4. Sends `speakeasy/approve` with `wait_secs = --wait − 5`, a `share_key`
+   (a hash of the agent's display name, session, tool, arguments and call
+   ID; only with a call ID) and `cooldown: false` when the call names no
+   destination, to the instance at `--state-dir` (else the usual state
+   dir), and maps the answer: `approved` → allow; everything else →
+   deny with a model-facing reason (denied + cooldown, feedback text,
+   cooldown-blocked, already sent, error). No instance → deny.
+5. Answers in the agent's format (`render`; each was checked against the
+   agent's hook runner):
+
+   | Agent | Neutral | Approved | Deny |
+   |---|---|---|---|
+   | Claude Code (also pdev; imported by Cursor) | exit 0, no output | `hookSpecificOutput.permissionDecision: "allow"` | same with `"deny"` + reason, reason on stderr, exit 2 |
+   | Codex | exit 0, no output | neutral (a bare `allow` is a hook failure) | as Claude Code |
+   | Gemini CLI | exit 0, no output | neutral | `{"decision":"deny","reason":…}`, exit 0 |
+   | Copilot CLI | exit 0, no output | `{"permissionDecision":"allow",…}` | `{"permissionDecision":"deny","permissionDecisionReason":…}`, exit 0 |
+   | Cursor | `{}` (empty output is a failure with `failClosed`) | `{"permission":"allow"}` | `{"permission":"deny","user_message":…,"agent_message":…}`, exit 0 |
+   | Mistral Vibe | exit 0, no output | neutral | `{"decision":"deny","reason":…}`, exit 0 (`strict = true`) |
+   | goose, and SpeakEasy's OpenCode / pi / Hermes / Amp plugins | exit 0, no output | neutral | `{"decision":"block","reason":…}`, reason on stderr, exit 2 |
+
+   Approved answers skip the agent's own second prompt where the format
+   allows it; elsewhere the agent's normal permission flow follows.
+
+The `--hook claude` display name follows the environment (`PDEV_VERSION` →
+pdev, `CURSOR_VERSION` → Cursor). goose's Code Mode (`execute_typescript`)
+does not hook the MCP calls a program makes, so for goose the program text
+is checked for Slack writes (`classify_for`); pi, pdev, Vibe and OpenCode
+hook each nested call themselves.
+
+A watchdog thread answers "blocked" when `--wait` seconds pass (default
+600), and one mutex-guarded `answer` makes the first answer final. With
+`--ok-code N` (3..=125) every exit 0 becomes N; the installer's wrapper
+maps N to 0 and anything but N and 2 to a block, so an older binary
+without hook mode (exit 0) fails closed. Every
+agent runs the tool when its hook times out, so the installer registers
+the hook with the agent's timeout set to `--wait` + 60 seconds, through a
+shell wrapper that turns a missing binary or any exit other than 0/2 into
+exit 2 (Cursor: `failClosed`; Vibe: `strict`; the plugins block on any
+failure themselves).
+
+Instance side (`speakeasy/approve`): requests that carry the same
+`share_key` and exact message share one popup and one decision
+(`Gateway::handle_approval` with `ApprovalOptions`; a decision is shared
+while pending and for 30 s after, measured with `Instant`; a panic while
+asking fills the shared slot with an error; a waiting duplicate leaves
+when its own connection closes). `cooldown: false` skips the cooldown
+check and records no deny cooldown. Slack's 40,000-character limit does
+not apply to approvals. A request is withdrawn from the popup when its connection closes
+(the hook was killed or interrupted): `mcp::run` sets a per-connection
+flag at EOF, which `request_decision_until` polls.
+
+`--hook claude --event config-change` is Claude Code's `ConfigChange`
+hook: it blocks (exit 2) a live settings change that sets
+`disableAllHooks` or `env.CLAUDE_CODE_SIMPLE`, or leaves the user settings
+missing, invalid, or without SpeakEasy's `PreToolUse` hook as installed
+(the exact `CLAUDE_MATCHER`, a command that starts with the wrapper and
+runs `--hook claude --wait <its own --wait>`, and a timeout of at least
+that + 60).
+
+In the GUI, a click whose press began before the current card appeared is
+ignored (`ApprovalApp::decide`): a withdrawal can change the front card
+under the pointer. `--cli` mode cannot withdraw a terminal prompt; an
+answer given after the deadline or after the hook left is discarded.
+
 ### `src/main.rs` — run modes, tray, window lifecycle
 
 Wires state dir (`SLACK_GATEWAY_STATE_DIR` or `~/.slack-approval-gateway`),
-Slack client, provider, MCP server, and UI. Three run modes:
+Slack client, provider, MCP server, and UI. `--hook <agent> [--wait
+SECS]` is checked first (see `src/hook.rs`; it answers one agent hook call
+and exits, never becoming the instance or a bridge). Three run modes:
 
 - `--cli`: headless. Becomes the instance (lock + socket), builds the
   gateway with the terminal fallback provider, serves the socket, and runs
@@ -608,9 +765,68 @@ sends real messages.
 - `scripts/install.sh` installs the app into every detected coding agent on
   this Mac and starts the LaunchAgent service (`--dry-run`, `--enforce`,
   `--uninstall`, `--purge`, `--skip-build`, `--slack-mcp-token`,
-  `--transport` (`slack-mcp` | `mistral-connector` | `korotovsky`),
-  `--mistral-api-key`, `--slack-bot-token`, `--slack-user-token`,
-  `--workspace-domain` flags; see README "Install").
+  `--transport` (`slack-mcp` | `mistral-connector` | `korotovsky` |
+  `hooks-only`), `--mistral-api-key`, `--slack-bot-token`,
+  `--slack-user-token`, `--workspace-domain`, `--take-over FILE[:NAME]`,
+  `--no-take-over`, `--no-hooks`, `--hook-wait SECS` flags; see README
+  "Install"). With no credential flag, no `$SLACK_MCP_TOKEN`, no stored
+  credential, no `slack_transport` file and nothing taken over, it selects
+  `hooks-only`: `request_slack_message` is not registered (earlier
+  registrations are removed) and the instruction block becomes "use your
+  own Slack tool; the user approves each call". Step 5b registers the
+  approval hook in every detected agent with hooks
+  (`agent_config.py hook-add AGENT FILE BIN WAIT`; `hook-remove`,
+  `hook-has`): Claude Code `~/.claude/settings.json` (PreToolUse +
+  ConfigChange; pdev reads it too), Codex `config.toml` (+ the
+  `hooks.state` trust entry, `sha256` of the hook identity), Gemini CLI
+  `settings.json` (timeout in ms), Copilot CLI `~/.copilot/hooks/`,
+  Cursor `hooks.json` (`beforeMCPExecution`, `failClosed`), Vibe
+  `hooks.toml` (`strict = true`), goose `~/.agents/plugins/…/hooks.json`
+  (integer timeout), and plugin files for OpenCode, pi, Hermes (enabled in
+  `config.yaml`) and Amp. pi and pdev get `request_slack_message` in their
+  `mcp.json` (`timeout: 86400`; their `settings.json` is not read for MCP).
+  The tool-hook command is a shell wrapper: `[ -x BIN ] || exit 2; BIN
+  --hook A --wait W --state-dir S --ok-code 10; rc=$?; [ $rc -eq 10 ] &&
+  exit 0; …; exit 2` (Cursor runs the binary directly, without
+  `--ok-code`, and relies on `failClosed`; the plugins check the code
+  themselves). The ConfigChange guard's wrapper fails open. TOML hook
+  entries are found by content, never by a comment span (Codex inserts its
+  own tables before a file's trailing comment): Codex's group is the
+  `[[hooks.PreToolUse]]` followed by a `[[hooks.PreToolUse.hooks]]` running
+  `--hook codex`, updated in place (the trust index comes from the file's
+  groups; trust tables are matched by key or by the old group's hash, and
+  removal renumbers the trust keys of later groups); Vibe's entry is the
+  `[[hooks]]` named `speakeasy-slack-approval`. The Hermes
+  `plugins.enabled` edit handles only block style (items at the key's
+  indent or two deeper) and refuses anything else. JSON with comments is
+  refused, not rewritten; JSON is written with non-ASCII text as is.
+  Backups (`.bak-sag`) are taken only while a file holds nothing of
+  SpeakEasy's. `has` ignores lines that belong to a hook. A credential
+  given (or stored) after a hooks-only install switches `slack_transport`
+  to its transport; hooks-only with `--no-hooks` is refused; `--enforce` is
+  skipped in hooks-only mode. Instruction blocks: `gateway` when SpeakEasy
+  can send; hooks-only: `hooks` where the hook was registered, `confirm`
+  ("ask the user in chat first") elsewhere. `CODEX_HOME`, `HERMES_HOME`
+  and `VIBE_HOME` select those agents' hook files. Before choosing a transport it takes over the
+  Slack MCP the user already has: `agent_config.py takeover-candidates`
+  lists the Slack MCP servers in agent configs (Claude Desktop and Cursor
+  included) — a korotovsky stdio server with literal `SLACK_MCP_*` tokens,
+  the official server with a bearer user token, a Mistral Slack connector
+  with a bearer key — and the ones that cannot be taken over (OAuth
+  sessions owned by an agent, Claude Code's Slack plugin); with no stored
+  credential and exactly one importable server (copies of one server in
+  several agents or project scopes share a hashed fingerprint and count
+  once), `agent_config.py take-over` copies its command/env, token, or key
+  and connector name into the state dir (chmod 600; replaced credential
+  files are moved to `*.pre-takeover`) and writes `slack_transport`.
+  `--take-over FILE[:NAME]` reads exactly FILE (any MCP config); same-name
+  entries that differ are `NAME#2`, `NAME#3`. A taken-over
+  `SLACK_MCP_ADD_MESSAGE_TOOL` is kept only when it is a channel-ID
+  allowlist; a docker/podman `run` line gets `-e NAME` for the variables
+  SpeakEasy sets. TOML is read with tomllib, tomli, or pip's vendored copy
+  (macOS's Python 3.9); without one, TOML servers are reported, not offered.
+  `agent_config.py can-enforce FILE` tells the installer whether `--enforce`
+  can edit a takeover source (goose, Zed and Hermes are edited by hand).
   `scripts/agent_config.py` is
   the per-agent config editor it uses (idempotent, `.bak-sag` backups);
   `scripts/test_agent_config.py` tests it. `scripts/slack_mcp_oauth.py`

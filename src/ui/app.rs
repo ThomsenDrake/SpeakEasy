@@ -180,6 +180,12 @@ pub struct ApprovalApp {
     feedback_text: String,
     focus: FocusTracker,
     current_id: Option<String>,
+    /// Input time when the current request became the front card. A click
+    /// whose press started earlier was aimed at a previous card (one that
+    /// was withdrawn under the pointer) and is ignored.
+    front_since: f64,
+    /// Input time of the latest primary pointer press.
+    pressed_at: f64,
     ta_id: Id,
 
     // Animation clock. The clock only advances while the window is actually
@@ -261,6 +267,8 @@ impl ApprovalApp {
             feedback_text: String::new(),
             focus: FocusTracker::default(),
             current_id: None,
+            front_since: 0.0,
+            pressed_at: f64::NEG_INFINITY,
             ta_id: Id::unique("feedback"),
             clock: Instant::now(),
             frozen_now: 0.0,
@@ -383,6 +391,7 @@ impl ApprovalApp {
             ctx.memory_mut(|m| m.surrender_focus(Id::unique("feedback").with(old)));
         }
         self.current_id = current_id;
+        self.front_since = ctx.input(|i| i.time);
         self.feedback_open = false;
         self.feedback_text.clear();
         self.submit_error = false;
@@ -426,6 +435,13 @@ impl ApprovalApp {
         }
     }
 
+    /// Remember when the primary pointer button went down (see `decide`).
+    fn track_press(&mut self, ctx: &Context) {
+        if let Some(t) = ctx.input(|i| i.pointer.primary_pressed().then_some(i.time)) {
+            self.pressed_at = t;
+        }
+    }
+
     /// The human decided. Mirrors the reference's `decide` with the required
     /// correction: the queue advances only after an accepted decision; a
     /// rejected submission retains the request and shows an error.
@@ -434,6 +450,14 @@ impl ApprovalApp {
             return;
         };
         if self.deciding {
+            return;
+        }
+        // A pointer press that began before this card appeared belongs to
+        // the card that was there (withdrawn since): never let it decide
+        // this one.
+        let stale_click =
+            ctx.input(|i| i.pointer.primary_released()) && self.pressed_at < self.front_since;
+        if stale_click {
             return;
         }
         self.deciding = true;
@@ -779,6 +803,7 @@ fn load_icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
 
 impl eframe::App for ApprovalApp {
     fn logic(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        self.track_press(ctx);
         if let Some(rs) = frame.wgpu_render_state() {
             self.effects.set_render_state(rs.clone());
         }
@@ -845,6 +870,20 @@ impl eframe::App for ApprovalApp {
                 self.queue.push_back(req);
             }
             self.reveal(ctx);
+            ctx.request_repaint();
+        }
+
+        // Requests withdrawn after their deadline (an agent hook stopped
+        // waiting): no decision can be made for them any more.
+        let withdrawn = self.state.drain_withdrawn();
+        if !withdrawn.is_empty() {
+            self.queue.retain(|r| !withdrawn.contains(&r.id));
+            // (The reveal hook shows the window without going through
+            // `reveal`, so `window_visible` cannot tell whether it is up.)
+            if self.queue.is_empty() {
+                self.state.hide_if_drained();
+                self.hide(ctx);
+            }
             ctx.request_repaint();
         }
 

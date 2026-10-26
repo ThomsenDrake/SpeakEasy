@@ -10,7 +10,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
+
+try:
+    import tomllib
+except ImportError:  # macOS's /usr/bin/python3 is 3.9: pip vendors tomli
+    from pip._vendor import tomli as tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -740,6 +744,561 @@ check("strip_jsonc: comments and trailing commas",
 check("strip_jsonc: comment-like strings kept",
       json.loads(ac.strip_jsonc('{"a": "http://x // not a comment"}')) == {"a": "http://x // not a comment"})
 
+shutil.rmtree(d, ignore_errors=True)
+
+# ------------------------------------------------------- take over a Slack MCP
+d = tmpdir()
+XOXC, XOXD = "xoxc-1111111111-2222222222-session", "xoxd-cookie%2Bvalue="
+XOXP = "xoxp-1111111111-2222222222-usertoken"
+XOXB = "xoxb-1111111111-2222222222-bottoken"
+MKEY = "mstrl_abcdefghijklmnopqrs"
+cursor = os.path.join(d, ".cursor", "mcp.json")
+write(cursor, json.dumps({"mcpServers": {
+    "slack": {"command": "npx -y slack-mcp-server@latest --transport stdio",
+              "env": {"SLACK_MCP_XOXC_TOKEN": XOXC, "SLACK_MCP_XOXD_TOKEN": XOXD,
+                      "SLACK_MCP_ENABLED_TOOLS": "channels_list",
+                      "SLACK_MCP_USERS_CACHE": "/elsewhere/users.json",
+                      "SLACK_MCP_ADD_MESSAGE_TOOL": "C0ALLOWED"}},
+    "official": {"url": "https://mcp.slack.com/mcp",
+                 "headers": {"Authorization": "Bearer " + XOXP}},
+    "official-oauth": {"type": "http", "url": "https://mcp.slack.com/mcp",
+                       "oauth": {"clientId": "1.2", "callbackPort": 3118}},
+    "mistral-slack": {"url": "https://api.mistral.ai/v1/connectors-gateway/my_slack/mcp",
+                      "headers": {"Authorization": "Bearer " + MKEY}},
+    "mistral-notion": {"url": "https://api.mistral.ai/v1/connectors-gateway/notion/mcp",
+                       "headers": {"Authorization": "Bearer " + MKEY}},
+    "env-ref": {"command": "slack-mcp-server", "args": ["--transport", "stdio"],
+                "env": {"SLACK_MCP_XOXP_TOKEN": "${SLACK_TOKEN}"}},
+    "half-session": {"command": "slack-mcp-server", "env": {"SLACK_MCP_XOXC_TOKEN": XOXC}},
+    "spaced": {"command": "/Applications/My Tools/slack-mcp-server",
+               "env": {"SLACK_MCP_XOXP_TOKEN": XOXP}},
+    "remote": {"url": "http://localhost:13080/sse", "env": {"SLACK_MCP_XOXP_TOKEN": XOXP}},
+    "grafana": {"command": "mcp-grafana"},
+}}))
+codex = os.path.join(d, ".codex", "config.toml")
+write(codex, '[mcp_servers.kslack]\ncommand = "slack-mcp-server"\nargs = ["--transport", "stdio"]\n'
+             '[mcp_servers.kslack.env]\nSLACK_MCP_XOXB_TOKEN = "%s"\n' % XOXB)
+vibe = os.path.join(d, ".vibe", "config.toml")
+write(vibe, '[[mcp_servers]]\nname = "vslack"\ntransport = "stdio"\ncommand = "slack-mcp-server"\n'
+            'args = ["--transport", "stdio"]\n[mcp_servers.env]\nSLACK_MCP_XOXP_TOKEN = "%s"\n' % XOXP)
+goose = os.path.join(d, ".config", "goose", "config.yaml")
+write(goose, "extensions:\n  gslack:\n    enabled: true\n    type: stdio\n    cmd: slack-mcp-server\n"
+             "    args:\n    - --transport\n    - stdio\n    envs:\n      SLACK_MCP_XOXC_TOKEN: \"%s\"\n"
+             "      SLACK_MCP_XOXD_TOKEN: %s\n    timeout: 300\n" % (XOXC, XOXD))
+plugins = os.path.join(d, ".claude", "plugins", "installed_plugins.json")
+write(plugins, json.dumps({"version": 2, "plugins": {"slack@claude-plugins-official": [{}], "other@x": [{}]}}))
+
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    ac.main(["takeover-candidates", cursor, codex, vibe, goose, plugins])
+raw = out.getvalue()
+cands = {(os.path.basename(os.path.dirname(c["file"])) + ":" + c["name"]): c for c in json.loads(raw)}
+def cand(key):
+    return cands.get(key) or {}
+check("takeover: candidate output never contains a raw secret",
+      not any(x in raw for x in (XOXC, XOXD, XOXP, XOXB, MKEY)), raw)
+check("takeover: korotovsky browser session (Cursor one-string command) is importable",
+      cand(".cursor:slack").get("importable") and cand(".cursor:slack").get("transport") == "korotovsky"
+      and "xoxc+xoxd" in cand(".cursor:slack").get("summary", ""), json.dumps(cand(".cursor:slack")))
+check("takeover: official server with a bearer user token is importable",
+      cand(".cursor:official").get("importable") and cand(".cursor:official").get("transport") == "slack-mcp")
+check("takeover: official server signed in with OAuth is not",
+      cand(".cursor:official-oauth").get("importable") is False and "OAuth" in cand(".cursor:official-oauth").get("reason", ""))
+check("takeover: Mistral Slack connector with a key is importable",
+      cand(".cursor:mistral-slack").get("importable") and cand(".cursor:mistral-slack").get("transport") == "mistral-connector")
+check("takeover: a non-Slack Mistral connector and other servers are ignored",
+      ".cursor:mistral-notion" not in cands and ".cursor:grafana" not in cands, sorted(cands))
+check("takeover: a token from an env reference is not importable",
+      cand(".cursor:env-ref").get("importable") is False and "literal" in cand(".cursor:env-ref").get("reason", ""))
+check("takeover: xoxc without xoxd is not importable", cand(".cursor:half-session").get("importable") is False)
+check("takeover: a command with a space is not importable",
+      cand(".cursor:spaced").get("importable") is False and "space" in cand(".cursor:spaced").get("reason", ""))
+check("takeover: a remote (HTTP/SSE) korotovsky server is not importable",
+      cand(".cursor:remote").get("importable") is False, json.dumps(cand(".cursor:remote")))
+check("takeover: codex TOML [mcp_servers.NAME] with env subtable",
+      cand(".codex:kslack").get("importable") and "xoxb" in cand(".codex:kslack").get("summary", ""))
+check("takeover: vibe TOML [[mcp_servers]] element with env subtable",
+      cand(".vibe:vslack").get("importable") and "xoxp" in cand(".vibe:vslack").get("summary", ""))
+check("takeover: goose YAML block list args and envs map",
+      cand("goose:gslack").get("importable") and "xoxc+xoxd" in cand("goose:gslack").get("summary", ""),
+      json.dumps(cand("goose:gslack")))
+check("takeover: Claude Code's Slack plugin is reported, not importable",
+      cand("plugins:slack@claude-plugins-official").get("importable") is False
+      and "plugins:other@x" not in cands)
+
+state = os.path.join(d, "state")
+os.makedirs(state)
+write(os.path.join(state, "slack_bot_token"), "xoxb-placeholder-get-a-real-token\n")
+write(os.path.join(state, "slack_user_token"), "xoxp-old-real-token-123\n")
+bindir = os.path.join(d, "bin")
+write(os.path.join(bindir, "slack-mcp-server"), "#!/bin/sh\nexit 0\n")
+os.chmod(os.path.join(bindir, "slack-mcp-server"), 0o755)
+old_path = os.environ.get("PATH", "")
+os.environ["PATH"] = bindir + os.pathsep + old_path
+try:
+    lines = ac.take_over(state, cursor, "slack")
+finally:
+    os.environ["PATH"] = old_path
+printed = "\n".join(lines)
+check("take-over: printed lines never contain a raw secret",
+      not any(x in printed for x in (XOXC, XOXD)), printed)
+check("take-over: korotovsky selects its transport",
+      open(os.path.join(state, "slack_transport")).read().strip() == "korotovsky")
+cmdline = open(os.path.join(state, "slack_stdio_command")).read().strip()
+check("take-over: npx line becomes the installed server (no download)",
+      cmdline == os.path.join(bindir, "slack-mcp-server") + " --transport stdio", cmdline)
+envtext = open(os.path.join(state, "slack_stdio_env")).read()
+check("take-over: session tokens copied verbatim",
+      ("SLACK_MCP_XOXC_TOKEN=" + XOXC) in envtext and ("SLACK_MCP_XOXD_TOKEN=" + XOXD) in envtext, envtext)
+check("take-over: the agent's own settings are kept (send allowlist)",
+      "SLACK_MCP_ADD_MESSAGE_TOOL=C0ALLOWED" in envtext)
+check("take-over: SpeakEasy-controlled settings are dropped (tool list, caches)",
+      "SLACK_MCP_ENABLED_TOOLS" not in envtext and "SLACK_MCP_USERS_CACHE" not in envtext, envtext)
+check("take-over: credential files are private (0600)",
+      all(os.stat(os.path.join(state, f)).st_mode & 0o077 == 0 for f in ("slack_stdio_env", "slack_stdio_command")))
+check("take-over: a placeholder token is deleted",
+      not os.path.exists(os.path.join(state, "slack_bot_token")))
+check("take-over: a real token it replaces is moved aside, not lost",
+      not os.path.exists(os.path.join(state, "slack_user_token"))
+      and open(os.path.join(state, "slack_user_token.pre-takeover")).read().strip() == "xoxp-old-real-token-123")
+
+os.environ["PATH"] = "/usr/bin:/bin"
+try:
+    ac.take_over(state, cursor, "slack")
+finally:
+    os.environ["PATH"] = old_path
+check("take-over: without an installed server the agent's own command is kept",
+      open(os.path.join(state, "slack_stdio_command")).read().split()[1:3] == ["-y", "slack-mcp-server@latest"],
+      open(os.path.join(state, "slack_stdio_command")).read())
+
+ac.take_over(state, cursor, "official")
+check("take-over: official token -> slack_mcp_token, transport slack-mcp",
+      open(os.path.join(state, "slack_mcp_token")).read().strip() == XOXP
+      and open(os.path.join(state, "slack_transport")).read().strip() == "slack-mcp"
+      and os.stat(os.path.join(state, "slack_mcp_token")).st_mode & 0o077 == 0)
+ac.take_over(state, cursor, "mistral-slack")
+check("take-over: Mistral key and a non-default connector name",
+      open(os.path.join(state, "mistral_api_key")).read().strip() == MKEY
+      and open(os.path.join(state, "mistral_slack_connector")).read().strip() == "my_slack"
+      and open(os.path.join(state, "slack_transport")).read().strip() == "mistral-connector")
+for name, needle in (("official-oauth", "OAuth"), ("env-ref", "literal"), ("nope", "no Slack MCP server")):
+    try:
+        ac.take_over(state, cursor, name)
+        refused = ""
+    except SystemExit as e:
+        refused = str(e)
+    check("take-over: refuses %s" % name, needle in refused, refused)
+ac.take_over(state, goose, "gslack")
+check("take-over: goose YAML session copied",
+      ("SLACK_MCP_XOXC_TOKEN=" + XOXC) in open(os.path.join(state, "slack_stdio_env")).read())
+# goose/hermes write block-list items at the key's own indent
+goose2 = os.path.join(d, "g2", ".config", "goose", "config.yaml")
+write(goose2, "extensions:\n  gslack:\n    cmd: npx\n    args:\n    - -y\n    - slack-mcp-server@latest\n"
+              "    - --transport\n    - stdio\n    envs:\n      SLACK_MCP_XOXP_TOKEN: %s\n" % XOXP)
+st2 = os.path.join(d, "state-g2")
+os.environ["PATH"] = "/usr/bin:/bin"
+try:
+    ac.take_over(st2, goose2, "gslack")
+finally:
+    os.environ["PATH"] = old_path
+check("take-over: goose same-indent list args are kept",
+      open(os.path.join(st2, "slack_stdio_command")).read().split()[1:] ==
+      ["-y", "slack-mcp-server@latest", "--transport", "stdio"],
+      open(os.path.join(st2, "slack_stdio_command")).read())
+
+# the same server in several Claude Code project scopes
+claude = os.path.join(d, "cc", ".claude.json")
+same = {"command": "slack-mcp-server", "args": ["--transport", "stdio"], "env": {"SLACK_MCP_XOXP_TOKEN": XOXP}}
+other = {"command": "slack-mcp-server", "args": ["--transport", "stdio"], "env": {"SLACK_MCP_XOXB_TOKEN": XOXB}}
+write(claude, json.dumps({"mcpServers": {"slack": same},
+                          "projects": {"/a": {"mcpServers": {"slack": same}},
+                                       "/b": {"mcpServers": {"slack": other}}}}))
+cc = [c for c in ac.takeover_candidates([claude])]
+check("takeover: identical same-name copies collapse; a different one is NAME#2",
+      [c["name"] for c in cc] == ["slack", "slack#2"], [c["name"] for c in cc])
+st3 = os.path.join(d, "state-cc")
+ac.take_over(st3, claude, "slack#2")
+check("take-over: NAME#2 picks the second distinct entry",
+      "SLACK_MCP_XOXB_TOKEN=" + XOXB in open(os.path.join(st3, "slack_stdio_env")).read())
+desktop = os.path.join(d, "cd", "Library", "Application Support", "Claude", "claude_desktop_config.json")
+write(desktop, json.dumps({"mcpServers": {"slack": same}}))
+fps = {c["fingerprint"] for c in ac.takeover_candidates([claude, desktop]) if c["name"] == "slack"}
+check("takeover: the same server in two configs shares a fingerprint", len(fps) == 1, fps)
+
+# send policy from the agent's config
+pol = os.path.join(d, "pol", ".cursor", "mcp.json")
+write(pol, json.dumps({"mcpServers": {
+    "deny": {"command": "slack-mcp-server", "env": {"SLACK_MCP_XOXP_TOKEN": XOXP, "SLACK_MCP_ADD_MESSAGE_TOOL": "false"}},
+    "allow": {"command": "slack-mcp-server", "env": {"SLACK_MCP_XOXP_TOKEN": XOXP, "SLACK_MCP_ADD_MESSAGE_TOOL": "C0123ABCD,!C0999XYZW"}},
+    "bad env": {"command": "slack-mcp-server", "env": {"SLACK_MCP_XOXP_TOKEN": XOXP, "NOT-A-NAME": "x"}},
+    "docker": {"command": "docker", "args": ["run", "-i", "--rm", "-e", "SLACK_MCP_XOXC_TOKEN", "-e", "SLACK_MCP_XOXD_TOKEN",
+                                              "ghcr.io/korotovsky/slack-mcp-server", "--transport", "stdio"],
+               "env": {"SLACK_MCP_XOXC_TOKEN": XOXC, "SLACK_MCP_XOXD_TOKEN": XOXD}},
+    "runner-only": {"command": "npx", "env": {"SLACK_MCP_XOXP_TOKEN": XOXP}},
+    "official-envref": {"url": "https://mcp.slack.com/mcp", "headers": {"Authorization": "Bearer ${SLACK_TOKEN}"}},
+}}))
+stp = os.path.join(d, "state-pol")
+lines = ac.take_over(stp, pol, "deny")
+check("take-over: a deny-all SLACK_MCP_ADD_MESSAGE_TOOL is dropped (and said so)",
+      "SLACK_MCP_ADD_MESSAGE_TOOL" not in open(os.path.join(stp, "slack_stdio_env")).read()
+      and any("ignored SLACK_MCP_ADD_MESSAGE_TOOL" in l for l in lines), lines)
+lines = ac.take_over(stp, pol, "allow")
+check("take-over: a channel allowlist is kept (and said so)",
+      "SLACK_MCP_ADD_MESSAGE_TOOL=C0123ABCD,!C0999XYZW" in open(os.path.join(stp, "slack_stdio_env")).read()
+      and any("kept SLACK_MCP_ADD_MESSAGE_TOOL" in l for l in lines))
+ac.take_over(stp, pol, "bad env")
+check("take-over: env names that are not variable names are skipped",
+      "NOT-A-NAME" not in open(os.path.join(stp, "slack_stdio_env")).read())
+ac.take_over(stp, pol, "docker")
+dcmd = open(os.path.join(stp, "slack_stdio_command")).read().split()
+check("take-over: a docker run line forwards SpeakEasy's settings into the container",
+      dcmd[2:6] == ["-e", "SLACK_MCP_ADD_MESSAGE_TOOL", "-e", "SLACK_MCP_LOG_LEVEL"]
+      and dcmd.count("SLACK_MCP_XOXC_TOKEN") == 1, dcmd)
+pc = {c["name"]: c for c in ac.takeover_candidates([pol])}
+check("takeover: a bare package runner is not importable",
+      pc["runner-only"]["importable"] is False and "no package" in pc["runner-only"]["reason"])
+check("takeover: an official token from an env reference says so",
+      pc["official-envref"]["importable"] is False and "environment variable" in pc["official-envref"]["reason"])
+
+# TOML without any TOML parser: reported, not silently skipped
+real_loader = ac._toml_loader
+ac._toml_loader = lambda: None
+try:
+    tc = ac.takeover_candidates([codex])
+finally:
+    ac._toml_loader = real_loader
+check("takeover: TOML without a parser is reported with the reason",
+      len(tc) == 1 and tc[0]["importable"] is False and "Python 3.11" in tc[0]["reason"], tc)
+
+check("can-enforce: goose, Zed and Hermes configs are edited by hand",
+      ac.enforce_style(goose) is None and ac.enforce_style(os.path.join(d, ".config", "zed", "settings.json")) is None
+      and ac.enforce_style(os.path.join(d, ".hermes", "config.yaml")) is None)
+check("can-enforce: Cursor, Claude Desktop, Codex, Vibe",
+      ac.enforce_style(cursor) == "gemini" and ac.enforce_style(desktop) == "gemini"
+      and ac.enforce_style(codex) == "codex" and ac.enforce_style(vibe) == "vibe")
+check("enforce style: a home dir containing 'amp' is not mistaken for Amp",
+      ac.enforce_style("/Users/sampson/.config/zed/settings.json") is None
+      and ac.enforce_style("/Users/x/.config/amp/settings.json") == "amp")
+# references an agent resolves at runtime are not tokens
+oc = os.path.join(d, "oc", ".config", "opencode", "opencode.json")
+write(oc, json.dumps({"mcp": {
+    "kslack": {"command": ["slack-mcp-server", "--transport", "stdio"],
+               "environment": {"SLACK_MCP_XOXP_TOKEN": "{env:SLACK_USER_TOKEN}"}},
+    "mslack": {"url": "https://api.mistral.ai/v1/connectors-gateway/slack/mcp",
+               "headers": {"Authorization": "Bearer {env:MISTRAL_API_KEY}"}},
+    "badshape": {"command": ["slack-mcp-server"], "environment": {"SLACK_MCP_XOXP_TOKEN": "not-a-token"}}}}))
+occ = {c["name"]: c for c in ac.takeover_candidates([oc])}
+check("takeover: OpenCode {env:VAR} references are not taken as tokens",
+      occ["kslack"]["importable"] is False and occ["mslack"]["importable"] is False, occ)
+check("takeover: a value without a token prefix is not a token", occ["badshape"]["importable"] is False)
+
+# VS Code keeps servers under a top-level "servers" key
+vsc = os.path.join(d, "proj", ".vscode", "mcp.json")
+write(vsc, json.dumps({"servers": {"slack": {"type": "stdio", "command": "slack-mcp-server",
+                                             "args": ["--transport", "stdio"],
+                                             "env": {"SLACK_MCP_XOXP_TOKEN": XOXP}}}, "inputs": []}))
+check("takeover: VS Code mcp.json (servers key) is read",
+      [c["name"] for c in ac.takeover_candidates([vsc]) if c["importable"]] == ["slack"])
+
+# a non-Slack server with the same name does not shift NAME#N
+cc2 = os.path.join(d, "cc2", ".claude.json")
+write(cc2, json.dumps({"projects": {
+    "/a": {"mcpServers": {"slack": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-slack"]}}},
+    "/b": {"mcpServers": {"slack": {"command": "slack-mcp-server", "env": {"SLACK_MCP_XOXP_TOKEN": XOXP}}}},
+    "/c": {"mcpServers": {"slack": {"command": "slack-mcp-server", "env": {"SLACK_MCP_XOXB_TOKEN": XOXB}}}}}}))
+names2 = [c["name"] for c in ac.takeover_candidates([cc2]) if c["importable"]]
+st4 = os.path.join(d, "state-cc2")
+ac.take_over(st4, cc2, "slack#2")
+env4 = open(os.path.join(st4, "slack_stdio_env")).read()
+ac.take_over(st4, cc2, names2[0])
+env5 = open(os.path.join(st4, "slack_stdio_env")).read()
+check("take-over: NAME#N picks the entry the candidate list named",
+      names2 == ["slack", "slack#2"] and ("SLACK_MCP_XOXB_TOKEN=" + XOXB) in env4
+      and ("SLACK_MCP_XOXP_TOKEN=" + XOXP) in env5, (names2, env4, env5))
+
+# YAML inline comments are not part of a value
+hermes = os.path.join(d, "hm", ".hermes", "config.yaml")
+write(hermes, "mcp_servers:\n  hslack:\n    command: slack-mcp-server  # installed with npm\n"
+              "    args: [\"--transport\", \"stdio\"]  # stdio mode\n    env:\n"
+              "      SLACK_MCP_XOXP_TOKEN: \"%s\"  # my user token\n" % XOXP)
+st6 = os.path.join(d, "state-hm")
+ac.take_over(st6, hermes, "hslack")
+check("take-over: YAML inline comments are dropped from values",
+      ("SLACK_MCP_XOXP_TOKEN=" + XOXP + "\n") in open(os.path.join(st6, "slack_stdio_env")).read()
+      and open(os.path.join(st6, "slack_stdio_command")).read().strip().endswith("slack-mcp-server --transport stdio"),
+      open(os.path.join(st6, "slack_stdio_env")).read() + open(os.path.join(st6, "slack_stdio_command")).read())
+
+# codex reads an official server's bearer token from the environment
+cx2 = os.path.join(d, "cx2", ".codex", "config.toml")
+write(cx2, '[mcp_servers.slack]\nurl = "https://mcp.slack.com/mcp"\nbearer_token_env_var = "SLACK_TOKEN"\n')
+cxc = ac.takeover_candidates([cx2])
+check("takeover: codex bearer_token_env_var is reported as an environment variable",
+      cxc and cxc[0]["importable"] is False and "environment variable" in cxc[0]["reason"], cxc)
+check("enforce: Cursor and Claude Desktop configs use the mcpServers style",
+      ac.enforce_remove(cursor, "official", None) == "removed"
+      and "official" not in json.load(open(cursor))["mcpServers"])
+shutil.rmtree(d, ignore_errors=True)
+
+# --------------------------------------------------------------- approval hooks
+d = tmpdir()
+HB = "/Users/test/.local/bin/slack-approval-gateway"
+SD = "/Users/test/.slack-approval-gateway"
+q = contextlib.redirect_stderr(io.StringIO())
+
+# claude: other hooks survive; ours is replaced in place, then removed
+cl = os.path.join(d, ".claude", "settings.json")
+write(cl, json.dumps({"model": "opus", "hooks": {"PreToolUse": [
+    {"matcher": "Artifact", "hooks": [{"type": "command", "command": "/x/other.sh"}]}]}}))
+ac.hook_add("claude", cl, HB, "600", SD)
+ac.hook_add("claude", cl, HB, "300", SD)
+data = json.load(open(cl))
+pre = data["hooks"]["PreToolUse"]
+ours = [g for g in pre if any(ac.is_hook_command(h.get("command")) for h in g["hooks"])]
+check("hooks/claude: other PreToolUse hooks kept", pre[0]["matcher"] == "Artifact", pre)
+check("hooks/claude: re-adding replaces ours (one entry)", len(ours) == 1, pre)
+check("hooks/claude: timeout = wait + margin", ours[0]["hooks"][0]["timeout"] == 360, ours)
+check("hooks/claude: --wait, --state-dir and --ok-code in the command",
+      "--hook claude --wait 300 --state-dir %s --ok-code 10" % SD in ours[0]["hooks"][0]["command"], ours)
+check("hooks/claude: the matcher equals src/hook.rs's copy (ConfigChange guard)",
+      ('"%s";' % ac.CLAUDE_MATCHER) in open(os.path.join(ROOT, "src", "hook.rs")).read())
+check("hooks/claude: ConfigChange guard registered",
+      any("--event config-change" in h["command"] for g in data["hooks"]["ConfigChange"] for h in g["hooks"]))
+check("hooks/claude: has", ac.hook_has("claude", cl))
+check("hooks/claude: remove", ac.hook_remove("claude", cl) == "removed")
+data = json.load(open(cl))
+check("hooks/claude: only ours removed", data == {"model": "opus", "hooks": {"PreToolUse": [
+    {"matcher": "Artifact", "hooks": [{"type": "command", "command": "/x/other.sh"}]}]}}, data)
+check("hooks/claude: remove again is absent", ac.hook_remove("claude", cl) == "absent")
+check("hooks/claude: missing file is absent", ac.hook_remove("claude", os.path.join(d, "nope.json")) == "absent")
+
+# the matchers select Slack tools in every agent's naming scheme
+import re as _re
+for matcher, anchored, yes, no in (
+    (ac.CLAUDE_MATCHER, True, ["mcp__plugin_slack_slack__slack_send_message", "mcp__claude_ai_Slack__x",
+                               "mcp__ws__conversations_add_message", "mcp__executor__call"],
+     ["mcp__github__create_issue", "Bash"]),
+    (ac.CODEX_MATCHER, False, ["mcp__slack__slack_send_message"], ["mcp__github__x"]),
+    (ac.GEMINI_MATCHER, False, ["mcp_slack_slack_send_message", "mcp_ws_conversations_add_message"], ["mcp_github_x", "run_shell_command"]),
+    (ac.COPILOT_MATCHER, True, ["slack-slack_send_message", "ws-reactions_add"], ["github-create_issue", "bash"]),
+):
+    test = (lambda m, n: _re.fullmatch(m, n)) if anchored else (lambda m, n: _re.search(m, n))
+    check("hooks: matcher %s selects Slack tools" % matcher, all(test(matcher, n) for n in yes) and not any(test(matcher, n) for n in no))
+
+# codex: trust entry with the verified hash formula, block replaced in place
+cx = os.path.join(d, ".codex", "config.toml")
+write(cx, 'model = "gpt"\n\n[[hooks.PreToolUse]]\nmatcher = "Bash"\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "/x/b.sh"\n\n[hooks.state]\n')
+ac.hook_add("codex", cx, HB, "600", SD)
+ac.hook_add("codex", cx, HB, "600", SD)
+parsed = tomllib.loads(open(cx).read())
+groups = parsed["hooks"]["PreToolUse"]
+check("hooks/codex: other group kept, ours appended once", len(groups) == 2 and groups[0]["matcher"] == "Bash", groups)
+key = "%s:pre_tool_use:1:0" % os.path.realpath(cx)
+cmd = groups[1]["hooks"][0]["command"]
+check("hooks/codex: trust entry for our group (index 1)",
+      parsed["hooks"]["state"].get(key, {}).get("trusted_hash") == ac._codex_hash(cmd, ac.CODEX_MATCHER, 660),
+      list(parsed["hooks"]["state"]))
+check("hooks/codex: remove restores the file", ac.hook_remove("codex", cx) == "removed"
+      and "slack-approval-gateway" not in open(cx).read() and 'matcher = "Bash"' in open(cx).read())
+
+# codex: tables Codex itself writes after SpeakEasy's survive re-adding and
+# removing (they used to land inside a marked span and get deleted)
+cx3 = os.path.join(d, "cx3", ".codex", "config.toml")
+write(cx3, 'model = "gpt"\n')
+ac.hook_add("codex", cx3, HB, "600", SD)
+with open(cx3, "a") as f:
+    f.write('\n[mcp_servers.other]\ncommand = "x"\n\n[features]\nfoo = true\n')
+ac.hook_add("codex", cx3, HB, "300", SD)
+ac.hook_remove("codex", cx3)
+parsed = tomllib.loads(open(cx3).read())
+check("hooks/codex: the user's later tables survive re-add and removal",
+      parsed.get("mcp_servers", {}).get("other") == {"command": "x"} and parsed.get("features") == {"foo": True}
+      and "hooks" not in parsed, open(cx3).read())
+# old marker-wrapped installs: the markers go, the user's tables inside stay
+cx4 = os.path.join(d, "cx4", ".codex", "config.toml")
+write(cx4, ac.CODEX_HOOK_BEGIN + '\n[mcp_servers.inside]\ncommand = "y"\n' + ac.CODEX_HOOK_END + "\n")
+ac.hook_remove("codex", cx4)
+check("hooks/codex: legacy markers are dropped, enclosed user tables kept",
+      tomllib.loads(open(cx4).read()) == {"mcp_servers": {"inside": {"command": "y"}}}, open(cx4).read())
+# a commented user group header still counts for the trust index
+cx5 = os.path.join(d, "cx5", ".codex", "config.toml")
+write(cx5, '[[hooks.PreToolUse]]  # mine\nmatcher = "Bash"\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "/x"\n')
+ac.hook_add("codex", cx5, HB, "600", SD)
+keys = list(tomllib.loads(open(cx5).read())["hooks"]["state"])
+check("hooks/codex: a commented group header counts (our group is index 1)",
+      all(k.endswith(":pre_tool_use:1:0") for k in keys) and keys, keys)
+# removing SpeakEasy's group renumbers the trust of groups after it
+cx6 = os.path.join(d, "cx6", ".codex", "config.toml")
+write(cx6, "")
+ac.hook_add("codex", cx6, HB, "600", SD)
+real6 = os.path.realpath(cx6)
+with open(cx6, "a") as f:
+    f.write('\n[[hooks.PreToolUse]]\nmatcher = "Edit"\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "/y"\n'
+            '\n[hooks.state."%s:pre_tool_use:1:0"]\ntrusted_hash = "sha256:user"\n' % real6)
+ac.hook_add("codex", cx6, HB, "300", SD)
+st = tomllib.loads(open(cx6).read())["hooks"]["state"]
+check("hooks/codex: re-adding keeps our group in place (the user's trust stays at 1)",
+      st.get("%s:pre_tool_use:1:0" % real6) == {"trusted_hash": "sha256:user"}, st)
+ac.hook_remove("codex", cx6)
+st = tomllib.loads(open(cx6).read())["hooks"]["state"]
+check("hooks/codex: after removal the user's group trust moves to index 0",
+      st == {"%s:pre_tool_use:0:0" % real6: {"trusted_hash": "sha256:user"}}, st)
+
+# vibe: updated in place by name; a table Vibe/Superset added after it stays
+vb2 = os.path.join(d, "vb2", ".vibe", "hooks.toml")
+write(vb2, "")
+ac.hook_add("vibe", vb2, HB, "600", SD)
+with open(vb2, "a") as f:
+    f.write('\n[[hooks]]\nname = "later"\ntype = "post_agent"\ncommand = "/z"\n')
+ac.hook_add("vibe", vb2, HB, "300", SD)
+names = [h["name"] for h in tomllib.loads(open(vb2).read())["hooks"]]
+check("hooks/vibe: in place, the later entry kept", names == ["speakeasy-slack-approval", "later"], names)
+ac.hook_remove("vibe", vb2)
+check("hooks/vibe: removal keeps the later entry",
+      [h["name"] for h in tomllib.loads(open(vb2).read())["hooks"]] == ["later"])
+
+# hermes: YAML it can't rewrite safely is refused, untouched
+for name, text in (("flow", "plugins:\n  enabled: [a, b]\n"), ("flowmap", "plugins: {enabled: [a]}\n"),
+                   ("indent", "plugins:\n    enabled:\n      - a\n")):
+    hy = os.path.join(d, "hy-" + name, ".hermes", "config.yaml")
+    write(hy, text)
+    try:
+        ac.hook_add("hermes", hy, HB, "600", SD)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("hooks/hermes: %s YAML is refused and left as it was" % name,
+          refused and open(hy).read() == text and not ac.hook_has("hermes", hy))
+hy2 = os.path.join(d, "hy2", ".hermes", "config.yaml")
+write(hy2, "plugins:\n  enabled:\n  - a\n  disabled: []\n")
+ac.hook_add("hermes", hy2, HB, "600", SD)
+check("hooks/hermes: items at the key's own indent are kept in that style",
+      "  enabled:\n  - a\n  - speakeasy\n  disabled: []" in open(hy2).read(), open(hy2).read())
+
+# JSON with comments is not rewritten
+jc = os.path.join(d, "jc", ".gemini", "settings.json")
+write(jc, '{\n  // mine\n  "a": 1\n}\n')
+try:
+    ac.hook_add("gemini", jc, HB, "600", SD)
+    refused = False
+except SystemExit:
+    refused = True
+check("hooks: a JSON file with comments is refused and left as it was", refused and "// mine" in open(jc).read())
+# non-ASCII survives; no backup of SpeakEasy's own version
+na = os.path.join(d, "na", ".gemini", "settings.json")
+write(na, '{"title": "été"}')
+ac.hook_add("gemini", na, HB, "600", SD)
+ac.hook_add("gemini", na, HB, "300", SD)
+check("hooks: non-ASCII text is written as is", "été" in open(na).read())
+check("hooks: the backup is the user's original", "slack-approval-gateway" not in open(na + ac.BAK).read())
+fresh = os.path.join(d, "fresh", ".gemini", "settings.json")
+ac.hook_add("gemini", fresh, HB, "600", SD)
+ac.hook_add("gemini", fresh, HB, "300", SD)
+check("hooks: a file SpeakEasy created gets no backup of its own version", not os.path.exists(fresh + ac.BAK))
+# a hook mentioning SpeakEasy is not an MCP registration
+check("has: a hook alone is not a registration", not ac.has_entry(fresh))
+ac.add_json("gemini", fresh, HB)
+check("has: the MCP entry is", ac.has_entry(fresh))
+# the ConfigChange guard lets changes through when the binary is gone
+r = subprocess.run(["sh", "-c", ac.config_change_command("/nonexistent/slack-approval-gateway", 600, SD)],
+                   input="{}", capture_output=True, text=True)
+check("hooks/claude: the ConfigChange guard fails open without the binary", r.returncode == 0, r)
+
+# gemini: milliseconds; cursor: no matcher, failClosed, other hooks kept
+ge = os.path.join(d, ".gemini", "settings.json")
+ac.hook_add("gemini", ge, HB, "600", SD)
+bt = json.load(open(ge))["hooks"]["BeforeTool"][0]
+check("hooks/gemini: timeout in milliseconds", bt["hooks"][0]["timeout"] == 660000, bt)
+cu = os.path.join(d, ".cursor", "hooks.json")
+write(cu, json.dumps({"version": 1, "hooks": {"beforeMCPExecution": [{"command": "/x/superset.sh Permission"}]}}))
+ac.hook_add("cursor", cu, HB, "600", SD)
+bm = json.load(open(cu))["hooks"]["beforeMCPExecution"]
+check("hooks/cursor: failClosed, no matcher, other hook kept",
+      len(bm) == 2 and bm[1]["failClosed"] is True and "matcher" not in bm[1] and bm[1]["timeout"] == 660, bm)
+ac.hook_remove("cursor", cu)
+check("hooks/cursor: remove keeps the other hook", json.load(open(cu)) == {"version": 1, "hooks": {"beforeMCPExecution": [{"command": "/x/superset.sh Permission"}]}})
+
+# goose: integer timeout (a float makes goose skip the file)
+go = os.path.join(d, ".agents", "plugins", "speakeasy-slack-approval", "hooks", "hooks.json")
+ac.hook_add("goose", go, HB, "600", SD)
+gh = json.load(open(go))["hooks"]["PreToolUse"][0]
+check("hooks/goose: integer timeout", isinstance(gh["hooks"][0]["timeout"], int), gh)
+check("hooks/goose: Code Mode in the matcher", "execute_typescript" in gh["matcher"])
+check("hooks/goose: remove deletes the plugin", ac.hook_remove("goose", go) == "removed"
+      and not os.path.exists(os.path.dirname(os.path.dirname(go))))
+
+# vibe: a managed [[hooks]] block, strict, parsed; Superset's hook kept
+vb = os.path.join(d, ".vibe", "hooks.toml")
+write(vb, '[[hooks]]\nname = "superset-notify"\ntype = "pre_tool"\ncommand = "/x/n.sh"\n')
+ac.hook_add("vibe", vb, HB, "600", SD)
+ac.hook_add("vibe", vb, HB, "600", SD)
+hooks = tomllib.loads(open(vb).read())["hooks"]
+check("hooks/vibe: ours once, strict, float timeout, other kept",
+      len(hooks) == 2 and hooks[1]["strict"] is True and hooks[1]["timeout"] == 660.0 and hooks[0]["name"] == "superset-notify", hooks)
+check("hooks/vibe: remove", ac.hook_remove("vibe", vb) == "removed" and len(tomllib.loads(open(vb).read())["hooks"]) == 1)
+
+# hermes: plugin + plugins.enabled entry, other plugins kept
+hc = os.path.join(d, ".hermes", "config.yaml")
+write(hc, "model: x\nplugins:\n  enabled:\n    - other-plugin\n  disabled: []\nmcp_servers: {}\n")
+ac.hook_add("hermes", hc, HB, "600", SD)
+ac.hook_add("hermes", hc, HB, "600", SD)
+text = open(hc).read()
+check("hooks/hermes: enabled once, other plugin kept",
+      text.count("- speakeasy") == 1 and "- other-plugin" in text and "mcp_servers: {}" in text, text)
+init = os.path.join(d, ".hermes", "plugins", "speakeasy", "__init__.py")
+check("hooks/hermes: plugin written with the binary", HB in open(init).read())
+check("hooks/hermes: has", ac.hook_has("hermes", hc))
+ac.hook_remove("hermes", hc)
+check("hooks/hermes: remove", "speakeasy" not in open(hc).read() and not os.path.exists(init), open(hc).read())
+hc2 = os.path.join(d, "h2", ".hermes", "config.yaml")
+write(hc2, "model: x\n")
+ac.hook_add("hermes", hc2, HB, "600", SD)
+check("hooks/hermes: plugins section created", "plugins:\n  enabled:\n    - speakeasy" in open(hc2).read(), open(hc2).read())
+hc3 = os.path.join(d, "h3", ".hermes", "config.yaml")
+write(hc3, "plugins:\n  enabled: []\n")
+ac.hook_add("hermes", hc3, HB, "600", SD)
+check("hooks/hermes: inline empty list expanded", "  enabled:\n    - speakeasy" in open(hc3).read(), open(hc3).read())
+
+# single-file plugins: copilot, amp, opencode, pi
+for agent, rel in (("copilot", ".copilot/hooks/speakeasy.json"), ("amp", ".config/amp/plugins/speakeasy.ts"),
+                   ("opencode", ".config/opencode/plugins/speakeasy-slack-approval.js"),
+                   ("pi", ".pi/agent/extensions/speakeasy-slack-gate.ts")):
+    f = os.path.join(d, rel)
+    ac.hook_add(agent, f, HB, "600", SD)
+    check("hooks/%s: written with the binary and wait" % agent, HB in open(f).read() and "600" in open(f).read())
+    check("hooks/%s: has" % agent, ac.hook_has(agent, f))
+    check("hooks/%s: remove" % agent, ac.hook_remove(agent, f) == "removed" and not os.path.exists(f))
+mine = os.path.join(d, ".copilot", "hooks", "theirs.json")
+write(mine, "{}")
+check("hooks: a file that is not ours is left alone", ac.hook_remove("copilot", mine) == "not ours (left alone)" and os.path.exists(mine))
+
+# the shell wrapper fails closed: a missing binary, a crash, and exit 0 from
+# an older binary without hook mode all block; the "proceed" code passes
+for bin_path, needle, rc in (("/nonexistent/slack-approval-gateway", "not installed", 2),
+                             ("/usr/bin/false", "hook failed (exit 1)", 2),
+                             ("/usr/bin/true", "hook failed (exit 0)", 2)):
+    cmd = ac.hook_command(bin_path, "claude", 60, SD)
+    r = subprocess.run(["sh", "-c", cmd], input="{}", capture_output=True, text=True)
+    check("hooks: wrapper blocks (exit 2) when the binary is %s" % bin_path, r.returncode == rc and needle in r.stderr, r)
+fake = os.path.join(d, "fake-gateway")
+write(fake, "#!/bin/sh\ncat >/dev/null; echo '{\"ok\":1}'; exit 10\n")
+os.chmod(fake, 0o755)
+r = subprocess.run(["sh", "-c", ac.hook_command(fake, "claude", 60, SD)], input="{}", capture_output=True, text=True)
+check("hooks: wrapper turns the proceed code into exit 0 and keeps stdout", r.returncode == 0 and '"ok"' in r.stdout, r)
+cu2 = os.path.join(d, "c2", ".cursor", "hooks.json")
+ac.hook_add("cursor", cu2, "/Apps/My Tools/slack-approval-gateway", "600", SD)
+cmd = json.load(open(cu2))["hooks"]["beforeMCPExecution"][0]["command"]
+check("hooks/cursor: the binary path is quoted and there is no --ok-code",
+      cmd.startswith("'/Apps/My Tools/slack-approval-gateway' --hook cursor") and "--ok-code" not in cmd, cmd)
+
+# instruction variants
+ins = os.path.join(d, "AGENTS.md")
+ac.instruction_add(ins, "hooks")
+check("instructions: hooks variant", "every message needs the user's approval" in open(ins).read())
+ac.instruction_add(ins)
+check("instructions: switching back replaces the block", "request_slack_message" in open(ins).read()
+      and "every message needs" not in open(ins).read())
+ac.instruction_add(ins, "confirm")
+check("instructions: confirm variant", "ask the user before sending" in open(ins).read())
 shutil.rmtree(d, ignore_errors=True)
 
 print()

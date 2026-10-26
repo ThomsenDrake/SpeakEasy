@@ -1,4 +1,5 @@
 pub mod core;
+pub mod hook;
 pub mod instance;
 pub mod mcp;
 pub mod mistral_slack;

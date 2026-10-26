@@ -157,6 +157,8 @@ def main():
                 for key in (
                     "SLACK_MCP_XOXB_TOKEN",
                     "SLACK_MCP_XOXP_TOKEN",
+                    "SLACK_MCP_XOXC_TOKEN",
+                    "SLACK_MCP_XOXD_TOKEN",
                     "SLACK_MCP_ADD_MESSAGE_TOOL",
                     "SLACK_MCP_LOG_LEVEL",
                     "SLACK_MCP_USERS_CACHE",

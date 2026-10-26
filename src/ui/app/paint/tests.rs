@@ -485,3 +485,55 @@ fn badge_mounts_with_the_count_then_springs_between_counts() {
     assert_eq!(app.badge.display(4.0), "1");
 }
 
+
+/// A press that began on a card that was withdrawn under the pointer must
+/// not decide the card that took its place.
+#[test]
+fn a_click_pressed_on_a_withdrawn_card_does_not_decide_the_next() {
+    use egui::{Event, Modifiers, PointerButton, Pos2, RawInput};
+    let state = Arc::new(UiState::new());
+    let mut app = ApprovalApp::new(
+        Arc::clone(&state),
+        Arc::new(Mutex::new(None)),
+        Theme::Light,
+        false,
+        false,
+        super::super::DemoFlags::default(),
+    );
+    // B is pending in the bridge, waiting for a decision.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let b = demo::DemoSeed::Single.requests().remove(0);
+    state.enqueue(b.id.clone(), tx, b.clone()).unwrap();
+    app.queue.push_back(state.drain_outbox().remove(0));
+
+    let ctx = egui::Context::default();
+    let p = Pos2::new(10.0, 10.0);
+    let frame = |time: f64, pressed: bool, app: &mut ApprovalApp, decide: bool| {
+        let input = RawInput {
+            time: Some(time),
+            events: vec![
+                Event::PointerMoved(p),
+                Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE },
+            ],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            app.track_press(ui.ctx());
+            if decide {
+                app.decide(ui.ctx(), Decision::Approve);
+            }
+        });
+        out.textures_delta.clear();
+    };
+    frame(1.0, true, &mut app, false);
+    // The previous card was withdrawn at t=1.5; B became the front card.
+    app.front_since = 1.5;
+    frame(2.0, false, &mut app, true);
+    assert!(rx.try_recv().is_err(), "the stale click must not approve B");
+    assert_eq!(app.queue.len(), 1);
+
+    // A fresh click on B decides it.
+    frame(3.0, true, &mut app, false);
+    frame(3.1, false, &mut app, true);
+    assert!(matches!(rx.try_recv(), Ok(Ok(Decision::Approve))));
+}
