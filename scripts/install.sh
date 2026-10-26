@@ -4,7 +4,7 @@
 # service.
 #
 # What it does:
-#   1. Builds the app (frontend + release binary).
+#   1. Builds the app (the release binary; the UI is pure Rust).
 #   2. Installs the binary to ~/.local/bin/slack-approval-gateway.
 #   3. Sets up the state dir, the Slack transport selection, and the
 #      credential files (chmod 600). The gateway is the only component
@@ -273,31 +273,22 @@ fi
 hr
 say "1. Build"
 hr
-# cargo and npm are only required when a build actually runs: not for
-# --uninstall (which exits above), not for --skip-build, not for --dry-run.
+# cargo is only required when a build actually runs: not for --uninstall
+# (which exits above), not for --skip-build, not for --dry-run.
 if [ "$SKIP_BUILD" = 0 ] && [ "$DRY_RUN" = 0 ]; then
-  for tool in cargo npm; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      say "missing required tool: $tool (needed to build; or pass --skip-build" >&2
-      say "to reuse the existing release binary)" >&2
-      exit 1
-    fi
-  done
+  if ! command -v cargo >/dev/null 2>&1; then
+    say "missing required tool: cargo (needed to build; or pass --skip-build" >&2
+    say "to reuse the existing release binary)" >&2
+    exit 1
+  fi
 fi
 if [ "$SKIP_BUILD" = 1 ]; then
   say "  skipping build (--skip-build)"
 else
   if [ "$DRY_RUN" = 0 ]; then
-    if [ ! -d "$ROOT/ui/node_modules" ]; then
-      say "  npm install (ui/)"
-      (cd "$ROOT/ui" && npm install --no-audit --no-fund)
-    fi
-    say "  npm run build (ui/)"
-    (cd "$ROOT/ui" && npm run build)
     say "  cargo build --release"
     (cd "$ROOT" && cargo build --release)
   else
-    say "  [dry-run] cd ui && npm install && npm run build"
     say "  [dry-run] cargo build --release"
   fi
 fi

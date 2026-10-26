@@ -15,12 +15,63 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# custom-protocol: serve the embedded frontend (ui/dist) from
-# tauri://localhost in every build instead of expecting a dev server.
-# tray-icon: menu-bar icon with Show/Quit (the gateway must keep running
-# when its window is hidden; the tray is how the human reopens/quits it).
-tauri = { version = "2", features = ["custom-protocol", "tray-icon"] }
 ureq = { version = "3", features = ["json"] }
+# Native desktop UI (no browser engine): egui/eframe with the wgpu renderer.
+# The approval popup is rendered entirely in Rust (see src/ui.rs and src/ui/).
+# - `accesskit` exposes the UI to assistive technology.
+# - `system_fonts` lets fontique resolve system fonts for scripts SF Pro
+#   does not cover (CJK, …).
+# - `wgpu` selects the wgpu renderer (Metal on macOS).
+# - `default_fonts` bundles egui's fallback fonts so non-macOS builds (and
+#   headless tests) render text; on macOS the app installs SF Pro / SF Mono
+#   itself to match the reference (src/ui/text.rs).
+# - `clipboard` is deliberately off (its arboard dependency cannot be
+#   resolved in the build environment); the app bridges the macOS
+#   NSPasteboard itself (src/ui/sys.rs).
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "system_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+egui = "0.37"
+# Direct winit dependency so the full default feature set (x11, wayland,
+# wayland-dlopen, …) is enabled for Linux builds; eframe's own `x11`/`wayland`
+# features cover the rest.
+winit = "0.30"
+# `color_fonts` renders color emoji (Apple Color Emoji) via vello_cpu.
+epaint = { version = "0.37", features = ["color_fonts"] }
+# Small PNG decoder for the bundled window/tray icon.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
-[build-dependencies]
-tauri-build = "2"
+[target.'cfg(target_os = "macos")'.dependencies]
+# Menu-bar tray icon with Show/Quit (the gateway must keep running when its
+# window is hidden; the tray is how the human reopens/quits it).
+# default-features off: the Linux backends (libappindicator/gtk, libxdo) are
+# not used; the tray is macOS-only in this app.
+tray-icon = { version = "0.25", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "std",
+    "NSApplication",
+    "NSPasteboard",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSNotification",
+    "NSObject",
+    "NSOperation",
+    "NSString",
+    "NSValue",
+    "block2",
+] }
+block2 = "0.6"
+# Raw CoreFoundation bindings: the user's "reduce motion" preference and
+# locale-aware time formatting (CFDateFormatter medium style, matching the
+# reference's `toLocaleTimeString()`).
+core-foundation-sys = "0.8"

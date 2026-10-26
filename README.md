@@ -43,7 +43,7 @@ posts exactly that text to exactly that place, once.
 
 Closing the window doesn't approve or deny anything. It only hides the
 window, and the request keeps waiting. To bring it back, click SpeakEasy's
-menu-bar icon or its Dock icon.
+menu-bar icon.
 
 All your agents share one SpeakEasy. Requests from every agent queue in the
 same window, and the header shows how many are waiting.
@@ -55,7 +55,7 @@ MCP server, and state folder keep an older name, `slack-approval-gateway`.
 
 **Requirements:** macOS with the Xcode Command Line Tools
 (`xcode-select --install`), Rust (stable, via [rustup](https://rustup.rs)),
-Node.js 20 or newer with npm, and Python 3.
+and Python 3.
 
 ### 1. Get the code
 
@@ -200,8 +200,8 @@ delete that line from its history afterwards.
 
 The installer:
 
-1. Builds the window UI and the app, and installs the binary to
-   `~/.local/bin/slack-approval-gateway`.
+1. Builds the app (the window UI is pure Rust — no Node/npm step), and
+   installs the binary to `~/.local/bin/slack-approval-gateway`.
 2. Creates `~/.slack-approval-gateway/` (mode 700) and stores the credential
    there (mode 600). With `--transport`, it also saves your choice in
    `slack_transport`. SpeakEasy doesn't copy the credential anywhere else.
@@ -235,7 +235,7 @@ token the helper saved is kept.
 | `--slack-bot-token xoxb-…`, `--slack-user-token xoxp-…` | Store a Slack token (Korotovsky server). |
 | `--workspace-domain DOMAIN` | Your workspace's subdomain (`acme` for `acme.slack.com`). The Korotovsky server uses it to build message links; the other transports get links from Slack. |
 | `--enforce` | Also remove token-based Slack MCP servers from agent configs. See [Security](#what-the-installers-audit-reports). |
-| `--dry-run` | Show what would change, and change nothing. It doesn't build, so it needs an existing `target/release` binary: run `cd ui && npm install && npm run build && cd .. && cargo build --release` first. |
+| `--dry-run` | Show what would change, and change nothing. It doesn't build, so it needs an existing `target/release` binary: run `cargo build --release` first. |
 | `--skip-build` | Use the existing `target/release` binary. |
 | `--uninstall [--purge]` | See [Uninstall](#uninstall). |
 
@@ -629,7 +629,6 @@ already set them.
 ## Development
 
 ```sh
-cd ui && npm install && npm run build && cd ..   # the binary embeds the UI: build it first, and after UI changes
 cargo build                                      # add --release for the installer's build
 cargo test                                       # all tests except one slow one
 cargo test --test slack_mcp_test -- --ignored    # the slow one: a 30-second timeout
@@ -638,21 +637,29 @@ python3 scripts/smoke_test.py                    # end to end against target/deb
 scripts/install.sh --dry-run                     # preview an install; needs a release build (cargo build --release)
 ```
 
-To work on the window without the app, run `cd ui && npm run dev` and open
-<http://localhost:5173/?demo>, which loads a sample request. Add
-`&theme=light` for the light theme.
+To look at the window without the app, run it in demo mode — synthetic
+fixtures, isolated from your credentials and state, never sending:
+
+```sh
+SLACK_GATEWAY_DEMO_SEED=single ./target/debug/slack-approval-gateway --demo
+# seeds: empty | single | single_cooldown | cooldown | multi | long | unresolved
+# env: SLACK_GATEWAY_THEME=light|dark, SLACK_GATEWAY_DEMO_SIZE=WxH,
+#      SLACK_GATEWAY_REDUCE_MOTION=1, SLACK_GATEWAY_DEMO_STICKY_DECIDING=1,
+#      SLACK_GATEWAY_DEMO_FAIL_SUBMIT=1
+```
 
 | Path | What's there |
 |---|---|
 | `src/core.rs` | The decision flow: validation, deny blocks, duplicate detection |
 | `src/mcp.rs` | The MCP server and the `request_slack_message` tool |
 | `src/instance.rs` | One running SpeakEasy per user: lock, socket, relays |
-| `src/main.rs`, `src/ui.rs` | Startup, run modes, the window, the menu-bar icon |
+| `src/main.rs`, `src/ui.rs` | Startup, run modes, and the bridge between agents' requests and the window |
+| `src/ui/` | The approval window and the menu-bar icon: a native egui/eframe + wgpu UI (no browser engine, no webview) |
 | `src/slack.rs` | Transport selection and shared credential helpers |
 | `src/slack_mcp.rs`, `src/mistral_slack.rs` | The Slack MCP and Mistral connector transports |
 | `src/slack_stdio.rs` | The Korotovsky transport (runs your `slack-mcp-server` over stdio) |
 | `src/slack_tools.rs` | Send-tool discovery and reply parsing, shared by the transports |
-| `ui/` | The window (React, Tailwind, Once UI) |
+| `NOTICE.md` | Upstream license notices (Once UI, Lucide, Heroicons, …) |
 | `scripts/install.sh`, `scripts/agent_config.py` | The installer and its agent-config editor |
 | `scripts/slack_mcp_oauth.py` | The OAuth helper for the Slack MCP token |
 | `tests/`, `scripts/smoke_test.py`, `scripts/mock_korotovsky.py` | Tests and mocks |
