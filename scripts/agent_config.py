@@ -3,9 +3,10 @@
 Gateway stdio server.
 
 Every file is backed up once to `<file>.bak-sag` before the first
-modification (the backup is the pre-install original; `--uninstall` restores
-it). All operations are idempotent: adding an already-registered server
-updates the entry in place, and a `--dry-run` prints what would change.
+modification (the backup is the pre-install original; it is kept for a
+manual restore — removals never overwrite a file with it). All operations
+are idempotent: adding an already-registered server updates the entry in
+place, and a `--dry-run` prints what would change.
 
 Subcommands:
   add-json STYLE FILE CMD     register in a JSON config. STYLE is one of:
@@ -22,16 +23,42 @@ Subcommands:
   add-hermes FILE CMD         ~/.hermes/config.yaml mcp_servers (YAML)
   add-codex FILE CMD          ~/.codex/config.toml [mcp_servers.NAME] (fallback
                               when the `codex mcp add` CLI is unavailable)
-  remove-json STYLE FILE      unregister (restores the .bak-sag backup when
-                              present, else removes the entry)
-  remove-zed|remove-goose|remove-hermes|remove-codex FILE
-                              unregister from a non-JSON config
-  remove-entry STYLE FILE NAME
+  add-vibe FILE CMD           ~/.vibe/config.toml [[mcp_servers]] element
+                              (Mistral Vibe's array style; fallback when the
+                              `vibe mcp add` CLI is unavailable)
+  remove-json STYLE FILE      unregister (removes only the gateway's own
+                              entry; the .bak-sag backup is kept, never
+                              restored over the file)
+  remove-zed|remove-goose|remove-hermes|remove-codex|remove-vibe FILE
+                              unregister from a non-JSON config (removes only
+                              the gateway's own entry/block; backup kept)
+  remove-entry STYLE FILE NAME [KEYS]
                               remove an arbitrary server entry (used by
-                              install.sh --enforce to drop direct Slack servers)
+                              install.sh --enforce to drop direct Slack
+                              servers). KEYS is a JSON list of keys locating
+                              a nested servers container — e.g. claude's
+                              projects.<path>.mcpServers — instead of the
+                              style's top-level parent key
   remove-codex-entry FILE NAME
                               remove a [mcp_servers.NAME] table from a TOML
-                              config (used by install.sh --enforce)
+                              config (codex style; used by --enforce)
+  remove-vibe-entry FILE NAME
+                              remove one [[mcp_servers]] element (matched by
+                              its name = "..."), its [mcp_servers.KEY]
+                              subtables included, from a TOML config (vibe
+                              style; used by --enforce)
+  set-timeout FILE NAME SECONDS
+                              give the entry a long tool-call timeout —
+                              tool_timeout_sec in a [mcp_servers.NAME] table or
+                              a [[mcp_servers]] element (codex/vibe TOML), the
+                              timeout: line in a goose YAML extensions block.
+                              A request_slack_message call blocks on a human
+                              approval for minutes
+  enforce-remove PAIR_JSON    remove one direct Slack server found by the
+                              audit. PAIR_JSON is the [file, name, key] entry
+                              as reported by audit. Prints an accurate status
+                              line: [removed], [absent], [failed], or
+                              [edit by hand]
   instruction-add FILE        insert/replace the managed "use the gateway"
                               instruction block in an agent instruction file
   instruction-remove FILE     remove the managed instruction block
@@ -43,7 +70,12 @@ Subcommands:
                               read Slack context through them), direct
                               (token-based) Slack MCP servers and other
                               agent-side Slack paths (violations), and
-                              Slack/Mistral credentials found in the files
+                              Slack/Mistral credentials found in the files.
+                              Server entries are {"name": ..., "key": [...]}
+                              where key is the JSON path of the servers
+                              container (nested per-project entries
+                              included), the YAML parent key, or [] for TOML
+                              tables.
 """
 
 import json
@@ -224,32 +256,58 @@ def add_json(style, path, cmd):
 
 
 def remove_json(style, path):
-    if os.path.exists(path + BAK):
-        shutil.copy2(path + BAK, path)
-        return "restored backup"
-    keypath, _ = JSON_STYLES[style]
+    """Uninstall path: remove only the gateway's own entries — the top-level
+    one and any nested ones (e.g. claude per-project projects.<path>.mcpServers).
+    The .bak-sag backup (the pre-install original) is kept for a manual
+    restore; the file is never overwritten with it, so changes made after
+    the install survive."""
     data = load_json(path)
     if not isinstance(data, dict):
         return "absent"
-    container, key = parent_of(data, keypath)
-    servers = container.get(key)
-    if not isinstance(servers, dict) or SERVER not in servers:
+    removed = False
+
+    def sweep(obj):
+        nonlocal removed
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in MCP_PARENT_KEYS and isinstance(v, dict) and SERVER in v:
+                    del v[SERVER]
+                    removed = True
+                sweep(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                sweep(v)
+
+    sweep(data)
+    if not removed:
         return "absent"
-    del servers[SERVER]
+    backup(path)
     dump_json(path, data)
     return "removed"
 
 
-def remove_entry(style, path, name):
+def remove_entry(style, path, name, keys=None):
     """Remove an arbitrary server entry (install.sh --enforce uses this to
-    drop direct Slack servers from agent configs)."""
+    drop direct Slack servers from agent configs). With KEYS (a list of
+    JSON keys), the servers container is that nested path — e.g. claude's
+    per-project projects.<path>.mcpServers — instead of the style's
+    top-level parent key."""
     backup(path)
     keypath, _ = JSON_STYLES[style]
     data = load_json(path)
     if not isinstance(data, dict):
         return "absent"
-    container, key = parent_of(data, keypath)
-    servers = container.get(key)
+    if keys:
+        container = data
+        for k in keys[:-1]:
+            nxt = container.get(k) if isinstance(container, dict) else None
+            if not isinstance(nxt, dict):
+                return "absent"
+            container = nxt
+        key = keys[-1]
+    else:
+        container, key = parent_of(data, keypath)
+    servers = container.get(key) if isinstance(container, dict) else None
     if not isinstance(servers, dict) or name not in servers:
         return "absent"
     del servers[name]
@@ -263,6 +321,81 @@ def remove_entry(style, path, name):
 
 def zed_entry(cmd):
     return '"%s": {"command": {"path": %s, "args": []}}' % (SERVER, json.dumps(cmd))
+
+
+def _scan_string(text, i):
+    """End (exclusive) of the JSON string whose opening quote is at i."""
+    i += 1
+    esc = False
+    while i < len(text):
+        c = text[i]
+        if esc:
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif c == '"':
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _skip_comment(text, i):
+    """End (exclusive) of the // or /* */ comment at i, or i if there is none."""
+    if text[i : i + 2] == "//":
+        j = text.find("\n", i)
+        return len(text) if j < 0 else j
+    if text[i : i + 2] == "/*":
+        j = text.find("*/", i + 2)
+        return len(text) if j < 0 else j + 2
+    return i
+
+
+def _skip_ws(text, i):
+    while i < len(text) and text[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _skip_ws_comments(text, i):
+    while True:
+        j = _skip_ws(text, i)
+        k = _skip_comment(text, j)
+        if k == j:
+            return j
+        i = k
+
+
+def _scan_json(text, i):
+    """End (exclusive) of the JSON value starting at i: balanced brackets,
+    with strings and comments respected (a bracket inside either does not
+    count)."""
+    n = len(text)
+    i = _skip_ws_comments(text, i)
+    if i < n and text[i] in "{[":
+        depth = 0
+        while i < n:
+            c = text[i]
+            if c == '"':
+                i = _scan_string(text, i)
+                continue
+            if c == "/":
+                j = _skip_comment(text, i)
+                if j != i:
+                    i = j
+                    continue
+            if c in "{[":
+                depth += 1
+            elif c in "}]":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return n
+    if i < n and text[i] == '"':
+        return _scan_string(text, i)
+    while i < n and text[i] not in ",}]\n":
+        i += 1
+    return i
 
 
 def add_zed(path, cmd):
@@ -295,19 +428,45 @@ def add_zed(path, cmd):
 
 
 def remove_zed(path):
-    if os.path.exists(path + BAK):
-        shutil.copy2(path + BAK, path)
-        return "restored backup"
+    """Text splice, the inverse of add_zed: remove only the gateway's
+    context_servers entry — key, value, and one adjoining comma. Every
+    other byte of the JSONC file (comments, other entries, formatting)
+    is kept."""
     text = read(path)
     if text is None or SERVER not in text:
         return "absent"
-    data = json.loads(strip_jsonc(text))
-    servers = data.get("context_servers")
-    if isinstance(servers, dict) and SERVER in servers:
-        del servers[SERVER]
-        dump_json(path, data)
-        return "removed"
-    return "absent"
+    m = re.search(r'"context_servers"\s*:\s*\{', text)
+    if not m:
+        return "absent"
+    obj_start = m.end() - 1
+    obj_end = _scan_json(text, obj_start) - 1  # the matching "}"
+    km = re.compile(r'"%s"\s*:' % re.escape(SERVER)).search(text, obj_start + 1, obj_end)
+    if not km:
+        return "absent"
+    key_start = km.start()
+    value_end = _scan_json(text, km.end())
+    after = _skip_ws_comments(text, value_end)
+    if (
+        after < obj_end
+        and text[after] == ","
+        and _skip_ws(text, after + 1) < obj_end
+    ):
+        # another entry follows ours: drop our comma and the whitespace up
+        # to that entry with it (comments in between are kept)
+        cut = (key_start, _skip_ws(text, after + 1))
+    else:
+        # our entry is the last one: drop the comma in front of it, if any
+        before = key_start
+        while before > obj_start + 1 and text[before - 1] in " \t\r\n":
+            before -= 1
+        if before > obj_start + 1 and text[before - 1] == ",":
+            cut = (before - 1, value_end)
+        else:
+            # the only entry in the object: drop the whitespace around it
+            cut = (before, _skip_ws_comments(text, value_end))
+    backup(path)
+    write(path, text[: cut[0]] + text[cut[1]:])
+    return "removed"
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +480,8 @@ def add_goose(path, cmd):
     if re.search(r"^  %s:" % re.escape(SERVER), text, re.M):
         return "already"
     backup(path)
+    # timeout is seconds and goose cancels the call when it expires; a
+    # request_slack_message call blocks on a human approval for minutes
     block = (
         "  %s:\n"
         "    enabled: true\n"
@@ -328,7 +489,7 @@ def add_goose(path, cmd):
         "    cmd: %s\n"
         "    args: []\n"
         "    envs: {}\n"
-        "    timeout: 120" % (SERVER, json.dumps(cmd))
+        "    timeout: 86400" % (SERVER, json.dumps(cmd))
     )
     m = re.search(r"^extensions:\s*$", text, re.M)
     if m:
@@ -339,6 +500,47 @@ def add_goose(path, cmd):
         text += "extensions:\n" + block + "\n"
     write(path, text)
     return "added"
+
+
+def set_goose_timeout(path, name, seconds):
+    """Set the timeout: line in the gateway's goose YAML block (the
+    `  name:` entry under extensions:), adding it after the block's last
+    key if it is missing. Only that line changes; the rest of the file —
+    comments, other extensions — is kept byte-for-byte."""
+    text = read(path)
+    if text is None:
+        return "absent"
+    m = re.search(r"^  %s:[^\n]*\n((?:    .*\n|\n)*)" % re.escape(name), text, re.M)
+    if not m:
+        return "absent"
+    # the block must live under extensions: (goose's MCP servers key)
+    parent = None
+    for line in text[: m.start()].splitlines():
+        pm = re.match(r"^([A-Za-z0-9_.-]+)\s*:", line)
+        if pm:
+            parent = pm.group(1)
+    if parent != "extensions":
+        return "absent"
+    block = m.group(1)
+    tm = re.search(r"^([ \t]+)timeout:[^\n]*\n?", block, re.M)
+    if tm:
+        had_nl = block[tm.end() - 1] == "\n"
+        repl = "%stimeout: %d" % (tm.group(1), seconds) + ("\n" if had_nl else "")
+        block = block[: tm.start()] + repl + block[tm.end():]
+        result = "updated"
+    else:
+        block_lines = block.splitlines(keepends=True)
+        insert_at = len(block_lines)
+        for i in range(len(block_lines) - 1, -1, -1):
+            if block_lines[i].strip():
+                insert_at = i + 1
+                break
+        block_lines.insert(insert_at, "    timeout: %d\n" % seconds)
+        block = "".join(block_lines)
+        result = "added"
+    backup(path)
+    write(path, text[: m.start(1)] + block + text[m.end(1):])
+    return result
 
 
 def add_hermes(path, cmd):
@@ -366,9 +568,6 @@ def add_hermes(path, cmd):
 
 
 def _remove_yaml_block(path, header_re, name):
-    if os.path.exists(path + BAK):
-        shutil.copy2(path + BAK, path)
-        return "restored backup"
     text = read(path)
     if text is None:
         return "absent"
@@ -378,6 +577,7 @@ def _remove_yaml_block(path, header_re, name):
     if not m:
         return "absent"
     text = text[: m.start()] + text[m.end():]
+    backup(path)
     write(path, text)
     return "removed"
 
@@ -403,16 +603,39 @@ def add_codex(path, cmd):
     backup(path)
     if text and not text.endswith("\n"):
         text += "\n"
-    text += '\n[mcp_servers.%s]\ncommand = %s\nargs = []\n' % (SERVER, json.dumps(cmd))
+    # tool_timeout_sec: a request_slack_message call blocks on a human
+    # approval for minutes; codex's default per-tool timeout is 60s
+    text += (
+        '\n[mcp_servers.%s]\ncommand = %s\nargs = []\ntool_timeout_sec = 86400\n'
+        % (SERVER, json.dumps(cmd))
+    )
     write(path, text)
     return "added"
 
 
 def remove_codex(path):
-    if os.path.exists(path + BAK):
-        shutil.copy2(path + BAK, path)
-        return "restored backup"
     return remove_codex_entry(path, SERVER)
+
+
+def _cut_lines(lines, start, end):
+    """Remove lines[start:end], keeping comment/blank lines that follow the
+    region's last key line: our writers append at EOF, so a comment after
+    the last key of a removed table/element is the user's, not ours."""
+    region = lines[start:end]
+    last = len(region)
+    while last > 0 and (
+        not region[last - 1].strip() or region[last - 1].lstrip().startswith("#")
+    ):
+        last -= 1
+    head = "".join(lines[:start])
+    kept = "".join(region[last:])
+    tail = "".join(lines[end:])
+    new = head + kept + tail
+    # the removal can leave runs of blank lines where the entry was
+    new = re.sub(r"\n{3,}", "\n\n", new)
+    if not (kept + tail).strip():
+        new = new.rstrip("\n") + "\n" if new.strip() else ""
+    return new
 
 
 def remove_codex_entry(path, name):
@@ -422,18 +645,194 @@ def remove_codex_entry(path, name):
     text = read(path)
     if text is None:
         return "absent"
-    # The table runs from its header line to the next line that starts a new
-    # table header (`[` at column 0); value lines like `args = [...]` do not
-    # start with `[`. Subtables ([mcp_servers.NAME.env]) are consumed too.
-    pattern = (
-        r"\n?(?:\[mcp_servers\.%s(?:\.[^\]\n]*)?\]\n(?:(?!\[)[^\n]*\n?)*)+" % re.escape(name)
-    )
-    m = re.search(pattern, text)
-    if not m:
+    lines = text.splitlines(keepends=True)
+    tables = _toml_tables(text)
+    # the [mcp_servers.NAME] table plus its [mcp_servers.NAME.*] subtables,
+    # which directly follow it
+    header_re = re.compile(r"^\[mcp_servers\.%s\][ \t]*$" % re.escape(name))
+    sub_re = re.compile(r"^\[mcp_servers\.%s\.[^\]\n]+\][ \t]*$" % re.escape(name))
+    start = None
+    end = None
+    for i, t in enumerate(tables):
+        if header_re.match(t["header"].strip()):
+            start = i
+            end = i + 1
+            while end < len(tables) and sub_re.match(tables[end]["header"].strip()):
+                end += 1
+            break
+    if start is None:
         return "absent"
     backup(path)
-    write(path, text[: m.start()] + "\n" + text[m.end():])
+    write(path, _cut_lines(lines, tables[start]["start"], tables[end - 1]["end"]))
     return "removed"
+
+
+# --------------------------------------------------------------------------- #
+# Mistral Vibe (TOML array tables)
+#
+# Vibe stores MCP servers as [[mcp_servers]] array elements carrying
+# name = "..."; a [mcp_servers.KEY] table that follows an element (e.g.
+# [mcp_servers.env]) is a sub-table of that element, not a server.
+# --------------------------------------------------------------------------- #
+
+# a tool call can block on a human approval for minutes; vibe's default
+# tool_timeout_sec is 60s
+TOOL_TIMEOUT_SEC = 86400
+
+_VIBE_ARRAY_RE = re.compile(r"^\[\[mcp_servers\]\][ \t]*$")
+_VIBE_SUB_RE = re.compile(r"^\[mcp_servers\.[A-Za-z0-9_.-]+\][ \t]*$")
+_VIBE_NAME_RE = re.compile(r'^\s*name\s*=\s*"([^"]+)"', re.M)
+
+
+def _toml_tables(text):
+    """Split a TOML file into top-level table chunks. A chunk runs from its
+    column-0 header line ([table] or [[array]]) to the next column-0 header
+    (or EOF): {"header", "start", "end", "body"} — start/end are line
+    indexes into text.splitlines(keepends=True); body excludes the header
+    line and the text of the chunk is header + body."""
+    lines = text.splitlines(keepends=True)
+    tables = []
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith("["):
+            if start is not None:
+                tables.append((start, i))
+            start = i
+    if start is not None:
+        tables.append((start, len(lines)))
+    return [
+        {
+            "header": lines[s],
+            "start": s,
+            "end": e,
+            "body": "".join(lines[s + 1 : e]),
+        }
+        for s, e in tables
+    ]
+
+
+def _vibe_element_name(table):
+    """The name = "..." of a [[mcp_servers]] element, or None."""
+    m = _VIBE_NAME_RE.search(table["body"])
+    return m.group(1) if m else None
+
+
+def add_vibe(path, cmd):
+    """Append a [[mcp_servers]] element (Mistral Vibe's array style)."""
+    text = read(path)
+    if text is None:
+        text = ""
+    for t in _toml_tables(text):
+        if _VIBE_ARRAY_RE.match(t["header"]) and _vibe_element_name(t) == SERVER:
+            return "already"
+    backup(path)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text.strip():
+        text += "\n"
+    text += (
+        "[[mcp_servers]]\n"
+        'name = "%s"\n'
+        'command = %s\n'
+        "args = []\n"
+        "tool_timeout_sec = %d\n" % (SERVER, json.dumps(cmd), TOOL_TIMEOUT_SEC)
+    )
+    write(path, text)
+    return "added"
+
+
+def remove_vibe_entry(path, name):
+    """Remove one [[mcp_servers]] element (matched by its name = "<name>")
+    and the [mcp_servers.KEY] subtables that belong to it. install.sh
+    --enforce uses this to drop direct Slack servers from vibe configs;
+    --uninstall uses it for the gateway's own element."""
+    text = read(path)
+    if text is None:
+        return "absent"
+    lines = text.splitlines(keepends=True)
+    tables = _toml_tables(text)
+    target = None
+    for i, t in enumerate(tables):
+        if _VIBE_ARRAY_RE.match(t["header"]) and _vibe_element_name(t) == name:
+            target = i
+            break
+    if target is None:
+        return "absent"
+    # The element's region runs to the next header that is not one of its
+    # [mcp_servers.KEY] subtables (the next [[mcp_servers]] element or any
+    # other table).
+    end = len(tables)
+    for j in range(target + 1, len(tables)):
+        if not _VIBE_SUB_RE.match(tables[j]["header"]):
+            end = j
+            break
+    region_end = tables[end]["start"] if end < len(tables) else len(lines)
+    backup(path)
+    write(path, _cut_lines(lines, tables[target]["start"], region_end))
+    return "removed"
+
+
+def remove_vibe(path):
+    return remove_vibe_entry(path, SERVER)
+
+
+def _set_toml_key(body_lines, key, value):
+    """Set key = value in a table body (a list of lines). Returns
+    (new_lines, existed)."""
+    pat = re.compile(r"^%s\s*=" % re.escape(key))
+    for i, line in enumerate(body_lines):
+        if pat.match(line):
+            body_lines[i] = "%s = %s\n" % (key, value)
+            return body_lines, True
+    insert_at = len(body_lines)
+    for i in range(len(body_lines) - 1, -1, -1):
+        if body_lines[i].strip():
+            insert_at = i + 1
+            break
+    body_lines.insert(insert_at, "%s = %s\n" % (key, value))
+    return body_lines, False
+
+
+def set_toml_timeout(path, name, seconds):
+    """Set tool_timeout_sec = seconds in the [mcp_servers.NAME] table
+    (codex style) or the [[mcp_servers]] element named NAME (vibe style)."""
+    text = read(path)
+    if text is None:
+        return "absent"
+    lines = text.splitlines(keepends=True)
+    value = str(seconds)
+    # codex style: a [mcp_servers.NAME] table (its body runs to the next
+    # column-0 header, so subtables are not touched)
+    pat = re.compile(r"^\[mcp_servers\.%s\][ \t]*$" % re.escape(name))
+    for i, line in enumerate(lines):
+        if pat.match(line):
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith("["):
+                j += 1
+            body, existed = _set_toml_key(lines[i + 1 : j], "tool_timeout_sec", value)
+            backup(path)
+            write(path, "".join(lines[: i + 1] + body + lines[j:]))
+            return "updated" if existed else "added"
+    # vibe style: a [[mcp_servers]] element with name = "NAME"
+    for t in _toml_tables(text):
+        if _VIBE_ARRAY_RE.match(t["header"]) and _vibe_element_name(t) == name:
+            body_lines = t["body"].splitlines(keepends=True)
+            body, existed = _set_toml_key(body_lines, "tool_timeout_sec", value)
+            backup(path)
+            write(path, "".join(lines[: t["start"] + 1] + body + lines[t["end"] :]))
+            return "updated" if existed else "added"
+    return "absent"
+
+
+def set_timeout(path, name, seconds):
+    """set-timeout: give the entry a long tool-call timeout — tool_timeout_sec
+    in a TOML entry (codex [mcp_servers.NAME] table, vibe [[mcp_servers]]
+    element) or the timeout: line in a goose YAML extensions block. A
+    request_slack_message call blocks on a human approval for minutes."""
+    result = set_toml_timeout(path, name, seconds)
+    if result != "absent":
+        return result
+    return set_goose_timeout(path, name, seconds)
 
 
 # --------------------------------------------------------------------------- #
@@ -518,20 +917,55 @@ def _yaml_server_blocks(text):
         i = j
 
 
-_TOML_SERVER_RE = re.compile(
-    r"^\[mcp_servers\.([A-Za-z0-9_-]+)((?:\.[^\]\n]*)?)\]\n(?:(?!\[)[^\n]*\n?)*",
-    re.M,
-)
+_TOML_TABLE_RE = re.compile(r"^\[mcp_servers\.([A-Za-z0-9_-]+)(?:\.[^\]\n]*)?\][ \t]*$")
 
 
 def _toml_server_blocks(text):
-    """Yield (name, block_text) for [mcp_servers.NAME] tables in a TOML
-    config, with subtables ([mcp_servers.NAME.env]) folded into NAME's block."""
-    parts = {}
-    for m in _TOML_SERVER_RE.finditer(text):
-        parts.setdefault(m.group(1), []).append(m.group(0))
-    for name, chunks in parts.items():
-        yield name, "\n".join(chunks)
+    """Yield (name, block_text) for the MCP servers in a TOML config, in
+    both styles agents use:
+
+      codex: [mcp_servers.NAME] tables, with subtables
+             ([mcp_servers.NAME.env]) folded into NAME's block.
+      vibe:  [[mcp_servers]] array elements with name = "..."; the
+             [mcp_servers.KEY] subtables that follow an element belong to
+             it and are folded into its block (they are not servers).
+
+    A file containing [[mcp_servers]] elements is treated as vibe-style:
+    its [mcp_servers.X] headers are then subtables of the current element,
+    not servers (so [mcp_servers.env] is never reported as a server "env").
+    """
+    tables = _toml_tables(text)
+    vibe_style = any(_VIBE_ARRAY_RE.match(t["header"]) for t in tables)
+    blocks = {}
+    order = []
+    current = None
+    for t in tables:
+        header = t["header"].strip()
+        if _VIBE_ARRAY_RE.match(header):
+            current = _vibe_element_name(t)
+            if current is not None:
+                if current not in blocks:
+                    blocks[current] = []
+                    order.append(current)
+                blocks[current].append(t["header"] + t["body"])
+            continue
+        m = _TOML_TABLE_RE.match(header)
+        if m:
+            if vibe_style:
+                # a [mcp_servers.KEY] subtable of the current element
+                if current is not None:
+                    blocks[current].append(t["header"] + t["body"])
+                continue
+            name = m.group(1)
+            if name not in blocks:
+                blocks[name] = []
+                order.append(name)
+            blocks[name].append(t["header"] + t["body"])
+            continue
+        # any other table header ends the current vibe element
+        current = None
+    for name in order:
+        yield name, "".join(blocks[name])
 
 
 def audit_file(path):
@@ -549,6 +983,11 @@ def audit_file(path):
       mistral_keys               masked Mistral API keys (mstrl_…) in the
                                  file — an agent with one can call the Slack
                                  connector's send tool directly
+
+    Server entries are {"name": ..., "key": [...]} objects: key is the JSON
+    path of the servers container (so nested per-project entries, e.g.
+    claude projects.<path>.mcpServers, are located and removable), the YAML
+    parent key, or [] for TOML tables/elements.
     """
     text = read(path)
     if text is None:
@@ -566,35 +1005,38 @@ def audit_file(path):
     for m in MISTRAL_KEY_RE.finditer(text):
         finding["mistral_keys"].append(_mask(m.group(0)))
 
-    def classify(name, entry_text):
+    def classify(name, entry_text, key):
         bucket = {
             "slack-mcp": "slack_mcp_servers",
             "mistral": "mistral_connector_servers",
             "direct": "direct_slack_servers",
         }.get(classify_server(name, entry_text))
-        if bucket and name not in finding[bucket]:
-            finding[bucket].append(name)
+        if bucket and not any(
+            e["name"] == name and e["key"] == key for e in finding[bucket]
+        ):
+            finding[bucket].append({"name": name, "key": key})
 
     try:
         data = json.loads(strip_jsonc(text))
     except ValueError:
         data = None
     if isinstance(data, dict):
-        def scan(obj, parent_key):
+        def scan(obj, keys):
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if (
-                        parent_key in MCP_PARENT_KEYS
+                        keys
+                        and keys[-1] in MCP_PARENT_KEYS
                         and isinstance(v, dict)
                         and k != SERVER
                     ):
-                        classify(k, json.dumps(v))
-                    scan(v, k)
+                        classify(k, json.dumps(v), keys)
+                    scan(v, keys + [k])
             elif isinstance(obj, list):
                 for v in obj:
-                    scan(v, parent_key)
+                    scan(v, keys)
 
-        scan(data, None)
+        scan(data, [])
     else:
         # YAML / plain text. Only MCP-server-shaped entries are classified
         # (under an MCP parent key, or carrying url/command/cmd) — LLM
@@ -605,18 +1047,71 @@ def audit_file(path):
             if parent in YAML_MCP_PARENTS or re.search(
                 r"^\s+(url|command|cmd)\s*:", block, re.M
             ):
-                classify(name, block)
-            elif "slack" in name.lower() and name not in finding["direct_slack_servers"]:
+                classify(name, block, [parent] if parent else [])
+            elif "slack" in name.lower():
                 # A slack-named key that is not an MCP server entry (e.g.
                 # hermes platform_toolsets.slack): still an agent-side Slack
                 # path the gateway does not control.
-                finding["direct_slack_servers"].append(name)
-    # TOML: [mcp_servers.<name>] tables (a .env subtable is part of its
-    # server, not a server of its own).
+                key = [parent] if parent else []
+                if not any(
+                    e["name"] == name and e["key"] == key
+                    for e in finding["direct_slack_servers"]
+                ):
+                    finding["direct_slack_servers"].append({"name": name, "key": key})
+    # TOML, both styles: codex [mcp_servers.<name>] tables and vibe
+    # [[mcp_servers]] elements (a .env subtable is part of its server, not
+    # a server of its own).
     for name, block in _toml_server_blocks(text):
         if name != SERVER:
-            classify(name, block)
+            classify(name, block, [])
     return finding
+
+
+def enforce_remove(path, name, key):
+    """Remove one direct Slack server found by the audit (install.sh
+    --enforce). Prints an accurate status line — [removed], [absent],
+    [failed], or [edit by hand] — instead of assuming success."""
+    base = os.path.basename(path)
+    if base == ".claude.json":
+        style = "claude"
+    elif base == "opencode.json":
+        style = "opencode"
+    elif base == "mcp-config.json":
+        style = "copilot"
+    elif base == "settings.json" and "amp" in path:
+        style = "amp"
+    elif base == "settings.json" and (".pi/" in path or ".paradev/" in path):
+        style = "pi"
+    elif base == "settings.json" and ".gemini/" in path:
+        style = "gemini"
+    elif base == "config.toml" and ".vibe" in path:
+        style = "vibe"
+    elif base == "config.toml":
+        style = "codex"
+    else:
+        style = None
+    if style is None:
+        print(
+            "    [edit by hand] %s (server: %s) — no automatic removal" % (path, name)
+        )
+        return "edit-by-hand"
+    try:
+        if style == "vibe":
+            result = remove_vibe_entry(path, name)
+        elif style == "codex":
+            result = remove_codex_entry(path, name)
+        else:
+            result = remove_entry(style, path, name, key or None)
+    except (Exception, SystemExit) as e:
+        print("    [failed]  %s (server: %s): %s" % (path, name, e))
+        return "failed"
+    if result == "removed":
+        print("    [removed] %s (server: %s)" % (path, name))
+    elif result == "absent":
+        print("    [absent]  %s (server: %s) — already gone" % (path, name))
+    else:
+        print("    [failed]  %s (server: %s): %s" % (path, name, result))
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -646,24 +1141,38 @@ def main(argv):
     elif cmd == "add-codex":
         path, gateway = args
         print("%s: %s" % (path, add_codex(path, gateway)))
+    elif cmd == "add-vibe":
+        path, gateway = args
+        print("%s: %s" % (path, add_vibe(path, gateway)))
     elif cmd == "remove-json":
         style, path = args
         print("%s: %s" % (path, remove_json(style, path)))
-    elif cmd in ("remove-zed", "remove-goose", "remove-hermes", "remove-codex"):
+    elif cmd in ("remove-zed", "remove-goose", "remove-hermes", "remove-codex", "remove-vibe"):
         (path,) = args
         fn = {
             "remove-zed": remove_zed,
             "remove-goose": remove_goose,
             "remove-hermes": remove_hermes,
             "remove-codex": remove_codex,
+            "remove-vibe": remove_vibe,
         }[cmd]
         print("%s: %s" % (path, fn(path)))
     elif cmd == "remove-entry":
-        style, path, name = args
-        print("%s: %s" % (path, remove_entry(style, path, name)))
+        style, path, name = args[0], args[1], args[2]
+        keys = json.loads(args[3]) if len(args) > 3 else None
+        print("%s: %s" % (path, remove_entry(style, path, name, keys)))
     elif cmd == "remove-codex-entry":
         path, name = args
         print("%s: %s" % (path, remove_codex_entry(path, name)))
+    elif cmd == "remove-vibe-entry":
+        path, name = args
+        print("%s: %s" % (path, remove_vibe_entry(path, name)))
+    elif cmd == "set-timeout":
+        path, name, seconds = args
+        print("%s: %s" % (path, set_timeout(path, name, int(seconds))))
+    elif cmd == "enforce-remove":
+        path, name, key = json.loads(args[0])
+        enforce_remove(path, name, key)
     elif cmd == "instruction-add":
         (path,) = args
         print("%s: %s" % (path, instruction_add(path)))

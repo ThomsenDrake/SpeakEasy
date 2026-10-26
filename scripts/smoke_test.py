@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 
-ROOT = "/Users/drake.thomsen/.superset/worktrees/SpeakEasy/use-superset-orchestrate-skill-d12645b9"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BINARY = os.path.join(ROOT, "target/debug/slack-approval-gateway")
 
 failures = []

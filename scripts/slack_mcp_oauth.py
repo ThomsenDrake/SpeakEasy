@@ -17,8 +17,9 @@ gateway then picks it up from there (or from SLACK_MCP_TOKEN).
 
 Prerequisites (one-time, in your Slack app at https://api.slack.com/apps):
   - the app must be directory-published or internal (only those may use MCP);
-  - register the redirect URL http://127.0.0.1:3118/callback (or the exact
-    --redirect-uri you pass) under OAuth & Permissions > Redirect URLs;
+  - register the redirect URL http://127.0.0.1:3118/callback (or
+    http://127.0.0.1:<port>/callback for the --port you pass) under
+    OAuth & Permissions > Redirect URLs;
   - add the user scopes (defaults below) under OAuth & Permissions >
     User Token Scopes.
 
@@ -31,6 +32,7 @@ users:read (resolve user IDs to display names in the approval popup) and
 channels:read/groups:read/im:read/mpim:read (resolve channel IDs).
 """
 import argparse
+import html
 import http.server
 import json
 import os
@@ -86,6 +88,57 @@ def exchange_code(client_id, client_secret, code, redirect_uri):
     return token
 
 
+def parse_mcp_reply(raw, content_type):
+    """Parse an MCP initialize reply.
+
+    The endpoint may answer with `application/json` or with
+    `text/event-stream` (the Streamable HTTP reply format), where the JSON-RPC
+    message arrives as one or more `data:` lines.
+    """
+    text = raw.decode(errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if not data:
+            continue
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            continue
+    raise SystemExit(
+        "slack_mcp_oauth: unexpected initialize reply "
+        f"(Content-Type {content_type}): {text[:300]}"
+    )
+
+
+MCP_NOT_ENABLED_MARKER = "not enabled for Slack MCP server access"
+MCP_NOT_ENABLED_HINT = (
+    "hint: the app is not enabled for Slack MCP server access. In your Slack\n"
+    "  app settings (https://api.slack.com/apps), under Agents (older UI:\n"
+    "  Agents & AI Apps), turn on \"Slack Model Context Protocol (MCP) Server\"\n"
+    "  under Model Context Protocol."
+)
+
+
+def mcp_reject(reason):
+    """Format a verification failure, adding the MCP-enablement hint when the
+    endpoint reports the app is not enabled for Slack MCP server access."""
+    message = f"slack_mcp_oauth: the MCP endpoint rejected the token: {reason}"
+    if MCP_NOT_ENABLED_MARKER in reason:
+        return message + "\n" + MCP_NOT_ENABLED_HINT
+    return message + (
+        "\nCheck that the app is directory-published or internal, that the\n"
+        "  redirect URL is registered, and that the scopes were granted on the\n"
+        "  consent screen."
+    )
+
+
 def verify_token(token, mcp_url):
     """Run the MCP initialize handshake with the token, like the gateway does."""
     body = json.dumps({
@@ -105,16 +158,18 @@ def verify_token(token, mcp_url):
     })
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read() or b"{}")
+            payload = parse_mcp_reply(
+                response.read(), response.headers.get("Content-Type", "")
+            )
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:300]
-        raise SystemExit(
-            f"slack_mcp_oauth: the MCP endpoint rejected the token: HTTP {e.code} {detail}\n"
-            "Check that the app is directory-published or internal, that the redirect "
-            "URL is registered, and that the scopes were granted on the consent screen."
-        )
+        raise SystemExit(mcp_reject(f"HTTP {e.code} {detail}"))
     except urllib.error.URLError as e:
         raise SystemExit(f"slack_mcp_oauth: cannot reach {mcp_url}: {e.reason}")
+    if isinstance(payload, dict) and payload.get("error"):
+        error = payload["error"]
+        detail = error.get("message") if isinstance(error, dict) else json.dumps(error)
+        raise SystemExit(mcp_reject(str(detail)[:300]))
     server = (payload.get("result") or {}).get("serverInfo") or {}
     if not server:
         raise SystemExit(f"slack_mcp_oauth: unexpected initialize reply: {json.dumps(payload)[:300]}")
@@ -187,20 +242,38 @@ def main():
             error = params.get("error", [None])[0]
             if error:
                 result["error"] = error
+                page = (
+                    "<html><body><h2>SpeakEasy: authorization failed.</h2>"
+                    f"<p>Slack returned an error: <code>{html.escape(error)}</code></p>"
+                    "<p>Close this window, fix the problem in your Slack app, and"
+                    " run the script again.</p></body></html>"
+                )
             else:
                 result["code"] = params.get("code", [None])[0]
+                page = (
+                    "<html><body><h2>SpeakEasy: authorized.</h2>"
+                    "<p>You can close this window and return to the terminal."
+                    "</p></body></html>"
+                )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(
-                b"<html><body><h2>SpeakEasy: authorized.</h2>"
-                b"<p>You can close this window and return to the terminal.</p></body></html>"
-            )
+            self.wfile.write(page.encode("utf-8"))
 
         def log_message(self, *args):
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", args.port), CallbackHandler)
+    try:
+        server = http.server.HTTPServer(("127.0.0.1", args.port), CallbackHandler)
+    except OSError as e:
+        reason = e.strerror or str(e)
+        raise SystemExit(
+            f"slack_mcp_oauth: cannot listen on 127.0.0.1:{args.port} ({reason})\n"
+            "  Is another copy of this script (or something else) already using the\n"
+            "  port? Stop it, or pick another port with --port N and register the\n"
+            "  matching redirect URL http://127.0.0.1:N/callback in your Slack app\n"
+            "  under OAuth & Permissions > Redirect URLs."
+        )
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     print("slack_mcp_oauth: Slack MCP server user-token OAuth")
