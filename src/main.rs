@@ -10,16 +10,21 @@
 //! normally kept running by a LaunchAgent (`--serve`); closing the popup
 //! window only hides it — the gateway keeps running, and closing never
 //! approves anything.
+//!
+//! The popup is a Rust-native window (egui/eframe with the wgpu renderer —
+//! no browser engine; see `src/ui.rs` and `src/ui/`). The window is created
+//! hidden; a request arriving at any time reveals and focuses it, and the
+//! menu-bar tray icon (Show / Quit) is always available.
 
 use slack_approval_gateway::core::{
     Decision, DecisionProvider, Gateway, MessageRequest, ProviderError,
 };
 use slack_approval_gateway::slack;
-use slack_approval_gateway::{instance, mcp, ui};
+use slack_approval_gateway::ui;
+use slack_approval_gateway::{instance, mcp};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tauri::Manager;
+use std::sync::{Arc, Mutex};
 
 fn state_dir() -> PathBuf {
     if let Ok(d) = std::env::var("SLACK_GATEWAY_STATE_DIR") {
@@ -134,50 +139,6 @@ fn serve_mcp(gateway: Arc<Gateway>) {
     }
 }
 
-/// Show and focus the approval window. The window exists from app start
-/// (hidden); a request arriving at any time brings it to the front.
-fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-}
-
-/// Menu-bar tray icon: the gateway's always-available affordance. A left
-/// click (or the Show item) reopens the window; Quit stops the gateway.
-fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-
-    let menu = Menu::with_items(
-        app,
-        &[
-            &MenuItem::with_id(app, "sag-show", "Show approval window", true, None::<&str>)?,
-            &MenuItem::with_id(app, "sag-quit", "Quit SpeakEasy", true, None::<&str>)?,
-        ],
-    )?;
-    let mut builder = TrayIconBuilder::with_id("slack-approval-gateway")
-        .menu(&menu)
-        .tooltip("SpeakEasy")
-        .icon_as_template(true)
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
-            }
-        });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
-    builder.build(app)?;
-    Ok(())
-}
-
 /// Become the single gateway instance for this state dir, or exit.
 fn become_instance(dir: &PathBuf) -> (instance::InstanceGuard, std::os::unix::net::UnixListener) {
     match instance::acquire(dir) {
@@ -189,10 +150,170 @@ fn become_instance(dir: &PathBuf) -> (instance::InstanceGuard, std::os::unix::ne
     }
 }
 
+/// Run the native approval window (egui/eframe, wgpu). Blocks until the
+/// human quits (tray Quit / Cmd+Q); returns false if the UI could not run.
+///
+/// The window starts hidden (`visible: false`) and is revealed by the first
+/// request (the reveal hook) or by the tray's Show item. Closing the window
+/// only hides it; the gateway keeps serving MCP until Quit.
+fn run_gui(
+    ui_state: Arc<ui::UiState>,
+    is_demo: bool,
+    demo: ui::app::DemoFlags,
+) -> bool {
+    use slack_approval_gateway::ui::app::ApprovalApp;
+    use slack_approval_gateway::ui::text;
+    use slack_approval_gateway::ui::theme::Theme;
+
+    // The UI event-loop hooks: gateway worker threads call these while the
+    // bridge lock is held, so they only send viewport commands (cheap, and
+    // they never call back into the bridge).
+    let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
+    let reveal_slot = Arc::clone(&ctx_slot);
+    let notify_slot = Arc::clone(&ctx_slot);
+    let hide_slot = Arc::clone(&ctx_slot);
+    let quit_slot = Arc::clone(&ctx_slot);
+    ui_state.install_hooks(ui::UiHooks {
+        reveal: Some(Box::new(move || {
+            if let Some(ctx) = reveal_slot.lock().unwrap().as_ref() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            }
+        })),
+        notify: Some(Box::new(move || {
+            if let Some(ctx) = notify_slot.lock().unwrap().as_ref() {
+                ctx.request_repaint();
+            }
+        })),
+        hide: Some(Box::new(move || {
+            if let Some(ctx) = hide_slot.lock().unwrap().as_ref() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.request_repaint();
+            }
+        })),
+        quit: Some(Box::new(move || {
+            if let Some(ctx) = quit_slot.lock().unwrap().as_ref() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ctx.request_repaint();
+            }
+        })),
+    });
+
+    let icon = match eframe::icon_data::from_png_bytes(include_bytes!("../icons/icon.png")) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            eprintln!("slack-approval-gateway: cannot load window icon: {e}");
+            None
+        }
+    };
+    // The reference window: 720×780 logical px, min 520×560, resizable,
+    // decorated, centered, and initially hidden.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("SpeakEasy")
+        .with_inner_size([720.0, 780.0])
+        .with_min_inner_size([520.0, 560.0])
+        .with_resizable(true)
+        .with_visible(false);
+    // Demo only: `SLACK_GATEWAY_DEMO_SIZE=WxH` overrides the initial size.
+    if is_demo {
+        if let Some(size) = ui::demo::demo_window_size() {
+            viewport = viewport.with_inner_size(size);
+        }
+    }
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
+    let opts = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+
+    let reduce_motion = ui::sys::reduce_motion();
+    let ctx_slot_for_app = Arc::clone(&ctx_slot);
+    let result = eframe::run_native(
+        "SpeakEasy",
+        opts,
+        Box::new(move |cc| {
+            // Install SF Pro / SF Mono before the first frame (no-op families
+            // on non-macOS systems, where the bundled/system fallback fonts
+            // are used instead).
+            text::install_fonts(&cc.egui_ctx);
+            // The reference (Chrome) places text baselines at fractional
+            // positions; egui's default rounds every galley origin to whole
+            // device pixels, which would quantize the baseline correction in
+            // `ui::text::baseline_correction` away. The glyph bitmaps already
+            // carry their own subpixel ink offsets, so unrounded origins keep
+            // the text crisp.
+            cc.egui_ctx
+                .tessellation_options_mut(|opts| opts.round_text_to_pixels = false);
+            Ok(Box::new(ApprovalApp::new(
+                ui_state,
+                ctx_slot_for_app,
+                // The app re-detects the theme (env override, then the system
+                // appearance) on its first logic pass.
+                Theme::Light,
+                reduce_motion,
+                is_demo,
+                demo,
+            )))
+        }),
+    );
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("slack-approval-gateway: UI error: {e}");
+            false
+        }
+    }
+}
+
+/// Demo mode (`--demo`): the native popup with synthetic fixtures, fully
+/// isolated from production (throwaway state dir, in-memory Slack client,
+/// no instance lock, no socket, no MCP stdio, no credentials). Never sends
+/// real messages.
+fn run_demo() {
+    use slack_approval_gateway::core::DecisionProvider;
+    use slack_approval_gateway::ui::demo;
+
+    let dir = demo::demo_state_dir();
+    let seed = demo::DemoSeed::from_env();
+    demo::seed_state(&dir, &seed.cooldowns());
+    let ui_state = Arc::new(ui::UiState::new());
+    let provider: Arc<dyn DecisionProvider> =
+        Arc::new(ui::GuiDecisionProvider::new(Arc::clone(&ui_state)));
+    let gateway = match Gateway::new(Arc::new(demo::DemoSlack::default()), provider, dir) {
+        Ok(g) => Arc::new(g),
+        Err(e) => {
+            eprintln!("slack-approval-gateway: demo: cannot initialize state: {e}");
+            std::process::exit(1);
+        }
+    };
+    ui_state.set_gateway(Arc::clone(&gateway));
+    // The demo requests go through the real gateway (cooldown/dedupe/
+    // decision plumbing) on worker threads, exactly like MCP workers.
+    demo::spawn_demo_requests(&gateway, &seed.requests());
+    let ui_ok = run_gui(
+        ui_state,
+        true,
+        ui::app::DemoFlags {
+            sticky_deciding: demo::demo_sticky_deciding(),
+            fail_submit: demo::demo_fail_submit(),
+        },
+    );
+    // Let any approved (recorded, in-memory) send finish before exiting.
+    gateway.wait_until_no_send_in_progress();
+    if !ui_ok {
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cli_mode = args.iter().any(|a| a == "--cli");
     let serve_mode = args.iter().any(|a| a == "--serve");
+    let demo_mode = args.iter().any(|a| a == "--demo");
     let dir = state_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("slack-approval-gateway: cannot create state dir {}: {e}", dir.display());
@@ -209,6 +330,11 @@ fn main() {
         // stdin reached EOF; let any approved send finish and be recorded
         // before the process exits.
         gateway.wait_until_no_send_in_progress();
+        return;
+    }
+
+    if demo_mode {
+        run_demo();
         return;
     }
 
@@ -249,7 +375,7 @@ fn main() {
     // (unless started by the service manager), and MCP on the socket for
     // every other agent's bridge.
     let ui_state = Arc::new(ui::UiState::new());
-    let provider = Arc::new(ui::TauriDecisionProvider::new(Arc::clone(&ui_state)));
+    let provider = Arc::new(ui::GuiDecisionProvider::new(Arc::clone(&ui_state)));
     let gateway = Arc::new(build_gateway(provider, &dir));
     ui_state.set_gateway(Arc::clone(&gateway));
     instance::serve_connections(Arc::clone(&gateway), listener);
@@ -257,68 +383,19 @@ fn main() {
         let mcp_gateway = Arc::clone(&gateway);
         std::thread::spawn(move || serve_mcp(mcp_gateway));
     }
-    let ui_state_for_setup = Arc::clone(&ui_state);
-    let app = tauri::Builder::default()
-        .manage(ui_state)
-        .setup(move |app| {
-            ui_state_for_setup.set_app(app.handle().clone());
-            if let Some(window) = app.get_webview_window("main") {
-                eprintln!(
-                    "slack-approval-gateway: main window created (visible={})",
-                    window.is_visible().unwrap_or(false)
-                );
-            } else {
-                eprintln!("slack-approval-gateway: main window missing at setup");
-            }
-            if let Err(e) = setup_tray(app.handle()) {
-                eprintln!("slack-approval-gateway: cannot set up tray icon: {e}");
-            }
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            ui::submit_decision,
-            ui::ui_ready,
-            ui::get_active_cooldowns,
-            ui::hide_window,
-            ui::quit_app
-        ])
-        .on_window_event(|window, event| {
-            // Closing the popup only hides it. The gateway keeps serving
-            // MCP for every agent; closing never approves anything.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
-            }
-        })
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "sag-show" => show_main_window(app),
-            "sag-quit" => app.exit(0),
-            _ => {}
-        })
-        .build(tauri::generate_context!());
-    let app = match app {
-        Ok(app) => app,
-        Err(e) => {
-            eprintln!("slack-approval-gateway: UI error: {e}");
-            gateway.wait_until_no_send_in_progress();
-            std::process::exit(1);
-        }
-    };
-    app.run(|app, event| {
-        // Dock icon / `open -a` with no visible window: reopen the popup.
-        #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Reopen {
-            has_visible_windows: false,
-            ..
-        } = event
-        {
-            show_main_window(app);
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = (app, event);
-    });
+    let ui_state_for_quit = Arc::clone(&ui_state);
+    let ui_ok = run_gui(ui_state, false, ui::app::DemoFlags::default());
+    if !ui_ok {
+        // The UI never ran: no human can decide anything, so fail every
+        // pending request (never approved) instead of hanging.
+        eprintln!("slack-approval-gateway: UI failed; quitting the gateway");
+        ui_state_for_quit.quit();
+    }
     // Quit via the tray: pending requests fail in the provider (never
     // approved). Let any approved send finish and be recorded before the
     // process exits.
     gateway.wait_until_no_send_in_progress();
+    if !ui_ok {
+        std::process::exit(1);
+    }
 }

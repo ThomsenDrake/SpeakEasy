@@ -297,6 +297,25 @@ impl Gateway {
     /// decision flow (cooldown check, dedupe check, provider call, send /
     /// cooldown / feedback, persistence, concurrency rules).
     pub fn handle_request(&self, req: IncomingRequest) -> RequestVerdict {
+        let now = now_secs();
+        let id = format!(
+            "req-{now}-{}",
+            NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        self.handle_request_with_id(req, id, now)
+    }
+
+    /// Handle one agent request end to end with a caller-chosen request ID
+    /// and receipt time. Same flow as [`Self::handle_request`]; the native
+    /// demo mode uses fixed demo IDs (and receipt time) so its popup matches
+    /// the reference captures. `received_at` is display-only: cooldowns and
+    /// dedupe always compare against the current time.
+    pub fn handle_request_with_id(
+        &self,
+        req: IncomingRequest,
+        id: String,
+        received_at: u64,
+    ) -> RequestVerdict {
         if let Err(problem) = validate(&req) {
             return RequestVerdict::Error(format!("{problem}; nothing was sent"));
         }
@@ -347,12 +366,9 @@ impl Gateway {
         // changes nothing (the raw destination is shown).
         let destination_display = self.slack.resolve_destination(&req.destination);
         let msg = MessageRequest {
-            id: format!(
-                "req-{now}-{}",
-                NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-            ),
+            id,
             incoming: req,
-            received_at: now,
+            received_at,
             destination_display,
         };
         let decision = self.provider.request_decision(&msg);

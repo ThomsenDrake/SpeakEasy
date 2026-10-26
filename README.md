@@ -55,7 +55,7 @@ MCP server, and state folder keep an older name, `slack-approval-gateway`.
 
 **Requirements:** macOS with the Xcode Command Line Tools
 (`xcode-select --install`), Rust (stable, via [rustup](https://rustup.rs)),
-Node.js 20 or newer with npm, and Python 3.
+and Python 3.
 
 ### 1. Get the code
 
@@ -172,8 +172,8 @@ delete that line from its history afterwards.
 
 The installer:
 
-1. Builds the window UI and the app, and installs the binary to
-   `~/.local/bin/slack-approval-gateway`.
+1. Builds the app (the window UI is pure Rust — no Node/npm step), and
+   installs the binary to `~/.local/bin/slack-approval-gateway`.
 2. Creates `~/.slack-approval-gateway/` (mode 700) and stores the credential
    there (mode 600). With `--transport`, it also saves your choice in
    `slack_transport`. SpeakEasy doesn't copy the credential anywhere else.
@@ -208,7 +208,7 @@ kept.
 | `--slack-mcp-token xoxp-…` | Store a Slack user token (Slack MCP). |
 | `--mistral-api-key KEY` | Store a Mistral API key (Mistral connector). |
 | `--enforce` | Also remove token-based Slack MCP servers from agent configs. See [Security](#what-the-installers-audit-reports). |
-| `--dry-run` | Show what would change, and change nothing. It doesn't build, so it needs an existing `target/release` binary: run `cd ui && npm install && npm run build && cd .. && cargo build --release` first. |
+| `--dry-run` | Show what would change, and change nothing. It doesn't build, so it needs an existing `target/release` binary: run `cargo build --release` first. |
 | `--skip-build` | Use the existing `target/release` binary. |
 | `--uninstall [--purge]` | See [Uninstall](#uninstall). |
 
@@ -422,16 +422,6 @@ what gets sent either way.
 user token, you can post only in channels you're a member of. Join the
 channel, or ask the agent to use another one.
 
-**`npm install` can't reach `socket-registry.mistralai.com`.**
-`ui/package-lock.json` points at Mistral's internal npm mirror. Point it at
-the public npm registry, which has the same versions and checksums, then run
-the installer again:
-
-```sh
-sed -i '' 's#https://socket-registry.mistralai.com/npm/#https://registry.npmjs.org/#g' ui/package-lock.json
-rm -rf ui/node_modules
-```
-
 **The installer prints `WARN: self-test did not get a handshake reply`.** The
 self-test needs the `timeout` command, which macOS doesn't include (install
 it with `brew install coreutils`). If `gateway.log` shows no errors, the
@@ -455,7 +445,7 @@ scripts/install.sh --uninstall --purge   # also deletes it: credentials, blocks,
 This stops SpeakEasy, removes the LaunchAgent and the binary, unregisters
 SpeakEasy from your agents (Claude Code and Vibe through their own CLIs),
 and removes the instruction blocks. The `.bak-sag` files are kept. Like the
-installer, it stops unless `cargo`, `npm`, and `python3` are on your `PATH`.
+installer, it stops unless `cargo` and `python3` are on your `PATH`.
 
 Uninstalling doesn't revoke the credential. Without `--purge`, it stays in
 `~/.slack-approval-gateway`. With `--purge`, the file is deleted, but the
@@ -601,19 +591,24 @@ The Korotovsky transport's variables are described in `src/slack_stdio.rs`.
 ## Development
 
 ```sh
-cd ui && npm install && npm run build && cd ..   # the binary embeds the UI: build it first, and after UI changes
 cargo build                                      # add --release for the installer's build
 cargo test                                       # all tests except one slow one
 cargo test --test slack_mcp_test -- --ignored    # the slow one: a 30-second timeout
 python3 scripts/test_agent_config.py             # tests for the installer's config editing
-python3 scripts/smoke_test.py                    # end to end against target/debug (macOS); run cargo build first,
-                                                 # and set ROOT at the top of the script to your checkout
+python3 scripts/smoke_test.py                    # end to end against target/debug (macOS); run cargo build first
 scripts/install.sh --dry-run                     # preview an install; needs a release build (cargo build --release)
 ```
 
-To work on the window without the app, run `cd ui && npm run dev` and open
-<http://localhost:5173/?demo>, which loads a sample request. Add
-`&theme=light` for the light theme.
+To look at the window without the app, run it in demo mode — synthetic
+fixtures, isolated from your credentials and state, never sending:
+
+```sh
+SLACK_GATEWAY_DEMO_SEED=single ./target/debug/slack-approval-gateway --demo
+# seeds: empty | single | single_cooldown | cooldown | multi | long | unresolved
+# env: SLACK_GATEWAY_THEME=light|dark, SLACK_GATEWAY_DEMO_SIZE=WxH,
+#      SLACK_GATEWAY_REDUCE_MOTION=1, SLACK_GATEWAY_DEMO_STICKY_DECIDING=1,
+#      SLACK_GATEWAY_DEMO_FAIL_SUBMIT=1
+```
 
 | Path | What's there |
 |---|---|
@@ -621,11 +616,12 @@ To work on the window without the app, run `cd ui && npm run dev` and open
 | `src/mcp.rs` | The MCP server and the `request_slack_message` tool |
 | `src/instance.rs` | One running SpeakEasy per user: lock, socket, relays |
 | `src/main.rs`, `src/ui.rs` | Startup, run modes, the window, the menu-bar icon |
+| `src/ui/` | The approval window: a native egui/eframe + wgpu UI (no browser engine, no webview) |
 | `src/slack.rs` | Transport selection and shared credential helpers |
 | `src/slack_mcp.rs`, `src/mistral_slack.rs` | The Slack MCP and Mistral connector transports |
 | `src/slack_stdio.rs` | The Korotovsky transport (not working yet) |
 | `src/slack_tools.rs` | Send-tool discovery and reply parsing, shared by the transports |
-| `ui/` | The window (React, Tailwind, Once UI) |
+| `NOTICE.md` | Upstream license notices (Once UI, Lucide, Heroicons, …) |
 | `scripts/install.sh`, `scripts/agent_config.py` | The installer and its agent-config editor |
 | `scripts/slack_mcp_oauth.py` | The OAuth helper for the Slack MCP token |
 | `tests/`, `scripts/smoke_test.py`, `scripts/mock_korotovsky.py` | Tests and mocks |

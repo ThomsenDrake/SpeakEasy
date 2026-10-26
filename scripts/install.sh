@@ -4,7 +4,7 @@
 # service.
 #
 # What it does:
-#   1. Builds the app (frontend + release binary).
+#   1. Builds the app (the release binary; the UI is pure Rust).
 #   2. Installs the binary to ~/.local/bin/slack-approval-gateway.
 #   3. Sets up the state dir, the Slack transport selection, and the
 #      credential files (chmod 600). The gateway is the only component
@@ -196,7 +196,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
   say "your agents manually (see README.md)."
   exit 1
 fi
-for tool in cargo npm "$PY"; do
+for tool in cargo "$PY"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     say "missing required tool: $tool" >&2
     exit 1
@@ -256,16 +256,9 @@ if [ "$SKIP_BUILD" = 1 ]; then
   say "  skipping build (--skip-build)"
 else
   if [ "$DRY_RUN" = 0 ]; then
-    if [ ! -d "$ROOT/ui/node_modules" ]; then
-      say "  npm install (ui/)"
-      (cd "$ROOT/ui" && npm install --no-audit --no-fund)
-    fi
-    say "  npm run build (ui/)"
-    (cd "$ROOT/ui" && npm run build)
     say "  cargo build --release"
     (cd "$ROOT" && cargo build --release)
   else
-    say "  [dry-run] cd ui && npm install && npm run build"
     say "  [dry-run] cargo build --release"
   fi
 fi

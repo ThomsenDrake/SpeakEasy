@@ -485,72 +485,87 @@ process per state dir:
 - `InstanceGuard` drops by removing the lock and socket files (best effort;
   a crash leaves them and the next starter steals the lock).
 
-### `src/ui.rs` — Tauri webview bridge (the approval popup)
+### `src/ui.rs` — native-UI bridge (the approval popup)
 
-The human-facing popup is the webview frontend in `ui/` — React 19 +
-Tailwind 4 + the OSS **Once UI** design system (`@once-ui-system/core`;
-its tokens and utility layer are imported in `ui/src/styles/globals.css`)
-and animated primitives vendored from **Motion Primitives** under
-`ui/src/components/motion-primitives/` (added with
-`npx motion-primitives add <name>`; they import `cn` from `@/lib/utils`).
-The theme (the `data-theme`/`data-brand`/… attributes on `<html>`) is
-applied in `ui/src/main.tsx`, because the Tauri CSP forbids inline
-scripts.
-`src/ui.rs` is the Rust↔webview bridge:
+The human-facing popup is a **Rust-native desktop UI** — egui/eframe with
+the wgpu renderer, no browser engine, no embedded webview. It is a 1:1
+visual and behavioral recreation of the former React 19 + Tailwind 4 +
+**Once UI** (`@once-ui-system/core`) + **Motion Primitives** frontend:
+same layout, spacing, typography, colors, radii, states, and animations
+(title word reveal, spring-animated pending count), recreated from the
+reference's computed styles and the installed Motion defaults. (The
+reference's card `Spotlight` paints *nothing* — its Tailwind radial-gradient
+background is invalid at computed-value time — so no spotlight is rendered;
+see the `shaders.rs` module doc.) SF Pro / SF Mono are installed explicitly
+so text metrics match the reference on macOS.
+
+`src/ui.rs` is the Rust bridge between the gateway's MCP worker threads
+and the native UI event loop (it replaces the old Tauri events/commands
+transport with typed Rust calls):
 
 - `UiState`: pending-request map (`request_id -> Sender<Result<Decision,
-  ProviderError>>`), an outbox of requests for a not-yet-ready webview,
-  the webview-ready flag, the `AppHandle`, and the gateway (for the
-  cooldown status line).
-- `TauriDecisionProvider::request_decision`: register the request, deliver
-  it to the webview (emit `approval-request` with the whole `MessageRequest`,
-  including `destination_display`, or queue it in the outbox if the webview
-  is not ready), then block on the single-use reply channel.
-  If the app exits, the sender is dropped and the request fails with
-  `ProviderError` — it is never approved. A single-use channel guarantees
-  exactly one decision per request; repeated UI clicks cannot produce a
-  second decision.
-- The frontend renders the destination as
+  ProviderError>>`), an outbox of requests for a not-yet-ready UI, the
+  installed `UiHooks`, and the gateway (for the cooldown status line).
+- `UiHooks`: callbacks into the event loop — `reveal` (a request arrived:
+  show + focus the hidden window), `notify` (wake the event loop so the
+  outbox drain is seen promptly), `hide` (the queue drained: hide the
+  window), `quit` (tray Quit). They run on worker threads while the bridge
+  lock is held, so they only capture the `egui::Context` and request
+  wakeups — never blocking work.
+- `GuiDecisionProvider::request_decision`: register the request, queue it
+  in the outbox, reveal the window, then block on the single-use reply
+  channel. Requests arriving before the UI is running stay queued and are
+  delivered on the UI's first drain. If the app exits, the sender is
+  dropped and the request fails with `ProviderError` — it is never
+  approved. A single-use channel guarantees exactly one decision per
+  request; repeated UI clicks cannot produce a second decision.
+- The UI renders the destination as
   `destination_display ?? incoming.destination`, with the raw destination
   as a secondary tag when a display name was resolved (display only — the
   exact `destination` is what gets sent).
-- Tauri commands invoked by the webview: `submit_decision(request_id,
-  decision)` (first decision wins; repeats and unknown IDs are ignored),
-  `ui_ready` (flushes the outbox — the frontend awaits its `listen()`
-  registration before invoking this so no event is lost),
-  `get_active_cooldowns`, `hide_window` (the webview calls this once its
-  queue has drained after a decision), and `quit_app` (tray Quit).
-- `UiState::reveal_window`: when a request is delivered (emitted or
-  queued), the hidden main window is shown and focused, so a request
-  arriving at any time surfaces the popup. `mark_webview_ready` reveals the
-  window when it flushed queued requests.
-- The frontend (`ui/src/App.tsx`) renders one request at a time with the
-  design-system components (`Button`, `Typography`, `Badge`, `Card`,
-  `Textarea`): the exact proposed message, the Slack destination (with a
-  caption distinguishing it from the agent conversation), the reason, the
-  originating agent conversation (context only — not a Slack thread), the
-  three actions **Approve** / **Deny** / **Give feedback** (feedback text
-  entry enabled only when non-empty), a "N waiting" badge, active deny
-  cooldowns, and the caption "Closing this window never approves a message.
-  If the app quits, pending requests fail and the agent is told nothing was
-  sent."
-- Closing the window only **hides** it (`CloseRequested` is intercepted:
-  `window.hide()` + `api.prevent_close()`); the gateway process keeps
-  serving MCP for every agent. Quitting happens only via the tray menu's
-  **Quit gateway** (`quit_app` → `app.exit(0)`) or a signal; pending reply
-  senders are then dropped, so blocked `request_decision` calls return
-  `Err` — never an approval. A Dock click / `open` with no visible window
-  (`RunEvent::Reopen`) shows the window again.
-- A menu-bar tray icon (Tauri `tray-icon` feature) offers **Show approval
-  window** / **Quit gateway**; a left click on the icon shows the window.
-- Tauri 2 gates `listen`/`invoke` behind **capabilities**:
-  `capabilities/default.json` grants `core:default` to the `main` window.
-  Without it the webview renders but no IPC reaches the backend (a blank
-  queue that never becomes ready).
-- The `tauri` dependency enables the **`custom-protocol`** feature, so
-  every build (debug and release) embeds `ui/dist` and serves it from
-  `tauri://localhost` — no dev server is needed to run the binary. (Without
-  it, Tauri expects a dev server at `devUrl` and the webview stays blank.)
+- `UiState::submit(request_id, decision)`: resolves exactly one blocked
+  worker. The first decision wins; repeats and unknown/stale IDs are
+  rejected (`SubmitError`), so a repeated click cannot double-send and a
+  stale ID cannot decide another request. A rejected submission is
+  reported to the UI as an actionable error and the request is *retained*
+  so the human can try again — the queue only advances after an accepted
+  decision.
+- `UiState::hide_if_drained`: hides the window once the queue has drained
+  (checked under the bridge lock, so it never races a newly arriving
+  request into a hidden window with something pending).
+- The UI (`src/ui/app.rs` + `src/ui/app/paint.rs`) renders one request at
+  a time: the exact proposed message (monospace, wrapped, selectable), the
+  Slack destination (with a hint distinguishing it from the agent
+  conversation), the reason, the originating agent conversation (context
+  only — not a Slack thread), the three actions **Approve** / **Deny** /
+  **Give feedback** (feedback text entry enabled only when non-empty), a
+  "N waiting" badge, active deny cooldowns, and the caption "Closing this
+  window hides it and never approves a message; SpeakEasy keeps running
+  (menu-bar icon to reopen or quit). If SpeakEasy quits, pending requests
+  fail and the agent is told nothing was sent."
+- Closing the window only **hides** it (egui `CloseRequested` → hide); the
+  gateway process keeps serving MCP for every agent. Quitting happens only
+  via the tray menu's **Quit SpeakEasy** (`UiState::quit` → the event loop
+  exits) or a signal; pending reply senders are then dropped, so blocked
+  `request_decision` calls return `Err` — never an approval. A Dock click /
+  `open` with no visible window (macOS `Reopen`) shows the window again.
+- A menu-bar tray icon (`tray-icon` crate, macOS) offers **Show approval
+  window** / **Quit SpeakEasy**; a left click on the icon shows the window.
+
+`src/ui/` module map:
+
+| Module | Role |
+|---|---|
+| `app.rs` | eframe app: window lifecycle (720×780 default, min 520×560, centered, initially hidden), tray menu, keyboard/focus model, decision dispatch, reduced-motion handling |
+| `app/paint.rs` | frame layout + painting (fixed header / scrolling main / fixed footer), scrollbar |
+| `components.rs` | Once UI-style controls: `Tag`, `Button`, `Textarea`, section labels, selectable text |
+| `theme.rs` | light/dark palettes + responsive metrics (rem root 15px ≤768px viewport, else 16px) |
+| `text.rs` | SF Pro / SF Mono installation + CSS-exact `TextSpec`s (size, weight, line-height, letter-spacing) |
+| `anim.rs` | Motion-matched animation: spring physics (stiffness 100 / damping 10 / mass 1), cubic-bezier tweens, `TextEffect` fade-in-blur, `AnimatedNumber` |
+| `icons.rs` | Lucide SVG path parser + flattener/renderer (Slack, inbox, hash, person, chat, …) |
+| `shaders.rs` | the title reveal's gaussian blur + premultiplied text draw as small wgpu paint callbacks |
+| `sys.rs` | macOS integration: NSPasteboard copy, dock/reveal, reduced-motion + on-screen queries |
+| `demo.rs` | `--demo` synthetic fixtures (isolated state dir, mock Slack — never sends) |
 
 ### `src/main.rs` — run modes, tray, window lifecycle
 
@@ -560,26 +575,27 @@ Slack client, provider, MCP server, and UI. Three run modes:
 - `--cli`: headless. Becomes the instance (lock + socket), builds the
   gateway with the terminal fallback provider, serves the socket, and runs
   MCP on stdio. Used by the smoke test and for SSH hosts.
-- `--serve`: service mode (LaunchAgent). Becomes the instance, builds the
-  Tauri app, serves the socket, but runs no MCP on stdio.
+- `--serve`: service mode (LaunchAgent). Becomes the instance, runs the
+  native eframe app, serves the socket, but runs no MCP on stdio.
 - default (spawned by an agent over stdio): if an instance answers on the
   socket, bridge to it (`instance::run_bridge`, never returns); otherwise
   become the instance (lost startup races bridge instead). The instance
   serves MCP on its own stdio (unless `--serve`) plus the socket.
 
-GUI mode builds the Tauri app (managed `UiState`, commands
-`submit_decision`/`ui_ready`/`get_active_cooldowns`/`hide_window`/
-`quit_app`, MCP server on a background thread), installs the tray icon in
-`setup`, hides the window on close, and shows it on `RunEvent::Reopen`
-(macOS). After the event loop ends, the app waits for any in-flight
-approved send to finish before exiting. The window is created hidden
-(`"visible": false` in `tauri.conf.json`) and revealed per request.
+GUI mode runs the eframe app (managed `UiState` + `UiHooks`, MCP server
+on a background thread), installs the tray icon, hides the window on
+close, and shows it on macOS `Reopen`. After the event loop ends, the app
+waits for any in-flight approved send to finish and be recorded before
+exiting. The window is created hidden (720×780, min 520×560, centered)
+and revealed per request. `--demo` runs the same UI against synthetic
+fixtures with an isolated state dir and a mock Slack client — it never
+sends real messages.
 
 ## Build, install, and test
 
-- Rust toolchain (cargo 1.98+) and Node 24+ are installed. The frontend
-  must be built before `cargo build` (Tauri embeds `ui/dist`):
-  `cd ui && npm install && npm run build`.
+- Rust toolchain (cargo 1.98+) is installed. The UI is pure Rust — there
+  is no Node/npm/Vite build step; `cargo build` produces the complete
+  binary.
 - `scripts/install.sh` installs the app into every detected coding agent on
   this Mac and starts the LaunchAgent service (`--dry-run`, `--enforce`,
   `--uninstall`, `--slack-mcp-token`, `--state-dir`, `--transport`
@@ -598,18 +614,18 @@ approved send to finish before exiting. The window is created hidden
   block routes all sending through the gateway); direct token-based Slack
   servers (a `xox*` token in the entry, or an unclassifiable slack-named
   server) are **violations**, as are Slack tokens and Mistral API keys
-  found in agent configs. LLM-provider entries that merely mention Mistral
-  (e.g. goose `providers.mistral`, hermes `providers.mistral-*` with
-  `base_url: https://api.mistral.ai/v1`) are not connector servers and are
-  not flagged as such. `--enforce` removes only the direct token-based
+  found in agent configs. `--enforce` removes only the direct token-based
   servers from the JSON/TOML configs it can edit and keeps the expected
   ones; `--dry-run` changes nothing, including under `--enforce`.
-- First builds compile Tauri/wry and take several minutes; that's expected.
+- First builds compile eframe/wgpu and take several minutes; that's
+  expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.
 - `cargo test` must pass (core + slack_tools + slack_stdio unit tests, Slack
   MCP client tests, korotovsky stdio client tests + transport-selection
-  tests, mistral connector client tests, MCP e2e tests, and the `UiState`
-  bridge tests).
+  tests, mistral connector client tests, MCP e2e tests, the `UiState`
+  bridge tests, and the native-UI tests: bridge lifecycle, Motion-matched
+  spring/bezier math, Lucide path parsing, and the capture-derived layout
+  geometry contract in `src/ui/app/paint/tests.rs`).
 - `scripts/smoke_test.py` drives the real binary end to end: a mock Slack
   MCP server (the default transport) + mock Mistral platform API on one
   local server, a pty as the CLI terminal, the single-instance bridge path,
