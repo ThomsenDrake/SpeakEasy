@@ -42,8 +42,8 @@ posts exactly that text to exactly that place, once.
 </p>
 
 Closing the window doesn't approve or deny anything. It only hides the
-window, and the request keeps waiting. To bring it back, choose **Show
-approval window** from SpeakEasy's menu-bar icon or click its Dock icon.
+window, and the request keeps waiting. To bring it back, click SpeakEasy's
+menu-bar icon.
 
 All your agents share one SpeakEasy. Requests from every agent queue in the
 same window, and the header shows how many are waiting.
@@ -70,24 +70,19 @@ The transport is how SpeakEasy posts to Slack. Agents can't tell the
 transports apart. The choice decides which credential SpeakEasy stores and
 whose name the messages appear under.
 
-| | **Slack MCP** (default) | **Mistral connector** |
-|---|---|---|
-| Sends through | Slack's official MCP server, `mcp.slack.com` | Mistral's Slack connector |
-| Messages appear from | you | the Slack user who connected Slack in Mistral (usually you) |
-| SpeakEasy stores | a Slack user token | a Mistral API key |
-| You need | a Slack app of your own | a Mistral account with Slack connected |
+| | **Slack MCP** (default) | **Mistral connector** | **Korotovsky server** |
+|---|---|---|---|
+| Sends through | Slack's official MCP server, `mcp.slack.com` | Mistral's Slack connector | [korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server), installed on your Mac |
+| Messages appear from | you | the Slack user who connected Slack in Mistral (usually you) | your bot, or you with a user token |
+| SpeakEasy stores | a Slack user token | a Mistral API key | a Slack bot or user token |
+| You need | a Slack app of your own | a Mistral account with Slack connected | a Slack app, and the server already installed |
 
-Use **Slack MCP** unless you already use Mistral's Slack connector. The
-**Mistral connector** keeps the Slack token off your Mac, but the Mistral API
-key that SpeakEasy stores can post to Slack too, so protect it the same way.
-
-> **Korotovsky server (not working yet).** The code also has a third
-> transport for [korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server),
-> an open-source Slack MCP server that SpeakEasy would run on your Mac. As
-> shipped, it can't start. Its default command names an npm package that
-> doesn't exist (`@korotovsky/slack-mcp-server`; the real package is
-> `slack-mcp-server`), and the login service can't find `npx`. Use one of
-> the two transports above.
+Use **Slack MCP** unless you have a reason not to. The **Mistral connector**
+keeps the Slack token off your Mac, but the Mistral API key that SpeakEasy
+stores can post to Slack too, so protect it the same way. Use the
+**Korotovsky server** if messages should come from a bot. It's the newest
+transport: it has been tested against the real server's startup, but not yet
+with a real send.
 
 ### 3. Set up the credential
 
@@ -151,6 +146,28 @@ Messages post as the Slack user who connected Slack in step 1.
 
 </details>
 
+<details>
+<summary><b>Korotovsky server</b></summary>
+
+1. Install [korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server)
+   yourself, for example with `npm install -g slack-mcp-server`. SpeakEasy
+   never installs or downloads it. Check that `slack-mcp-server` is on your
+   `PATH` in the terminal where you'll run the installer.
+2. Create a Slack app at <https://api.slack.com/apps>. Under **Bot Token
+   Scopes**, add `chat:write`, `users:read`, `channels:read`, `groups:read`,
+   `im:read`, and `mpim:read`. All six are required: the server lists every
+   kind of conversation when it starts and exits if Slack refuses any of
+   them. Install the app to your workspace and copy the **Bot User OAuth
+   Token** (`xoxb-…`).
+3. Invite the bot to every channel it should post in. A bot can only see
+   channels it's a member of.
+
+To post as yourself instead of a bot, add the same scopes as **User Token
+Scopes** and give the installer `--slack-user-token xoxp-…` instead of
+`--slack-bot-token`.
+
+</details>
+
 ### 4. Run the installer
 
 Run the command for your transport.
@@ -167,6 +184,17 @@ Mistral connector:
 scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_API_KEY
 ```
 
+Korotovsky server (`acme` stands for your workspace's `acme.slack.com`
+address, which SpeakEasy needs to build message links):
+
+```sh
+scripts/install.sh --transport korotovsky --slack-bot-token xoxb-YOUR-BOT-TOKEN --workspace-domain acme
+```
+
+The installer records where your `slack-mcp-server` is in
+`~/.slack-approval-gateway/slack_stdio_command`. If it can't find the server,
+it says so, and SpeakEasy won't start until the server is installed.
+
 Your shell keeps a copy of any key or token you type in a command, so
 delete that line from its history afterwards.
 
@@ -178,7 +206,7 @@ The installer:
    there (mode 600). With `--transport`, it also saves your choice in
    `slack_transport`. SpeakEasy doesn't copy the credential anywhere else.
 3. Installs a LaunchAgent, `com.speakeasy.slack-approval-gateway`, that
-   starts SpeakEasy at login, and starts it now.
+   starts SpeakEasy at login with your current `PATH`, and starts it now.
 4. Registers the MCP server `slack-approval-gateway` with every agent it
    finds ([table below](#supported-agents)). It also adds a short block to
    each agent's instructions file: read Slack through your Slack MCP server
@@ -187,9 +215,6 @@ The installer:
    prints what it finds. See [Security](#security).
 6. Checks that the service answers and that each registration worked.
 
-At the end it lists next steps. The first one always repeats the credential
-step. If you already stored a credential, skip it.
-
 The installer backs up every file before its first change, to
 `<file>.bak-sag`. You can run it again at any time: it keeps existing
 registrations and credential files unless you pass a new credential. Each
@@ -197,16 +222,18 @@ run restarts SpeakEasy, which disconnects agents that are already running,
 so restart them afterwards.
 
 If no credential is stored and you don't pass one, the installer writes a
-placeholder, and SpeakEasy can't send until you replace it. With Slack MCP,
-SpeakEasy doesn't start at all until then, and agents report that the
-`slack-approval-gateway` server failed to start. A token the helper saved is
-kept.
+placeholder, and SpeakEasy can't send until you replace it. With Slack MCP
+or the Korotovsky server, SpeakEasy doesn't start at all until then, and
+agents report that the `slack-approval-gateway` server failed to start. A
+token the helper saved is kept.
 
 | Option | Effect |
 |---|---|
-| `--transport slack-mcp` or `--transport mistral-connector` | Choose the transport. The choice is saved, so later runs keep it. |
+| `--transport slack-mcp`, `mistral-connector`, or `korotovsky` | Choose the transport. The choice is saved, so later runs keep it. |
 | `--slack-mcp-token xoxp-…` | Store a Slack user token (Slack MCP). |
 | `--mistral-api-key KEY` | Store a Mistral API key (Mistral connector). |
+| `--slack-bot-token xoxb-…`, `--slack-user-token xoxp-…` | Store a Slack token (Korotovsky server). |
+| `--workspace-domain DOMAIN` | Your workspace's subdomain (`acme` for `acme.slack.com`). The Korotovsky server uses it to build message links; the other transports get links from Slack. |
 | `--enforce` | Also remove token-based Slack MCP servers from agent configs. See [Security](#what-the-installers-audit-reports). |
 | `--dry-run` | Show what would change, and change nothing. It doesn't build, so it needs an existing `target/release` binary: run `cargo build --release` first. |
 | `--skip-build` | Use the existing `target/release` binary. |
@@ -230,11 +257,9 @@ only by their config folder, so run each one once before you install.
 | pdev (paradev) | `~/.paradev/agent/settings.json` | `~/.paradev/agent/AGENTS.md` |
 | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/GEMINI.md` |
 | Copilot CLI | `~/.copilot/mcp-config.json` | `~/.copilot/copilot-instructions.md` |
-| Zed | `~/.config/zed/settings.json` | `~/.config/zed/rules/slack-gateway.md`, which Zed doesn't read. Copy the block into `~/.config/zed/AGENTS.md`. |
+| Zed | `~/.config/zed/settings.json` | `~/.config/zed/AGENTS.md` |
 | Amp | `~/.config/amp/settings.json` | none |
-| Hermes Agent | `~/.hermes/config.yaml` | `~/.hermes/AGENTS.md`, which Hermes doesn't read. Copy the block into `~/.hermes/SOUL.md`. |
-
-A block you copy by hand isn't removed when you uninstall.
+| Hermes Agent | `~/.hermes/config.yaml` | `~/.hermes/SOUL.md` |
 
 Tools that launch these agent CLIs as your user, such as
 [Superset](https://superset.sh) workspaces, pick up the registration with no
@@ -261,9 +286,9 @@ returns the first result with `duplicate: true`.
 
 ## Day to day
 
-**The menu-bar icon** has two items: **Show approval window** and **Quit
-SpeakEasy**. The window hides itself when no requests are left. Its footer
-lists the deny blocks that are active.
+**The menu-bar icon** opens the window when you click it. Right-click it
+for **Show approval window** and **Quit SpeakEasy**. The window hides itself
+when no requests are left. Its footer lists the deny blocks that are active.
 
 **Quitting** cancels the requests that are still waiting for you; those are
 never sent. A message you just approved may still be posting, so wait until
@@ -287,12 +312,11 @@ the new options, for example
 You can also replace the file in `~/.slack-approval-gateway/` and restart the
 service. SpeakEasy reads credentials only when it starts.
 
-**Some agents stop waiting after a while.** Mistral Vibe gives up on a tool
-call after 60 seconds by default, and goose after 2 minutes with the
-installer's settings. The request stays in the window, and approving it
-still sends, but the agent doesn't learn the result. If the agent retries
-the same message after you approved it, it gets `duplicate: true`, not a
-second post.
+**If an agent stops waiting before you decide,** the request stays in the
+window, and approving it still sends; the agent just doesn't learn the
+result. If it retries the same message after you approved it, it gets
+`duplicate: true`, not a second post. The installer gives Codex, Mistral
+Vibe, and goose a 24-hour tool timeout so this doesn't happen with them.
 
 **Over SSH, or without the window,** stop the login service (`bootout`,
 above) and run SpeakEasy in a terminal:
@@ -357,20 +381,18 @@ agents](#supported-agents) table and reports:
    instruction block stands in the way.
 2. **Token-based Slack MCP servers.** Agents could post through these
    without asking. `scripts/install.sh --enforce` removes them from the
-   configs of Claude Code, Codex, OpenCode, pi, pdev, Gemini CLI, Copilot
-   CLI, and Amp. Remove the rest by hand: entries in goose, Zed, and Hermes
-   configs, and per-project entries in `~/.claude.json`. Removing an entry
-   doesn't revoke its token, and the file's `.bak-sag` backup may still
-   hold it, so rotate the token in Slack.
+   configs of Claude Code (per-project entries included), Codex, Mistral
+   Vibe, OpenCode, pi, pdev, Gemini CLI, Copilot CLI, and Amp, and lists
+   entries in goose, Zed, and Hermes configs for you to remove by hand.
+   Removing an entry doesn't revoke its token, and the file's `.bak-sag`
+   backup may still hold it, so rotate the token in Slack.
 3. **Slack tokens and Mistral API keys in agent configs**, masked. Rotate
    them.
 
 A clean report doesn't prove that agents have no other way to send. The
-audit can't read Mistral Vibe's server list (`[[mcp_servers]]` in
-`~/.vibe/config.toml`), so check that file yourself. It also doesn't see
-servers that agent plugins add (such as Claude Code's Slack plugin),
-per-project files such as a repo's `.mcp.json`, or credentials in
-environment variables.
+audit doesn't see servers that agent plugins add (such as Claude Code's
+Slack plugin), per-project files such as a repo's `.mcp.json`, or
+credentials in environment variables.
 
 The audit also prints the state folder's permissions. If you use the
 separate agent-guards hook guard (`~/.config/agent-guards`, not part of
@@ -390,6 +412,9 @@ and SpeakEasy doesn't gate it.
   agent sent. SpeakEasy can't check them, so judge each request by its
   message, destination, and thread.
 - SpeakEasy and the agents must run on the same Mac.
+- With the Korotovsky transport, SpeakEasy hands your Slack token to
+  `slack-mcp-server`, third-party code you installed. Keep it up to date
+  from a source you trust.
 - The Mistral connector transport relies on a Mistral API that is in public
   preview, and Mistral's SDK marks its tool-call endpoint as deprecated. It
   may change.
@@ -422,30 +447,31 @@ what gets sent either way.
 user token, you can post only in channels you're a member of. Join the
 channel, or ask the agent to use another one.
 
-**The installer prints `WARN: self-test did not get a handshake reply`.** The
-self-test needs the `timeout` command, which macOS doesn't include (install
-it with `brew install coreutils`). If `gateway.log` shows no errors, the
-service is probably fine.
+**`the korotovsky Slack MCP server is not installed`.** SpeakEasy couldn't
+find `slack-mcp-server`. Install it, then run the installer again so it
+records the server's location, or write the command yourself:
+`echo "/path/to/slack-mcp-server --transport stdio" > ~/.slack-approval-gateway/slack_stdio_command`.
+
+**`Authentication failed - check your Slack tokens` (Korotovsky server).**
+The server checks the token when it starts and exits if Slack rejects it.
+Install a valid bot or user token. If the log mentions `missing_scope`, add
+the missing scope to your Slack app and reinstall the app.
 
 **An agent lost the tool after you ran the installer again.** Restart the
 agent. The installer restarts SpeakEasy, which drops existing connections.
 
 ## Uninstall
 
-**Read this first.** For every agent except Claude Code and Vibe,
-uninstalling restores the config file from the `.bak-sag` backup taken
-before SpeakEasy first edited it. Changes you made to that file since then
-are lost, so compare each file with its backup first.
-
 ```sh
 scripts/install.sh --uninstall           # keeps ~/.slack-approval-gateway
 scripts/install.sh --uninstall --purge   # also deletes it: credentials, blocks, and sent records
 ```
 
-This stops SpeakEasy, removes the LaunchAgent and the binary, unregisters
-SpeakEasy from your agents (Claude Code and Vibe through their own CLIs),
-and removes the instruction blocks. The `.bak-sag` files are kept. Like the
-installer, it stops unless `cargo` and `python3` are on your `PATH`.
+This stops SpeakEasy, removes the LaunchAgent and the binary, and takes
+SpeakEasy's own server entries and instruction blocks out of your agents'
+files. Everything else in those files stays as it is. The `.bak-sag`
+backups are kept, in case you want a file back exactly as it was before
+the install. Like the installer, it needs `python3` on your `PATH`.
 
 Uninstalling doesn't revoke the credential. Without `--purge`, it stays in
 `~/.slack-approval-gateway`. With `--purge`, the file is deleted, but the
@@ -548,9 +574,13 @@ SpeakEasy keeps its state in `~/.slack-approval-gateway/`:
 
 | File | What it holds |
 |---|---|
-| `slack_transport` | `slack-mcp` or `mistral-connector`. Written only when you pass `--transport`. Without it, SpeakEasy uses `slack-mcp`. |
+| `slack_transport` | `slack-mcp`, `mistral-connector`, or `korotovsky`. Written only when you pass `--transport`. Without it, SpeakEasy uses `slack-mcp`. |
 | `slack_mcp_token` | Slack user token (Slack MCP) |
 | `mistral_api_key` | Mistral API key (Mistral connector) |
+| `slack_bot_token`, `slack_user_token` | Slack tokens (Korotovsky server) |
+| `slack_stdio_command` | The command that starts your `slack-mcp-server` (Korotovsky server) |
+| `slack_workspace_domain` | Your workspace's subdomain, for message links (Korotovsky server) |
+| `korotovsky_*_cache.json` | The Korotovsky server's user and channel caches |
 | `cooldowns.json` | Active deny blocks |
 | `sent.json` | Records of sent messages, used to catch duplicates (kept 7 days) |
 | `gateway.log` | The login service's log |
@@ -572,7 +602,7 @@ token or `SLACK_TRANSPORT` set there wins over the files.
 |---|---|---|
 | `SLACK_TRANSPORT` | `slack_transport` file, then `slack-mcp` | The transport |
 | `SLACK_GATEWAY_STATE_DIR` | `~/.slack-approval-gateway` | The state folder. A process with a different value doesn't find the running SpeakEasy and starts its own. |
-| `SLACK_WORKSPACE_DOMAIN` | `workspace` | Your workspace's subdomain (`acme` for `acme.slack.com`). Used only to build a message link when the transport doesn't return one. |
+| `SLACK_WORKSPACE_DOMAIN` | `workspace` (Korotovsky server: the `slack_workspace_domain` file, then `workspace`) | Your workspace's subdomain (`acme` for `acme.slack.com`). Used only to build a message link when the transport doesn't return one. |
 | **Slack MCP** | | |
 | `SLACK_MCP_TOKEN` | `slack_mcp_token` file | The user token |
 | `SLACK_MCP_URL` | `https://mcp.slack.com/mcp` | The MCP endpoint |
@@ -583,8 +613,16 @@ token or `SLACK_TRANSPORT` set there wins over the files.
 | `MISTRAL_API_BASE` | `https://api.mistral.ai` | The API endpoint |
 | `MISTRAL_SLACK_CONNECTOR` | `slack` | The connector's name or ID |
 | `MISTRAL_SLACK_TOOL`, `MISTRAL_SLACK_CHANNEL_ARG`, `MISTRAL_SLACK_TEXT_ARG`, `MISTRAL_SLACK_THREAD_ARG` | as for Slack MCP | Send tool and argument names |
+| **Korotovsky server** | | |
+| `SLACK_BOT_TOKEN`, `SLACK_USER_TOKEN` | `slack_bot_token`, `slack_user_token` files | The tokens. SpeakEasy passes them to the server as `SLACK_MCP_XOXB_TOKEN` / `SLACK_MCP_XOXP_TOKEN`. |
+| `SLACK_STDIO_COMMAND` | `slack_stdio_command` file, then `slack-mcp-server --transport stdio` from `PATH` | The command that starts the server. It's split on spaces, with no quoting. |
+| `SLACK_STDIO_CONTENT_TYPE` | `text/plain` | `text/plain` or `text/markdown` |
+| `SLACK_STDIO_TOOL`, `SLACK_STDIO_CHANNEL_ARG`, `SLACK_STDIO_TEXT_ARG`, `SLACK_STDIO_THREAD_ARG` | `conversations_add_message`, `channel_id`, `text`, `thread_ts` | Send tool and argument names |
 
-The Korotovsky transport's variables are described in `src/slack_stdio.rs`.
+SpeakEasy starts the Korotovsky server with its own environment and sets
+`SLACK_MCP_ADD_MESSAGE_TOOL=true` (the server's send tool is off by default),
+`SLACK_MCP_LOG_LEVEL=error`, and cache paths in the state folder, unless you
+already set them.
 
 </details>
 
@@ -615,11 +653,11 @@ SLACK_GATEWAY_DEMO_SEED=single ./target/debug/slack-approval-gateway --demo
 | `src/core.rs` | The decision flow: validation, deny blocks, duplicate detection |
 | `src/mcp.rs` | The MCP server and the `request_slack_message` tool |
 | `src/instance.rs` | One running SpeakEasy per user: lock, socket, relays |
-| `src/main.rs`, `src/ui.rs` | Startup, run modes, the window, the menu-bar icon |
-| `src/ui/` | The approval window: a native egui/eframe + wgpu UI (no browser engine, no webview) |
+| `src/main.rs`, `src/ui.rs` | Startup, run modes, and the bridge between agents' requests and the window |
+| `src/ui/` | The approval window and the menu-bar icon: a native egui/eframe + wgpu UI (no browser engine, no webview) |
 | `src/slack.rs` | Transport selection and shared credential helpers |
 | `src/slack_mcp.rs`, `src/mistral_slack.rs` | The Slack MCP and Mistral connector transports |
-| `src/slack_stdio.rs` | The Korotovsky transport (not working yet) |
+| `src/slack_stdio.rs` | The Korotovsky transport (runs your `slack-mcp-server` over stdio) |
 | `src/slack_tools.rs` | Send-tool discovery and reply parsing, shared by the transports |
 | `NOTICE.md` | Upstream license notices (Once UI, Lucide, Heroicons, …) |
 | `scripts/install.sh`, `scripts/agent_config.py` | The installer and its agent-config editor |

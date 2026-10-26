@@ -230,10 +230,14 @@ with `scripts/slack_mcp_oauth.py` (authorize
 
 `KorotovskyClient` implements the same `SlackClient` contract by **spawning
 Korotovsky's unofficial Slack MCP server**
-(`@korotovsky/slack-mcp-server`, <https://github.com/korotovsky/slack-mcp-server>)
+(`slack-mcp-server`, <https://github.com/korotovsky/slack-mcp-server>)
 as a child process and speaking MCP (newline-delimited JSON-RPC 2.0 over
-its stdin/stdout; the default server command is
-`npx -y @korotovsky/slack-mcp-server`, i.e. it needs node/npx). The
+its stdin/stdout). The user installs the server; SpeakEasy never installs
+or downloads it. The command resolves from `SLACK_STDIO_COMMAND`, else a
+one-line `<state_dir>/slack_stdio_command` file, else `slack-mcp-server`
+found on PATH (run with `--transport stdio`); when none resolves, startup
+fails with a "not installed" error. Message links use the workspace domain
+from `SLACK_WORKSPACE_DOMAIN`, else `<state_dir>/slack_workspace_domain`. The
 credential is a Slack **bot token** (`xoxb-…`, default) or **user token**
 (`xoxp-…`), held by the gateway and passed to the child as
 `SLACK_MCP_XOXB_TOKEN` / `SLACK_MCP_XOXP_TOKEN`; agents never see it.
@@ -243,8 +247,8 @@ credential is a Slack **bot token** (`xoxb-…`, default) or **user token**
   `<state_dir>/slack_user_token` (either one suffices; the server's own
   `SLACK_MCP_XOX*` variables already in the environment are inherited by
   the child and count as a credential); at least one credential is
-  required, else an error naming both files. `SLACK_STDIO_COMMAND`
-  (whitespace-split command line), `SLACK_STDIO_CONTENT_TYPE`
+  required, else an error naming both files. The server command (see
+  above; whitespace-split, no quoting), `SLACK_STDIO_CONTENT_TYPE`
   (`text/plain` default / `text/markdown`), `SLACK_STDIO_TOOL` (pin the
   send tool) and argument renames `SLACK_STDIO_CHANNEL_ARG` /
   `SLACK_STDIO_TEXT_ARG` / `SLACK_STDIO_THREAD_ARG`.
@@ -545,12 +549,16 @@ transport with typed Rust calls):
   fail and the agent is told nothing was sent."
 - Closing the window only **hides** it (egui `CloseRequested` → hide); the
   gateway process keeps serving MCP for every agent. Quitting happens only
-  via the tray menu's **Quit SpeakEasy** (`UiState::quit` → the event loop
-  exits) or a signal; pending reply senders are then dropped, so blocked
-  `request_decision` calls return `Err` — never an approval. A Dock click /
-  `open` with no visible window (macOS `Reopen`) shows the window again.
+  via **Quit SpeakEasy** in the tray menu or the app menu (⌘Q)
+  (`UiState::quit` → the event loop exits) or a signal; pending reply
+  senders are then dropped, so blocked `request_decision` calls return
+  `Err` — never an approval. Any activation of the app while it is
+  inactive (a Dock click, Cmd+Tab, `open`) shows the window again (an
+  `NSApplicationDidBecomeActive` observer, `sys::observe_dock_reopen`); a
+  Dock click while SpeakEasy is still the active app does not.
 - A menu-bar tray icon (`tray-icon` crate, macOS) offers **Show approval
-  window** / **Quit SpeakEasy**; a left click on the icon shows the window.
+  window** / **Quit SpeakEasy** on right-click; a left click on the icon
+  shows the window.
 
 `src/ui/` module map:
 
@@ -584,7 +592,8 @@ Slack client, provider, MCP server, and UI. Three run modes:
 
 GUI mode runs the eframe app (managed `UiState` + `UiHooks`, MCP server
 on a background thread), installs the tray icon, hides the window on
-close, and shows it on macOS `Reopen`. After the event loop ends, the app
+close, and shows it again when the app is activated
+(`NSApplicationDidBecomeActive`). After the event loop ends, the app
 waits for any in-flight approved send to finish and be recorded before
 exiting. The window is created hidden (720×780, min 520×560, centered)
 and revealed per request. `--demo` runs the same UI against synthetic
@@ -598,9 +607,10 @@ sends real messages.
   binary.
 - `scripts/install.sh` installs the app into every detected coding agent on
   this Mac and starts the LaunchAgent service (`--dry-run`, `--enforce`,
-  `--uninstall`, `--slack-mcp-token`, `--state-dir`, `--transport`
-  (`slack-mcp` | `mistral-connector` | `korotovsky`), `--mistral-api-key`,
-  `--slack-bot-token`, `--slack-user-token` flags; see README §0).
+  `--uninstall`, `--purge`, `--skip-build`, `--slack-mcp-token`,
+  `--transport` (`slack-mcp` | `mistral-connector` | `korotovsky`),
+  `--mistral-api-key`, `--slack-bot-token`, `--slack-user-token`,
+  `--workspace-domain` flags; see README "Install").
   `scripts/agent_config.py` is
   the per-agent config editor it uses (idempotent, `.bak-sag` backups);
   `scripts/test_agent_config.py` tests it. `scripts/slack_mcp_oauth.py`

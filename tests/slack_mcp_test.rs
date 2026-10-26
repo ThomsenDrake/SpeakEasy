@@ -549,13 +549,18 @@ fn resolve_destination_resolves_user_and_channel_ids() {
         Some("Bearer xoxp-slack-mcp-test-token")
     );
 
-    // Channel ID -> "#name" via the channel object.
+    // Channel ID -> "#name" via the channels array (the list tool's shape);
+    // the list tool takes no channel ID, so it gets a full-page request.
     assert_eq!(client.resolve_destination("C0ENG"), Some("#eng".to_string()));
-    let channel_calls = mock.calls_to("slack_read_channel");
-    assert_eq!(channel_calls.len(), 1);
+    assert_eq!(
+        client.resolve_destination("C0RAND"),
+        Some("#random".to_string())
+    );
+    let channel_calls = mock.calls_to("slack_list_user_channels");
+    assert_eq!(channel_calls.len(), 2);
     assert_eq!(
         channel_calls[0].body["params"]["arguments"],
-        json!({ "channel_id": "C0ENG" })
+        json!({ "limit": 200 })
     );
 
     // A flat JSON user object resolves the same way.
@@ -582,23 +587,205 @@ fn resolve_destination_resolves_user_and_channel_ids() {
         Some("Drake Thomsen (@drake.thomsen)".to_string())
     );
 
-    // A channels array (the list tool's shape) resolves the channel too.
+    // `Channel: #name (ID)` text resolves the channel too.
     mock.set_tool_reply_for(
-        "slack_read_channel",
+        "slack_list_user_channels",
+        json!({ "content": [{ "type": "text", "text":
+            "Channel: #eng (C0ENG)\n\n=== Message from someone ===" }] }),
+    );
+    assert_eq!(client.resolve_destination("C0ENG"), Some("#eng".to_string()));
+}
+
+/// The official Slack MCP server's tool catalog: the decoys
+/// (`slack_search_users`, `slack_read_channel`, …) come before the lookup
+/// tools in `tools/list` order. `reverse` flips the list to prove the
+/// lookup preference does not depend on the order.
+fn official_catalog(reverse: bool) -> Vec<Value> {
+    let mut tools = json!([
+        { "name": "slack_search_messages", "inputSchema": { "type": "object", "properties": {
+            "query": { "type": "string" } } } },
+        { "name": "slack_search_users", "inputSchema": { "type": "object", "properties": {
+            "query": { "type": "string" } }, "required": ["query"] } },
+        { "name": "slack_search_channels", "inputSchema": { "type": "object", "properties": {
+            "query": { "type": "string" } }, "required": ["query"] } },
+        { "name": "slack_read_channel", "inputSchema": { "type": "object", "properties": {
+            "channel_id": { "type": "string" } }, "required": ["channel_id"] } },
+        { "name": "slack_read_user_profile", "inputSchema": { "type": "object", "properties": {
+            "user_id": { "type": "string" } } } },
+        { "name": "slack_list_user_channels", "inputSchema": { "type": "object", "properties": {
+            "types": { "type": "string" },
+            "name_prefix": { "type": "string" },
+            "exclude_archived": { "type": "boolean" },
+            "limit": { "type": "integer" },
+            "cursor": { "type": "string" },
+            "format": { "type": "string" },
+            "team_id": { "type": "string" }
+        } } },
+        { "name": "slack_send_message", "inputSchema": { "type": "object", "properties": {
+            "channel_id": { "type": "string" },
+            "message": { "type": "string" },
+            "thread_ts": { "type": "string" }
+        }, "required": ["channel_id", "message"] } }
+    ])
+    .as_array()
+    .expect("catalog is an array")
+    .clone();
+    if reverse {
+        tools.reverse();
+    }
+    tools
+}
+
+#[test]
+fn preferred_lookup_tools_win_regardless_of_tools_list_order() {
+    for reverse in [false, true] {
+        let mock = MockSlackMcpServer::start();
+        mock.set_tools(official_catalog(reverse));
+        let client = fresh_client(&mock);
+
+        // The user lookup is slack_read_user_profile (users:read), not
+        // slack_search_users (search:read.users, and it takes a query).
+        assert_eq!(
+            client.resolve_destination("U0DRAKE"),
+            Some("Drake Thomsen (@drake.thomsen)".to_string()),
+            "reversed order: {reverse}"
+        );
+        let user_calls = mock.calls_to("slack_read_user_profile");
+        assert_eq!(user_calls.len(), 1, "reversed order: {reverse}");
+        assert_eq!(
+            user_calls[0].body["params"]["arguments"],
+            json!({ "user_id": "U0DRAKE" })
+        );
+        assert!(
+            mock.calls_to("slack_search_users").is_empty(),
+            "the search tool must not be called (reversed order: {reverse})"
+        );
+
+        // The channel lookup is slack_list_user_channels (channels:read
+        // and friends), not slack_read_channel (the *:history scopes).
+        assert_eq!(
+            client.resolve_destination("C0ENG"),
+            Some("#eng".to_string()),
+            "reversed order: {reverse}"
+        );
+        let channel_calls = mock.calls_to("slack_list_user_channels");
+        assert_eq!(channel_calls.len(), 1, "reversed order: {reverse}");
+        assert_eq!(
+            channel_calls[0].body["params"]["arguments"],
+            json!({ "limit": 200 })
+        );
+        assert!(
+            mock.calls_to("slack_read_channel").is_empty(),
+            "the history-reading tool must not be called (reversed order: {reverse})"
+        );
+        assert!(
+            mock.calls_to("slack_search_channels").is_empty(),
+            "the search tool must not be called (reversed order: {reverse})"
+        );
+    }
+}
+
+#[test]
+fn the_loose_name_match_is_the_fallback_when_the_official_tools_are_absent() {
+    let mock = MockSlackMcpServer::start();
+    // A server that names its lookup tools differently (no official names).
+    mock.set_tools(
+        json!([
+            { "name": "users_get_info", "inputSchema": { "type": "object", "properties": {
+                "user_id": { "type": "string" } } } },
+            { "name": "conversations_get_info", "inputSchema": { "type": "object", "properties": {
+                "channel_id": { "type": "string" } } } },
+            { "name": "send_message", "inputSchema": { "type": "object", "properties": {
+                "channel_id": { "type": "string" }, "message": { "type": "string" } } } }
+        ])
+        .as_array()
+        .unwrap()
+        .clone(),
+    );
+    mock.set_tool_reply_for(
+        "users_get_info",
         json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
-            "channels": [{ "id": "C0RAND", "name": "random" }]
+            "real_name": "Drake Thomsen", "name": "drake.thomsen"
+        })).unwrap() }] }),
+    );
+    mock.set_tool_reply_for(
+        "conversations_get_info",
+        json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+            "channel": { "id": "C0ENG", "name": "eng" }
+        })).unwrap() }] }),
+    );
+    let client = fresh_client(&mock);
+
+    assert_eq!(
+        client.resolve_destination("U0DRAKE"),
+        Some("Drake Thomsen (@drake.thomsen)".to_string())
+    );
+    let user_calls = mock.calls_to("users_get_info");
+    assert_eq!(user_calls.len(), 1);
+    assert_eq!(
+        user_calls[0].body["params"]["arguments"],
+        json!({ "user_id": "U0DRAKE" })
+    );
+
+    assert_eq!(client.resolve_destination("C0ENG"), Some("#eng".to_string()));
+    let channel_calls = mock.calls_to("conversations_get_info");
+    assert_eq!(channel_calls.len(), 1);
+    assert_eq!(
+        channel_calls[0].body["params"]["arguments"],
+        json!({ "channel_id": "C0ENG" })
+    );
+}
+
+#[test]
+fn wrapped_lookup_replies_are_unwrapped() {
+    let mock = MockSlackMcpServer::start();
+    let client = fresh_client(&mock);
+
+    // `{"result": "<json>"}` — the wrapped string is itself JSON.
+    mock.set_tool_reply_for(
+        "slack_read_user_profile",
+        json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+            "result": serde_json::to_string(&json!({ "user": {
+                "real_name": "Drake Thomsen", "name": "drake.thomsen",
+                "profile": { "display_name": "Drake" }
+            } })).unwrap()
         })).unwrap() }] }),
     );
     assert_eq!(
-        client.resolve_destination("C0RAND"),
-        Some("#random".to_string())
+        client.resolve_destination("U0DRAKE"),
+        Some("Drake Thomsen (@drake.thomsen)".to_string())
     );
 
-    // `Channel: #name (ID)` text resolves the channel too.
+    // `{"result": "<formatted text>"}` — the wrapped string is Key: value
+    // lines.
     mock.set_tool_reply_for(
-        "slack_read_channel",
-        json!({ "content": [{ "type": "text", "text":
-            "Channel: #eng (C0ENG)\n\n=== Message from someone ===" }] }),
+        "slack_read_user_profile",
+        json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+            "result": "User ID: U0DRAKE\nUsername: drake.thomsen\nReal Name: Drake Thomsen\n"
+        })).unwrap() }] }),
+    );
+    assert_eq!(
+        client.resolve_destination("U0DRAKE"),
+        Some("Drake Thomsen (@drake.thomsen)".to_string())
+    );
+
+    // `{"messages": "<json>"}` — the channel list, wrapped.
+    mock.set_tool_reply_for(
+        "slack_list_user_channels",
+        json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+            "messages": serde_json::to_string(&json!({ "channels": [
+                { "id": "C0ENG", "name": "eng" }
+            ] })).unwrap()
+        })).unwrap() }] }),
+    );
+    assert_eq!(client.resolve_destination("C0ENG"), Some("#eng".to_string()));
+
+    // `{"messages": "<Channel: #name text>"}`.
+    mock.set_tool_reply_for(
+        "slack_list_user_channels",
+        json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+            "messages": "Channel: #eng (C0ENG)\n\n=== Message from someone ==="
+        })).unwrap() }] }),
     );
     assert_eq!(client.resolve_destination("C0ENG"), Some("#eng".to_string()));
 }

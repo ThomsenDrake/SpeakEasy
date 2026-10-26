@@ -1,6 +1,12 @@
 //! Slack sending via Korotovsky's unofficial Slack MCP server
-//! (`@korotovsky/slack-mcp-server`, <https://github.com/korotovsky/slack-mcp-server>)
+//! (`slack-mcp-server`, <https://github.com/korotovsky/slack-mcp-server>)
 //! over MCP stdio.
+//!
+//! The server command resolves from `SLACK_STDIO_COMMAND`, else a one-line
+//! `<state_dir>/slack_stdio_command` file, else `slack-mcp-server` found on
+//! PATH (run with `--transport stdio`, the server's documented stdio
+//! invocation). SpeakEasy never installs or downloads the server; when none
+//! of these resolves, startup fails with instructions.
 //!
 //! The third [`SlackClient`] transport: the gateway spawns the server as a
 //! child process and speaks MCP (newline-delimited JSON-RPC) over its
@@ -22,10 +28,11 @@
 //! the other transports in [`crate::slack_tools`]. The reply of
 //! `conversations_add_message` is plain text (`Successfully posted message
 //! to channel … (ts=…)`), so the permalink is built with
-//! [`crate::slack::fallback_permalink`].
+//! [`crate::slack::fallback_permalink_with_domain`] from the workspace
+//! domain (`SLACK_WORKSPACE_DOMAIN`, else `<state_dir>/slack_workspace_domain`).
 
 use crate::core::{SlackClient, SlackError, SlackSend};
-use crate::slack::{fallback_permalink, non_empty_env};
+use crate::slack::{fallback_permalink_with_domain, non_empty_env, workspace_domain};
 use crate::slack_tools::{
     is_send_message_tool, pick_argument, schema_properties, send_arguments, send_outcome,
     text_content, tool_result_error, SendToolSpec, CHANNEL_ARG_CANDIDATES, THREAD_ARG_CANDIDATES,
@@ -44,8 +51,10 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Upper bound on each MCP call (initialize, tools/list, tools/call).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The server command used when `SLACK_STDIO_COMMAND` is not set.
-const DEFAULT_COMMAND: &str = "npx -y @korotovsky/slack-mcp-server";
+/// The server program looked up on PATH when nothing else configures the
+/// command. Its npm bin is a node wrapper around the native binary, so both
+/// it and `node` must be reachable; the wrapper passes the arguments through.
+const PATH_SERVER_PROGRAM: &str = "slack-mcp-server";
 
 /// Candidate property names for the message-text argument. `text` is the
 /// server's current parameter; `payload` is accepted by older versions.
@@ -76,6 +85,9 @@ pub struct KorotovskyClient {
     thread_arg: Option<String>,
     /// `text/plain` (default) or `text/markdown`.
     content_type: String,
+    /// The workspace domain for fallback permalinks: `SLACK_WORKSPACE_DOMAIN`
+    /// wins over the `<state_dir>/slack_workspace_domain` file.
+    workspace_domain: String,
     /// The child's stdin, the reply channel and the RPC id counter. One
     /// mutex: MCP requests are serialized, which also keeps id matching
     /// trivial.
@@ -105,8 +117,10 @@ impl KorotovskyClient {
     /// `slack_user_token`, one line, trimmed, chmod 600). At least one
     /// credential is required, unless the server's own `SLACK_MCP_XOX*`
     /// variables are already in the environment (the child inherits them).
-    /// `SLACK_STDIO_COMMAND` overrides the server command (default
-    /// `npx -y @korotovsky/slack-mcp-server`), `SLACK_STDIO_CONTENT_TYPE`
+    /// The server command resolves from `SLACK_STDIO_COMMAND`, else a
+    /// one-line `<state_dir>/slack_stdio_command` file, else
+    /// `slack-mcp-server` on PATH (run with `--transport stdio`); SpeakEasy
+    /// never installs the server. `SLACK_STDIO_CONTENT_TYPE`
     /// picks `text/plain` (default) or `text/markdown`. The MCP handshake
     /// runs here so a bad token or a missing server fails at startup, not
     /// after an approval.
@@ -133,8 +147,7 @@ impl KorotovskyClient {
                 state_dir.display()
             )));
         }
-        let command =
-            non_empty_env("SLACK_STDIO_COMMAND").unwrap_or_else(|| DEFAULT_COMMAND.to_string());
+        let command = resolve_command(state_dir)?;
         let content_type = non_empty_env("SLACK_STDIO_CONTENT_TYPE")
             .unwrap_or_else(|| "text/plain".to_string());
         let mut client = Self::new(bot, user, &command, &content_type, state_dir)?;
@@ -166,6 +179,7 @@ impl KorotovskyClient {
         }
         let content_type = validate_content_type(content_type)?;
         let (program, args) = split_command(command)?;
+        let workspace_domain = workspace_domain(state_dir);
 
         let mut cmd = Command::new(&program);
         cmd.args(&args)
@@ -206,9 +220,10 @@ impl KorotovskyClient {
         }
         let mut child = cmd.spawn().map_err(|e| {
             SlackError(format!(
-                "cannot start the Slack MCP server '{command}': {e} (install it with \
-                 `npm install -g @korotovsky/slack-mcp-server`, or set SLACK_STDIO_COMMAND \
-                 to the server's path)"
+                "cannot start the Slack MCP server '{command}': {e} (check the server command: \
+                 SLACK_STDIO_COMMAND, the slack_stdio_command file in {}, or `slack-mcp-server` \
+                 on PATH — https://github.com/korotovsky/slack-mcp-server)",
+                state_dir.display()
             ))
         })?;
         let stdin = child
@@ -279,6 +294,7 @@ impl KorotovskyClient {
             text_arg: None,
             thread_arg: None,
             content_type,
+            workspace_domain,
             session: Mutex::new(session),
             child: Mutex::new(child),
         })
@@ -498,7 +514,11 @@ impl SlackClient for KorotovskyClient {
                 if ts.is_empty() {
                     None
                 } else {
-                    Some(fallback_permalink(&channel, &ts))
+                    Some(fallback_permalink_with_domain(
+                        &channel,
+                        &ts,
+                        &self.workspace_domain,
+                    ))
                 }
             })
             .unwrap_or_default();
@@ -563,6 +583,89 @@ fn validate_content_type(value: &str) -> Result<String, SlackError> {
     }
 }
 
+/// Resolve the Slack MCP server command. SpeakEasy never installs or
+/// downloads the server — it must already be installed. Precedence:
+///   1. `SLACK_STDIO_COMMAND` (a full command line, e.g.
+///      `slack-mcp-server --transport stdio`);
+///   2. a one-line `<state_dir>/slack_stdio_command` file (same format);
+///   3. `slack-mcp-server` found on PATH, run with `--transport stdio`.
+/// When none resolves, the error says the server is not installed and how
+/// to point SpeakEasy at it.
+fn resolve_command(state_dir: &Path) -> Result<String, SlackError> {
+    resolve_command_from(
+        state_dir,
+        non_empty_env("SLACK_STDIO_COMMAND").as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// The resolution behind [`resolve_command`], with the environment inputs
+/// passed explicitly so tests need not touch the process environment.
+fn resolve_command_from(
+    state_dir: &Path,
+    env_command: Option<&str>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Result<String, SlackError> {
+    if let Some(command) = env_command.map(str::trim).filter(|c| !c.is_empty()) {
+        return Ok(command.to_string());
+    }
+    let file = state_dir.join("slack_stdio_command");
+    match std::fs::read_to_string(&file) {
+        Ok(contents) => {
+            let command = contents.trim();
+            if command.is_empty() {
+                return Err(SlackError(format!(
+                    "the Slack MCP server command file {} is empty",
+                    file.display()
+                )));
+            }
+            return Ok(command.to_string());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(SlackError(format!(
+                "cannot read the Slack MCP server command file {}: {e}",
+                file.display()
+            )))
+        }
+    }
+    if let Some(path) = find_on_path(PATH_SERVER_PROGRAM, path_var) {
+        return Ok(format!("{} --transport stdio", path.display()));
+    }
+    Err(SlackError(format!(
+        "the korotovsky Slack MCP server is not installed: `{PATH_SERVER_PROGRAM}` was not \
+         found on PATH. SpeakEasy does not install it — install it yourself from \
+         https://github.com/korotovsky/slack-mcp-server, then either leave it on PATH, write \
+         its command to {} (e.g. 'slack-mcp-server --transport stdio'), or set \
+         SLACK_STDIO_COMMAND when starting the gateway",
+        file.display()
+    )))
+}
+
+/// The absolute path of `program` on `path_var` (an executable file), if any.
+fn find_on_path(program: &str, path_var: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let path_var = path_var?;
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Whether `path` is an executable file (a directory named like the program
+/// is not enough).
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+}
+
 /// Split a command line into program + arguments (whitespace-separated; no
 /// quoting — paths with spaces need a wrapper script).
 fn split_command(command: &str) -> Result<(String, Vec<String>), SlackError> {
@@ -570,7 +673,7 @@ fn split_command(command: &str) -> Result<(String, Vec<String>), SlackError> {
     let program = parts.next().unwrap_or_default().to_string();
     if program.is_empty() {
         return Err(SlackError(
-            "SLACK_STDIO_COMMAND is empty (expected e.g. 'npx -y @korotovsky/slack-mcp-server')"
+            "SLACK_STDIO_COMMAND is empty (expected e.g. 'slack-mcp-server --transport stdio')"
                 .to_string(),
         ));
     }
@@ -842,10 +945,10 @@ mod tests {
     #[test]
     fn split_command_splits_program_and_args() {
         assert_eq!(
-            split_command("npx -y @korotovsky/slack-mcp-server").unwrap(),
+            split_command("slack-mcp-server --transport stdio").unwrap(),
             (
-                "npx".to_string(),
-                vec!["-y".to_string(), "@korotovsky/slack-mcp-server".to_string()]
+                "slack-mcp-server".to_string(),
+                vec!["--transport".to_string(), "stdio".to_string()]
             )
         );
         assert_eq!(
@@ -853,6 +956,84 @@ mod tests {
             ("/usr/local/bin/slack-mcp-server".to_string(), vec![])
         );
         assert!(split_command("   ").is_err());
+    }
+
+    /// A fresh scratch directory for the command-resolution tests.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slack-approval-gateway-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_command_prefers_env_then_file_then_path() {
+        let dir = scratch_dir("resolve-command");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let server = bin_dir.join(PATH_SERVER_PROGRAM);
+        std::fs::write(&server, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let server_path = std::ffi::OsString::from(bin_dir.as_os_str());
+        let empty_dir = dir.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let empty_path = std::ffi::OsString::from(empty_dir.as_os_str());
+        let file = dir.join("slack_stdio_command");
+
+        // Nothing resolves: the not-installed error names the file, the env
+        // var and the repo.
+        let err = resolve_command_from(&dir, None, Some(&empty_path)).unwrap_err();
+        assert!(err.0.contains("not installed"), "{}", err.0);
+        assert!(err.0.contains("slack_stdio_command"), "{}", err.0);
+        assert!(err.0.contains("SLACK_STDIO_COMMAND"), "{}", err.0);
+        assert!(
+            err.0.contains("https://github.com/korotovsky/slack-mcp-server"),
+            "{}",
+            err.0
+        );
+
+        // A non-executable file on PATH does not count either.
+        let noexec_dir = dir.join("noexec");
+        std::fs::create_dir_all(&noexec_dir).unwrap();
+        std::fs::write(noexec_dir.join(PATH_SERVER_PROGRAM), "not executable\n").unwrap();
+        let noexec_path = std::ffi::OsString::from(noexec_dir.as_os_str());
+        let err = resolve_command_from(&dir, None, Some(&noexec_path)).unwrap_err();
+        assert!(err.0.contains("not installed"), "{}", err.0);
+
+        // PATH: the server is run with --transport stdio.
+        assert_eq!(
+            resolve_command_from(&dir, None, Some(&server_path)).unwrap(),
+            format!("{} --transport stdio", server.display())
+        );
+
+        // The file beats PATH.
+        std::fs::write(&file, "  /opt/slack/server --transport stdio \n").unwrap();
+        assert_eq!(
+            resolve_command_from(&dir, None, Some(&server_path)).unwrap(),
+            "/opt/slack/server --transport stdio"
+        );
+
+        // The env var beats the file (a blank one falls through to the file).
+        assert_eq!(
+            resolve_command_from(&dir, Some("/env/server --flag"), Some(&server_path)).unwrap(),
+            "/env/server --flag"
+        );
+        assert_eq!(
+            resolve_command_from(&dir, Some("   "), Some(&server_path)).unwrap(),
+            "/opt/slack/server --transport stdio"
+        );
+
+        // An empty command file is an error, not a silent fallback.
+        std::fs::write(&file, "\n").unwrap();
+        let err = resolve_command_from(&dir, None, Some(&server_path)).unwrap_err();
+        assert!(err.0.contains("is empty"), "{}", err.0);
     }
 
     #[test]

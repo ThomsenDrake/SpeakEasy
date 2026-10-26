@@ -561,6 +561,9 @@ impl ApprovalApp {
             };
             match TrayIconBuilder::new().with_id("slack-approval-gateway")
                 .with_menu(Box::new(menu))
+                // A left click opens the window (the menu is right-click
+                // only); tray-icon's default shows the menu on left click.
+                .with_menu_on_left_click(false)
                 .with_icon(icon)
                 .with_icon_as_template(true)
                 .with_tooltip(APP_TITLE)

@@ -30,16 +30,15 @@
 # Usage:
 #   scripts/install.sh [--dry-run] [--enforce] [--uninstall] [--purge]
 #                      [--skip-build] [--slack-mcp-token xoxp-...]
-#                      [--state-dir DIR]
 #                      [--transport slack-mcp|mistral-connector|korotovsky]
 #                      [--mistral-api-key KEY] [--slack-bot-token xoxb-...]
-#                      [--slack-user-token xoxp-...]
+#                      [--slack-user-token xoxp-...] [--workspace-domain DOMAIN]
 #
 #   --dry-run     print what would happen, change nothing
 #   --enforce     also remove direct (token-based) Slack MCP servers from
 #                 agent configs (agents then cannot send except through the
-#                 gateway; restores with: install.sh --uninstall). The
-#                 official Slack MCP / Mistral connector servers are kept:
+#                 gateway; the pre-install files stay as <file>.bak-sag).
+#                 The official Slack MCP / Mistral connector servers are kept:
 #                 agents are expected to have them for reading Slack
 #                 context, and the instruction block + hook guard are the
 #                 boundary for their send tools.
@@ -56,7 +55,6 @@
 #                 --client-secret SECRET   (an existing token file is kept
 #                 unless this flag is given; $SLACK_MCP_TOKEN is only a
 #                 fallback)
-#   --state-dir   state dir (default ~/.slack-approval-gateway)
 #   --transport   how the gateway sends to Slack (default: slack-mcp):
 #                 slack-mcp         the official Slack MCP server
 #                                    (https://mcp.slack.com/mcp, remote MCP)
@@ -66,10 +64,13 @@
 #                                    (connect the workspace there first), and
 #                                    the gateway only holds a Mistral API key;
 #                 korotovsky       Korotovsky's unofficial Slack MCP server
-#                                    (@korotovsky/slack-mcp-server, spawned
-#                                    as a stdio child process) with a Slack
-#                                    bot token (xoxb-..., default) or user
-#                                    token (xoxp-...) — see the flags below.
+#                                    (slack-mcp-server,
+#                                    https://github.com/korotovsky/slack-mcp-server
+#                                    — you install it; SpeakEasy never installs
+#                                    or downloads it; spawned as a stdio child
+#                                    process) with a Slack bot token
+#                                    (xoxb-..., default) or user token
+#                                    (xoxp-...) — see the flags below.
 #   --mistral-api-key  Mistral API key, stored only in
 #                 <state-dir>/mistral_api_key (chmod 600). Falls back to
 #                 $MISTRAL_API_KEY. Required for the mistral-connector
@@ -86,6 +87,12 @@
 #                 or --slack-bot-token is required for the korotovsky
 #                 transport (a bot token is the usual choice: the server
 #                 posts as the app).
+#   --workspace-domain  Slack workspace domain (e.g. acme for
+#                 acme.slack.com), stored in <state-dir>/slack_workspace_domain.
+#                 The korotovsky server's replies carry no permalink, so the
+#                 gateway builds message links from this domain;
+#                 $SLACK_WORKSPACE_DOMAIN overrides the file when the gateway
+#                 runs.
 
 set -euo pipefail
 
@@ -111,17 +118,18 @@ TRANSPORT_ARG=""
 MISTRAL_KEY_ARG=""
 BOT_TOKEN_ARG=""
 USER_TOKEN_ARG=""
+WORKSPACE_DOMAIN_ARG=""
 
 expect_value=""
 for arg in "$@"; do
   if [ -n "$expect_value" ]; then
     case "$expect_value" in
       --slack-mcp-token) MCP_TOKEN_ARG="$arg" ;;
-      --state-dir) STATE_DIR="$arg" ;;
       --transport) TRANSPORT_ARG="$arg" ;;
       --mistral-api-key) MISTRAL_KEY_ARG="$arg" ;;
       --slack-bot-token) BOT_TOKEN_ARG="$arg" ;;
       --slack-user-token) USER_TOKEN_ARG="$arg" ;;
+      --workspace-domain) WORKSPACE_DOMAIN_ARG="$arg" ;;
     esac
     expect_value=""
     continue
@@ -132,15 +140,24 @@ for arg in "$@"; do
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
-    --slack-mcp-token|--state-dir|--transport|--mistral-api-key|--slack-bot-token|--slack-user-token)
+    --slack-mcp-token|--transport|--mistral-api-key|--slack-bot-token|--slack-user-token|--workspace-domain)
       expect_value="$arg" ;;
     --slack-mcp-token=*) MCP_TOKEN_ARG="${arg#--slack-mcp-token=}" ;;
-    --state-dir=*) STATE_DIR="${arg#--state-dir=}" ;;
     --transport=*) TRANSPORT_ARG="${arg#--transport=}" ;;
     --mistral-api-key=*) MISTRAL_KEY_ARG="${arg#--mistral-api-key=}" ;;
     --slack-bot-token=*) BOT_TOKEN_ARG="${arg#--slack-bot-token=}" ;;
     --slack-user-token=*) USER_TOKEN_ARG="${arg#--slack-user-token=}" ;;
-    -h|--help) sed -n '2,70p' "$0"; exit 0 ;;
+    --workspace-domain=*) WORKSPACE_DOMAIN_ARG="${arg#--workspace-domain=}" ;;
+    --state-dir|--state-dir=*)
+      echo "--state-dir is not supported: the service and the agents always use" >&2
+      echo "~/.slack-approval-gateway — there is no per-install state dir to move" >&2
+      exit 2 ;;
+    -h|--help)
+      # Print the whole header comment block (every leading '#' line after
+      # the shebang), so the help survives edits that change its length.
+      awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
+      exit 0
+      ;;
     *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -196,12 +213,11 @@ if [ "$(uname -s)" != "Darwin" ]; then
   say "your agents manually (see README.md)."
   exit 1
 fi
-for tool in cargo "$PY"; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    say "missing required tool: $tool" >&2
-    exit 1
-  fi
-done
+# python runs scripts/agent_config.py in every mode, --uninstall included.
+if ! command -v "$PY" >/dev/null 2>&1; then
+  say "missing required tool: $PY (runs scripts/agent_config.py)" >&2
+  exit 1
+fi
 
 # --------------------------------------------------------------------------- #
 # uninstall
@@ -216,6 +232,7 @@ if [ "$UNINSTALL" = 1 ]; then
   run_ok claude mcp remove --scope user "$SERVER_NAME"
   run_ok codex mcp remove "$SERVER_NAME"
   run_ok vibe mcp remove "$SERVER_NAME"
+  ac remove-json claude "$HOME_DIR/.claude.json"
   ac remove-json pi "$HOME_DIR/.paradev/agent/settings.json"
   ac remove-json opencode "$HOME_DIR/.config/opencode/opencode.json"
   ac remove-json gemini "$HOME_DIR/.gemini/settings.json"
@@ -226,11 +243,13 @@ if [ "$UNINSTALL" = 1 ]; then
   ac remove-goose "$HOME_DIR/.config/goose/config.yaml"
   ac remove-hermes "$HOME_DIR/.hermes/config.yaml"
   ac remove-codex "$HOME_DIR/.codex/config.toml"
+  ac remove-vibe "$HOME_DIR/.vibe/config.toml"
   for f in "$HOME_DIR/.claude/CLAUDE.md" "$HOME_DIR/.codex/AGENTS.md" \
            "$HOME_DIR/.config/opencode/AGENTS.md" "$HOME_DIR/.vibe/AGENTS.md" \
            "$HOME_DIR/.config/goose/.goosehints" "$HOME_DIR/.pi/agent/AGENTS.md" \
            "$HOME_DIR/.paradev/agent/AGENTS.md" "$HOME_DIR/.gemini/GEMINI.md" \
-           "$HOME_DIR/.copilot/copilot-instructions.md" "$HOME_DIR/.hermes/AGENTS.md"; do
+           "$HOME_DIR/.copilot/copilot-instructions.md" "$HOME_DIR/.hermes/SOUL.md" \
+           "$HOME_DIR/.hermes/AGENTS.md" "$HOME_DIR/.config/zed/AGENTS.md"; do
     ac instruction-remove "$f"
   done
   run rm -f "$HOME_DIR/.config/zed/rules/slack-gateway.md"
@@ -241,8 +260,10 @@ if [ "$UNINSTALL" = 1 ]; then
     say "Kept state dir $STATE_DIR (cooldowns, sent records, token file)."
     say "Delete it manually with: rm -rf $STATE_DIR"
   fi
-  say "Uninstalled. Agent configs were restored from their .bak-sag backups"
-  say "where one existed."
+  say "Uninstalled. SpeakEasy's own entries and instruction blocks were"
+  say "removed from your agent configs; your other changes to those files"
+  say "are untouched. The pre-install .bak-sag backups remain next to each"
+  say "config file for a manual full restore."
   exit 0
 fi
 
@@ -252,6 +273,15 @@ fi
 hr
 say "1. Build"
 hr
+# cargo is only required when a build actually runs: not for --uninstall
+# (which exits above), not for --skip-build, not for --dry-run.
+if [ "$SKIP_BUILD" = 0 ] && [ "$DRY_RUN" = 0 ]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    say "missing required tool: cargo (needed to build; or pass --skip-build" >&2
+    say "to reuse the existing release binary)" >&2
+    exit 1
+  fi
+fi
 if [ "$SKIP_BUILD" = 1 ]; then
   say "  skipping build (--skip-build)"
 else
@@ -329,10 +359,24 @@ else
   say "  transport: slack-mcp (default; SLACK_TRANSPORT or $TRANSPORT_FILE can change it)"
 fi
 
+# --- workspace domain (message permalinks; the korotovsky server's replies
+# carry no permalink, so the gateway builds links from this domain)
+WORKSPACE_DOMAIN_FILE="$STATE_DIR/slack_workspace_domain"
+if [ -n "$WORKSPACE_DOMAIN_ARG" ]; then
+  if [ "$DRY_RUN" = 0 ]; then
+    printf '%s\n' "$WORKSPACE_DOMAIN_ARG" > "$WORKSPACE_DOMAIN_FILE"
+  else
+    say "  [dry-run] write $WORKSPACE_DOMAIN_FILE ($WORKSPACE_DOMAIN_ARG)"
+  fi
+  say "  wrote $WORKSPACE_DOMAIN_FILE — message permalinks point at $WORKSPACE_DOMAIN_ARG.slack.com"
+  say "  (SLACK_WORKSPACE_DOMAIN overrides the file when the gateway runs)"
+fi
+
 # --- Mistral API key (the mistral-connector transport)
 # Precedence: the --mistral-api-key flag, then an existing key file, then
 # $MISTRAL_API_KEY. An ambient env var must never clobber a working file.
 MISTRAL_KEY_FILE="$STATE_DIR/mistral_api_key"
+MISTRAL_CREDENTIAL_WRITTEN=0
 if [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
   if [ -n "$MISTRAL_KEY_ARG" ]; then
     MISTRAL_KEY="$MISTRAL_KEY_ARG"
@@ -342,6 +386,7 @@ if [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
     MISTRAL_KEY=""
   fi
   if [ -n "$MISTRAL_KEY" ]; then
+    MISTRAL_CREDENTIAL_WRITTEN=1
     if [ "$DRY_RUN" = 0 ]; then
       umask 077
       printf '%s\n' "$MISTRAL_KEY" > "$MISTRAL_KEY_FILE"
@@ -363,10 +408,12 @@ if [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
       say "  [dry-run] write placeholder $MISTRAL_KEY_FILE"
     fi
     say "  WARNING: no Mistral API key given (--mistral-api-key KEY or MISTRAL_API_KEY)."
-    say "  Wrote a placeholder to $MISTRAL_KEY_FILE — approval popups work, but"
-    say "  connector sends fail until you install a real key:"
+    say "  Wrote a placeholder to $MISTRAL_KEY_FILE — the gateway starts and"
+    say "  approval popups work, but connector sends fail until you install a"
+    say "  real key:"
     say "    scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_KEY"
-    say "  (the service restarts automatically; it reads the file at startup)"
+    say "  (re-running the installer restarts the service, which reads the file"
+    say "   at startup)"
   fi
 fi
 
@@ -374,6 +421,7 @@ fi
 # Precedence: the --slack-mcp-token flag, then an existing token file, then
 # $SLACK_MCP_TOKEN. An ambient env var must never clobber a working file.
 MCP_TOKEN_FILE="$STATE_DIR/slack_mcp_token"
+MCP_CREDENTIAL_WRITTEN=0
 if [ "$TRANSPORT" = "slack-mcp" ]; then
   if [ -n "$MCP_TOKEN_ARG" ]; then
     MCP_TOKEN="$MCP_TOKEN_ARG"
@@ -383,6 +431,7 @@ if [ "$TRANSPORT" = "slack-mcp" ]; then
     MCP_TOKEN=""
   fi
   if [ -n "$MCP_TOKEN" ]; then
+    MCP_CREDENTIAL_WRITTEN=1
     if [ "$DRY_RUN" = 0 ]; then
       umask 077
       printf '%s\n' "$MCP_TOKEN" > "$MCP_TOKEN_FILE"
@@ -404,14 +453,19 @@ if [ "$TRANSPORT" = "slack-mcp" ]; then
       say "  [dry-run] write placeholder $MCP_TOKEN_FILE"
     fi
     say "  WARNING: no Slack MCP token given (--slack-mcp-token xoxp-... or SLACK_MCP_TOKEN)."
-    say "  Wrote a placeholder to $MCP_TOKEN_FILE — approval popups work, but"
-    say "  sends fail until you install a real Slack user token:"
+    say "  Wrote a placeholder to $MCP_TOKEN_FILE — the gateway cannot start with"
+    say "  it: it runs the Slack MCP handshake at startup and exits on failure, so"
+    say "  the service keeps restarting (launchd retries every 10 s) and agents"
+    say "  report that the MCP server failed to start. Neither popups nor sends"
+    say "  work until you install a real Slack user token:"
     say "    scripts/slack_mcp_oauth.py --client-id YOUR_SLACK_APP_CLIENT_ID \\"
     say "        --client-secret YOUR_SLACK_APP_CLIENT_SECRET"
     say "  (opens the Slack authorize page for the official Slack MCP server and"
     say "   writes the token to $MCP_TOKEN_FILE; needs a Slack app with the"
     say "   redirect URL http://127.0.0.1:3118/callback — see README.md)"
-    say "  (the service restarts automatically; it reads the file at startup)"
+    say "  Then restart the service so it picks the token up:"
+    say "    launchctl kickstart -k gui/$(id -u)/com.speakeasy.slack-approval-gateway"
+    say "  (re-running this installer restarts it too)"
   fi
 else
   say "  $TRANSPORT transport selected: no Slack MCP token needed"
@@ -483,10 +537,37 @@ if [ "$TRANSPORT" = "korotovsky" ]; then
     say "      to the channels it may post to (bot tokens see invited channels"
     say "      only); or"
     say "    - a Slack user token (xoxp-...) with the same scopes as a user."
-    say "  The gateway spawns @korotovsky/slack-mcp-server as a child process"
-    say "  (needs node/npx, or set SLACK_STDIO_COMMAND to a server binary) and"
-    say "  passes it the token — see README.md."
+    say "  The gateway spawns the slack-mcp-server you installed"
+    say "  (https://github.com/korotovsky/slack-mcp-server) as a stdio child"
+    say "  process and passes it the token — see README.md."
     say "  (the service restarts automatically; it reads the file at startup)"
+  fi
+
+  # --- the server command (SpeakEasy never installs the server)
+  # Unless the command file already exists, detect `slack-mcp-server` on
+  # this PATH and record its absolute path — with --transport stdio, the
+  # server's documented stdio invocation — so the login service can spawn
+  # it. When it is missing, the gateway fails at startup with instructions;
+  # install it yourself, never via this script.
+  STDIO_COMMAND_FILE="$STATE_DIR/slack_stdio_command"
+  if [ -f "$STDIO_COMMAND_FILE" ]; then
+    say "  keeping existing $STDIO_COMMAND_FILE ($(cat "$STDIO_COMMAND_FILE"))"
+  elif SERVER_BIN="$(command -v slack-mcp-server 2>/dev/null)"; then
+    if [ "$DRY_RUN" = 0 ]; then
+      printf '%s\n' "$SERVER_BIN --transport stdio" > "$STDIO_COMMAND_FILE"
+    else
+      say "  [dry-run] write $STDIO_COMMAND_FILE ($SERVER_BIN --transport stdio)"
+    fi
+    say "  korotovsky server: $SERVER_BIN (recorded in $STDIO_COMMAND_FILE)"
+  else
+    say "  WARNING: slack-mcp-server is not on PATH. SpeakEasy does not install"
+    say "  or download it — install it yourself:"
+    say "    https://github.com/korotovsky/slack-mcp-server"
+    say "  (e.g. npm install -g slack-mcp-server), then either keep it on PATH,"
+    say "  write its command to $STDIO_COMMAND_FILE, or set SLACK_STDIO_COMMAND:"
+    say "    printf '%s\\n' \"slack-mcp-server --transport stdio\" > $STDIO_COMMAND_FILE"
+    say "  The gateway refuses to start the korotovsky transport until the"
+    say "  server is installed and reachable."
   fi
 fi
 
@@ -499,6 +580,10 @@ hr
 if [ "$DRY_RUN" = 0 ]; then
   mkdir -p "$HOME_DIR/Library/LaunchAgents"
   umask 022
+  # launchd starts the service with PATH=/usr/bin:/bin:/usr/sbin:/sbin,
+  # which can find neither the korotovsky server nor the node its npm
+  # wrapper needs — pass the installer's own PATH through (XML-escaped).
+  SERVICE_PATH_XML="$(printf '%s' "$PATH" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
   cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -510,6 +595,8 @@ if [ "$DRY_RUN" = 0 ]; then
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>$SERVICE_PATH_XML</string></dict>
   <key>StandardOutPath</key><string>$STATE_DIR/gateway.log</string>
   <key>StandardErrorPath</key><string>$STATE_DIR/gateway.log</string>
 </dict>
@@ -596,6 +683,10 @@ if command -v codex >/dev/null 2>&1; then
     fi
     note_registered codex "$CFG"
   fi
+  # `codex mcp add` has no timeout flag; a request_slack_message call
+  # blocks on a human approval for minutes (codex's default tool timeout
+  # is 60s), so give the entry a long tool_timeout_sec
+  run_ok "$PY" "$AGENT_CONFIG" set-timeout "$CFG" "$SERVER_NAME" 86400
 else
   note_skipped "codex (not installed)"
 fi
@@ -621,14 +712,23 @@ if command -v vibe >/dev/null 2>&1; then
   else
     backup_once "$CFG"
     if [ "$DRY_RUN" = 0 ]; then
-      if ! vibe mcp add "$SERVER_NAME" --transport stdio --command "$INSTALL_BIN" >/dev/null 2>&1; then
-        say "  WARNING: vibe mcp add failed; edit $CFG by hand (see README.md)"
+      # --tool-timeout-sec: a request_slack_message call blocks on a human
+      # approval for minutes (vibe's default tool timeout is 60s). An older
+      # vibe without the flag still registers (second attempt); the
+      # set-timeout below then fixes the entry either way.
+      if ! vibe mcp add "$SERVER_NAME" --transport stdio --command "$INSTALL_BIN" --tool-timeout-sec 86400 >/dev/null 2>&1 \
+         && ! vibe mcp add "$SERVER_NAME" --transport stdio --command "$INSTALL_BIN" >/dev/null 2>&1; then
+        say "  (vibe mcp add failed; appending to config.toml)"
+        "$PY" "$AGENT_CONFIG" add-vibe "$CFG" "$INSTALL_BIN"
       fi
     else
-      say "  [dry-run] vibe mcp add $SERVER_NAME --transport stdio --command $INSTALL_BIN"
+      say "  [dry-run] vibe mcp add $SERVER_NAME --transport stdio --command $INSTALL_BIN --tool-timeout-sec 86400"
     fi
     note_registered vibe "$CFG"
   fi
+  # make sure the entry has a long tool_timeout_sec whether the CLI wrote
+  # it or an older vibe without --tool-timeout-sec did
+  run_ok "$PY" "$AGENT_CONFIG" set-timeout "$CFG" "$SERVER_NAME" 86400
 else
   note_skipped "vibe (not installed)"
 fi
@@ -642,6 +742,10 @@ if command -v goose >/dev/null 2>&1 || [ -f "$HOME_DIR/.config/goose/config.yaml
     ac add-goose "$CFG" "$INSTALL_BIN"
     note_registered goose "$CFG"
   fi
+  # a request_slack_message call blocks on a human approval for minutes
+  # (goose cancels the call when its timeout expires; older installs wrote
+  # timeout: 120), so set a long timeout on every run
+  run_ok "$PY" "$AGENT_CONFIG" set-timeout "$CFG" "$SERVER_NAME" 86400
 else
   note_skipped "goose (not installed)"
 fi
@@ -777,11 +881,19 @@ if [ -f "$HOME_DIR/.copilot/mcp-config.json" ]; then
   add_instruction "$HOME_DIR/.copilot/copilot-instructions.md"
 fi
 if [ -f "$HOME_DIR/.hermes/config.yaml" ]; then
-  add_instruction "$HOME_DIR/.hermes/AGENTS.md"
+  # Hermes loads global instructions from SOUL.md (HERMES_HOME), never from
+  # ~/.hermes/AGENTS.md (that file is only read from a working directory)
+  add_instruction "$HOME_DIR/.hermes/SOUL.md"
+  if has "$HOME_DIR/.hermes/AGENTS.md"; then
+    say "  migrating: removing the old block from $HOME_DIR/.hermes/AGENTS.md"
+    ac instruction-remove "$HOME_DIR/.hermes/AGENTS.md"
+  fi
 fi
 if [ -f "$HOME_DIR/.config/zed/settings.json" ]; then
-  run mkdir -p "$HOME_DIR/.config/zed/rules"
-  add_instruction "$HOME_DIR/.config/zed/rules/slack-gateway.md"
+  # Zed reads user-level instructions from ~/.config/zed/AGENTS.md; the old
+  # rules/slack-gateway.md location is never loaded, so drop it
+  add_instruction "$HOME_DIR/.config/zed/AGENTS.md"
+  run rm -f "$HOME_DIR/.config/zed/rules/slack-gateway.md"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -808,18 +920,23 @@ AUDIT_JSON="$("$PY" "$AGENT_CONFIG" audit "${AUDIT_FILES[@]}" 2>/dev/null || ech
 # The audit categorizes what agents have installed. The official Slack MCP
 # server and Mistral connector servers are expected (agents read Slack
 # context through them); direct token-based Slack servers are violations.
-audit_pairs() { # audit_pairs <finding-field> — "[file, name]" lines
+audit_pairs() { # audit_pairs <finding-field> — "[file, name, key]" lines for
+  # server entries (key = the JSON path of the servers container, [] for
+  # TOML), "[file, value]" lines for token/key findings
   "$PY" - "$AUDIT_JSON" "$1" <<'EOF'
 import json, sys
 for f in json.loads(sys.argv[1]):
-    for name in f.get(sys.argv[2], []):
-        print(json.dumps([f["file"], name]))
+    for e in f.get(sys.argv[2], []):
+        if isinstance(e, dict):
+            print(json.dumps([f["file"], e["name"], e.get("key", [])]))
+        else:
+            print(json.dumps([f["file"], e]))
 EOF
 }
 report_pairs() { # report_pairs <pairs> — one "    - file (server: name)" per line
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    "$PY" -c 'import json,sys; p,n=json.loads(sys.argv[1]); print(f"    - {p}  (server: {n})")' "$line"
+    "$PY" -c 'import json,sys; p,n,k=json.loads(sys.argv[1]); print(f"    - {p}  (server: {n})")' "$line"
   done <<< "$1"
 }
 EXPECTED_SLACK_MCP="$(audit_pairs slack_mcp_servers)"
@@ -899,44 +1016,16 @@ if [ "$ENFORCE" = 1 ]; then
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       if [ "$DRY_RUN" = 1 ]; then
-        "$PY" -c 'import json,sys; p,n=json.loads(sys.argv[1]); print(f"  [dry-run] would remove server {n} from {p}")' "$line"
+        "$PY" -c 'import json,sys; p,n,k=json.loads(sys.argv[1]); print(f"  [dry-run] would remove server {n} from {p}")' "$line"
         continue
       fi
-      "$PY" - "$line" "$AGENT_CONFIG" <<'EOF'
-import json, os, subprocess, sys
-path, name = json.loads(sys.argv[1])
-helper = sys.argv[2]
-base = os.path.basename(path)
-if base == ".claude.json":
-    style = "claude"
-elif base == "opencode.json":
-    style = "opencode"
-elif base == "mcp-config.json":
-    style = "copilot"
-elif base == "settings.json" and "amp" in path:
-    style = "amp"
-elif base == "settings.json" and (".pi/" in path or ".paradev/" in path):
-    style = "pi"
-elif base == "settings.json" and ".gemini/" in path:
-    style = "gemini"
-elif base == "config.toml":
-    style = "codex"
-else:
-    style = None
-if style is None:
-    print(f"    [skip]    {path} (server: {name}) — no automatic removal; edit by hand")
-elif style == "codex":
-    r = subprocess.run([sys.executable, helper, "remove-codex-entry", path, name],
-                       capture_output=True, text=True)
-    print(f"    [removed] {path} (server: {name}): {r.stdout.strip()}")
-else:
-    r = subprocess.run([sys.executable, helper, "remove-entry", style, path, name],
-                       capture_output=True, text=True)
-    print(f"    [removed] {path} (server: {name}): {r.stdout.strip()}")
-EOF
+      # enforce-remove reports what actually happened: [removed], [absent],
+      # [failed], or [edit by hand] (configs it cannot edit, e.g. YAML)
+      ac enforce-remove "$line"
     done <<< "$GAPS"
     if [ "$DRY_RUN" = 0 ]; then
-      say "  Backups of the originals: <file>.bak-sag (restore: install.sh --uninstall)"
+      say "  Backups of the originals: <file>.bak-sag (kept — restore one by"
+      say "  hand if you ever want the pre-install file back)"
     fi
     say "  Kept (expected in agents): the official Slack MCP / Mistral"
     say "  connector servers — see the report above."
@@ -958,8 +1047,10 @@ hr
 if [ "$DRY_RUN" = 1 ]; then
   say "  [dry-run] skipped"
 elif [ -S "$STATE_DIR/gateway.sock" ]; then
+  # perl ships with macOS; GNU timeout does not. `alarm shift; exec @ARGV`
+  # runs the command under a 15 s alarm.
   SELF_TEST="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-self-test","version":"0"}}}' \
-    | timeout 15 "$INSTALL_BIN" 2>/dev/null | head -1 || true)"
+    | perl -e 'alarm shift; exec @ARGV' 15 "$INSTALL_BIN" 2>/dev/null | head -1 || true)"
   if printf '%s' "$SELF_TEST" | grep -q '"slack-approval-gateway"'; then
     say "  PASS: a spawned process bridged to the running instance and completed"
     say "        the MCP initialize handshake."
@@ -1002,35 +1093,80 @@ say "  Service:    $PLIST_LABEL (launchctl; logs in $STATE_DIR/gateway.log)"
 say "  State dir:  $STATE_DIR (cooldowns, sent records, token, socket)"
 say ""
 say "Next steps:"
+# A stored credential counts only if it is not the placeholder the installer
+# writes when no credential is given; step 1 (set up a credential) is shown
+# only when a placeholder was written or no credential exists.
+real_secret() { # real_secret <file> <placeholder-value>
+  [ -s "$1" ] && [ "$(cat "$1" 2>/dev/null)" != "$2" ]
+}
 if [ "$TRANSPORT" = "mistral-connector" ]; then
-  say "  1. In the Mistral console, connect your Slack workspace to the Slack"
-  say "     connector (the gateway calls it; it holds the Slack credentials),"
-  say "     and set a real Mistral API key if you have not:"
-  say "       scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_KEY"
-  say "     (the service restarts and reads the file at startup)"
+  CREDENTIAL_OK="$MISTRAL_CREDENTIAL_WRITTEN"
+  if real_secret "$MISTRAL_KEY_FILE" "mistral-placeholder-set-a-real-key"; then
+    CREDENTIAL_OK=1
+  fi
 elif [ "$TRANSPORT" = "korotovsky" ]; then
-  say "  1. Install a Slack token for the korotovsky transport if you have not:"
-  say "       scripts/install.sh --transport korotovsky --slack-bot-token xoxb-your-bot-token"
-  say "     (or --slack-user-token xoxp-...; see the scopes in README.md — the"
-  say "      gateway spawns @korotovsky/slack-mcp-server, which needs node/npx)"
-  say "     (the service restarts and reads the file at startup)"
+  CREDENTIAL_OK=0
+  if real_secret "$BOT_TOKEN_FILE" "xoxb-placeholder-get-a-real-token" \
+     || real_secret "$USER_TOKEN_FILE" "xoxp-placeholder-get-a-real-token"; then
+    CREDENTIAL_OK=1
+  fi
 else
-  say "  1. Get a Slack user token for the Slack MCP server (one-time):"
-  say "       scripts/slack_mcp_oauth.py --client-id YOUR_SLACK_APP_CLIENT_ID \\"
-  say "           --client-secret YOUR_SLACK_APP_CLIENT_SECRET"
-  say "     It opens the Slack authorize page, verifies the token against"
-  say "     https://mcp.slack.com/mcp, and writes $MCP_TOKEN_FILE (chmod 600)."
-  say "     You need a Slack app (directory-published or internal) with the"
-  say "     redirect URL http://127.0.0.1:3118/callback and the user scopes"
-  say "     chat:write, users:read, channels:read — see README.md."
-  say "     Or set the token directly:"
-  say "       scripts/install.sh --slack-mcp-token xoxp-your-user-token"
-  say "     (the service restarts and reads the file at startup)"
+  CREDENTIAL_OK="$MCP_CREDENTIAL_WRITTEN"
+  if real_secret "$MCP_TOKEN_FILE" "xoxp-placeholder-get-a-real-token"; then
+    CREDENTIAL_OK=1
+  fi
 fi
-say "  2. Restart your agents (or start a new session) so they pick up the"
-say "     new MCP server; then ask any agent to send a Slack message."
-say "  3. The popup appears, the gateway sends only what you approve, and"
-say "     closing the popup never sends anything."
+STEP=1
+if [ "$TRANSPORT" = "mistral-connector" ]; then
+  if [ "$CREDENTIAL_OK" = 0 ]; then
+    say "  $STEP. In the Mistral console, connect your Slack workspace to the Slack"
+    say "      connector (the gateway calls it; it holds the Slack credentials),"
+    say "      and set a real Mistral API key:"
+    say "        scripts/install.sh --transport mistral-connector --mistral-api-key YOUR_KEY"
+    say "      (re-running the installer restarts the service, which reads the"
+    say "       file at startup)"
+    STEP=$((STEP + 1))
+  fi
+elif [ "$TRANSPORT" = "korotovsky" ]; then
+  if [ "$CREDENTIAL_OK" = 0 ]; then
+    say "  $STEP. Install a Slack token for the korotovsky transport:"
+    say "        scripts/install.sh --transport korotovsky --slack-bot-token xoxb-your-bot-token"
+    say "      (or --slack-user-token xoxp-...; see the scopes in README.md — the"
+    say "       gateway spawns the slack-mcp-server you installed"
+    say "       (https://github.com/korotovsky/slack-mcp-server) as a stdio child)"
+    say "      (re-running the installer restarts the service, which reads the"
+    say "       file at startup)"
+    STEP=$((STEP + 1))
+  fi
+  if [ ! -s "$STATE_DIR/slack_workspace_domain" ]; then
+    say "  $STEP. Set the workspace domain used in message links (the server's"
+    say "      replies carry no permalink):"
+    say "        scripts/install.sh --transport korotovsky --workspace-domain YOUR_WORKSPACE"
+    STEP=$((STEP + 1))
+  fi
+else
+  if [ "$CREDENTIAL_OK" = 0 ]; then
+    say "  $STEP. Get a Slack user token for the Slack MCP server (one-time):"
+    say "        scripts/slack_mcp_oauth.py --client-id YOUR_SLACK_APP_CLIENT_ID \\"
+    say "            --client-secret YOUR_SLACK_APP_CLIENT_SECRET"
+    say "      It opens the Slack authorize page, verifies the token against"
+    say "      https://mcp.slack.com/mcp, and writes $MCP_TOKEN_FILE (chmod 600)."
+    say "      You need a Slack app (directory-published or internal) with the"
+    say "      redirect URL http://127.0.0.1:3118/callback and the user scopes"
+    say "      chat:write, users:read, channels:read — see README.md."
+    say "      Or set the token directly:"
+    say "        scripts/install.sh --slack-mcp-token xoxp-your-user-token"
+    say "      Then restart the service so it picks the token up:"
+    say "        launchctl kickstart -k gui/$(id -u)/com.speakeasy.slack-approval-gateway"
+    say "      (re-running the installer restarts it too)"
+    STEP=$((STEP + 1))
+  fi
+fi
+say "  $STEP. Restart your agents (or start a new session) so they pick up the"
+say "      new MCP server; then ask any agent to send a Slack message."
+STEP=$((STEP + 1))
+say "  $STEP. The popup appears, the gateway sends only what you approve, and"
+say "      closing the popup never sends anything."
 say ""
 say "  Uninstall: scripts/install.sh --uninstall"
 say "  Enforce exclusivity (remove direct Slack MCP servers from agents):"

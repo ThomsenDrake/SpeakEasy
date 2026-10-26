@@ -124,16 +124,20 @@ struct MockSlackMcpState {
 ///   (which the client must send back on later requests);
 /// - `notifications/initialized` replies `202 Accepted` with no body;
 /// - `tools/list` replies with the tool catalog, settable with
-///   [`set_tools`](Self::set_tools). The default catalog lists
-///   `slack_search_messages`, `slack_read_user_profile`, `slack_read_channel`,
-///   `slack_list_channels` and `slack_send_message` (declaring
-///   `channel_id`/`message`/`thread_ts`);
+///   [`set_tools`](Self::set_tools). The default catalog mirrors the
+///   official Slack MCP server's list and order: `slack_search_messages`,
+///   `slack_search_users`, `slack_search_channels`, `slack_read_channel`,
+///   `slack_read_user_profile`, `slack_list_user_channels` and
+///   `slack_send_message` (declaring `channel_id`/`message`/`thread_ts`);
 /// - `tools/call` replies with an MCP CallToolResult. `slack_send_message`
 ///   gets `{"message_link": …, "message_context": {…}}` as a JSON string in
 ///   a text block, with a fresh `ts` per send (`N` = 1, 2, 3, … in
 ///   `1700000000.00000N`) and the channel ID Slack would report for the
-///   requested destination (see [`mock_channel_id`]); the read tools get
-///   canned `U0DRAKE`/`C0ENG` lookups. Replace any of it with
+///   requested destination (see [`mock_channel_id`]); the lookup tools get
+///   canned `U0DRAKE`/`C0ENG`/`C0RAND` replies (`slack_read_user_profile` a
+///   nested user object, `slack_list_user_channels` a channels array,
+///   `slack_read_channel` a channel object), and the search tools fail
+///   loudly — they must never be called. Replace any of it with
 ///   [`set_tool_reply`](Self::set_tool_reply) or
 ///   [`set_tool_reply_for`](Self::set_tool_reply_for), make the send tool
 ///   fail with [`set_send_error`](Self::set_send_error), or fail every
@@ -479,18 +483,34 @@ pub fn mock_channel_id(destination: &str) -> String {
     }
 }
 
-/// The default tool catalog, shaped like the official Slack MCP server's:
-/// read tools plus `slack_send_message` declaring
-/// `channel_id`/`message`/`thread_ts`.
+/// The default tool catalog, shaped like the official Slack MCP server's
+/// `tools/list` — including its order, where the search/read tools come
+/// before the profile/list lookups — plus `slack_send_message` declaring
+/// `channel_id`/`message`/`thread_ts`. The lookup tools declare the
+/// official schemas: `slack_read_user_profile` takes `user_id`;
+/// `slack_list_user_channels` takes `types`/`name_prefix`/`limit`/`cursor`/
+/// `format`/`team_id` and no channel ID.
 fn default_mcp_tools() -> Vec<Value> {
     json!([
         { "name": "slack_search_messages", "inputSchema": { "type": "object", "properties": {
             "query": { "type": "string" } } } },
+        { "name": "slack_search_users", "inputSchema": { "type": "object", "properties": {
+            "query": { "type": "string" } }, "required": ["query"] } },
+        { "name": "slack_search_channels", "inputSchema": { "type": "object", "properties": {
+            "query": { "type": "string" } }, "required": ["query"] } },
+        { "name": "slack_read_channel", "inputSchema": { "type": "object", "properties": {
+            "channel_id": { "type": "string" } }, "required": ["channel_id"] } },
         { "name": "slack_read_user_profile", "inputSchema": { "type": "object", "properties": {
             "user_id": { "type": "string" } } } },
-        { "name": "slack_read_channel", "inputSchema": { "type": "object", "properties": {
-            "channel_id": { "type": "string" } } } },
-        { "name": "slack_list_channels", "inputSchema": { "type": "object" } },
+        { "name": "slack_list_user_channels", "inputSchema": { "type": "object", "properties": {
+            "types": { "type": "string" },
+            "name_prefix": { "type": "string" },
+            "exclude_archived": { "type": "boolean" },
+            "limit": { "type": "integer" },
+            "cursor": { "type": "string" },
+            "format": { "type": "string" },
+            "team_id": { "type": "string" }
+        } } },
         { "name": "slack_send_message", "inputSchema": { "type": "object", "properties": {
             "channel_id": { "type": "string" },
             "message": { "type": "string" },
@@ -545,13 +565,18 @@ fn default_tool_result(state: &MockSlackMcpState, tool: &str, arguments: &Value)
             None => default_send_reply(state, arguments),
         };
     }
-    if tool == "slack_list_channels" {
+    // The official channel-lookup tool: a channels array (IDs + names).
+    if tool == "slack_list_user_channels" {
         return json_text_reply(&json!({ "channels": [
             { "id": "C0ENG", "name": "eng" },
             { "id": "C0RAND", "name": "random" }
         ] }));
     }
-    if tool.contains("user") {
+    // The official user-lookup tool: a nested user object (the same shape
+    // for a loosely-matching user tool that is not a channel tool).
+    if tool == "slack_read_user_profile"
+        || (tool.contains("user") && !tool.contains("search") && !tool.contains("channel"))
+    {
         return match arguments.get("user_id").and_then(Value::as_str) {
             Some("U0DRAKE") => json_text_reply(&json!({ "user": {
                 "real_name": "Drake Thomsen", "name": "drake.thomsen",
@@ -560,7 +585,9 @@ fn default_tool_result(state: &MockSlackMcpState, tool: &str, arguments: &Value)
             _ => json!({ "content": [{ "type": "text", "text": "user_not_found" }], "isError": true }),
         };
     }
-    if tool.contains("channel") {
+    // A channel read by ID: a channel object (the same shape for a
+    // loosely-matching channel tool).
+    if tool == "slack_read_channel" || tool.contains("channel") {
         return match arguments.get("channel_id").and_then(Value::as_str) {
             Some("C0ENG") => {
                 json_text_reply(&json!({ "channel": { "id": "C0ENG", "name": "eng" } }))
@@ -570,6 +597,13 @@ fn default_tool_result(state: &MockSlackMcpState, tool: &str, arguments: &Value)
             }
             _ => json!({ "content": [{ "type": "text", "text": "channel_not_found" }], "isError": true }),
         };
+    }
+    // The search tools are decoys: the client must prefer the exact lookup
+    // tool names, so a search call means that preference failed.
+    if tool.contains("search") {
+        return json!({ "content": [{
+            "type": "text", "text": format!("unexpected search tool call: {tool}")
+        }], "isError": true });
     }
     json!({ "content": [{ "type": "text", "text": format!("unknown tool: {tool}") }], "isError": true })
 }

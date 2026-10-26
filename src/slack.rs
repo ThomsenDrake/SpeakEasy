@@ -84,22 +84,53 @@ fn warn_if_readable_by_others(path: &Path) {
 #[cfg(not(unix))]
 fn warn_if_readable_by_others(_path: &Path) {}
 
+/// Normalize a workspace domain: trim, drop a scheme, a trailing slash and
+/// a `.slack.com` suffix (`https://acme.slack.com/` → `acme`).
+fn normalize_domain(domain: &str) -> String {
+    domain
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .trim_end_matches(".slack.com")
+        .to_string()
+}
+
 /// `https://<SLACK_WORKSPACE_DOMAIN or "workspace">.slack.com/archives/{channel}/p{ts without '.'}`.
 pub(crate) fn fallback_permalink(channel: &str, ts: &str) -> String {
     let domain = non_empty_env("SLACK_WORKSPACE_DOMAIN")
-        .map(|d| {
-            d.trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .trim_end_matches('/')
-                .trim_end_matches(".slack.com")
-                .to_string()
-        })
+        .map(|d| normalize_domain(&d))
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "workspace".to_string());
+    fallback_permalink_with_domain(channel, ts, &domain)
+}
+
+/// `https://<domain>.slack.com/archives/{channel}/p{ts without '.'}`.
+pub(crate) fn fallback_permalink_with_domain(channel: &str, ts: &str, domain: &str) -> String {
     format!(
         "https://{domain}.slack.com/archives/{channel}/p{}",
         ts.replace('.', "")
     )
+}
+
+/// The workspace domain for fallback permalinks: `SLACK_WORKSPACE_DOMAIN`,
+/// else a one-line `<state_dir>/slack_workspace_domain` file, else
+/// "workspace". The env var wins over the file. Used by the transports whose
+/// server replies carry no permalink.
+pub(crate) fn workspace_domain(state_dir: &Path) -> String {
+    if let Some(domain) = non_empty_env("SLACK_WORKSPACE_DOMAIN") {
+        let domain = normalize_domain(&domain);
+        if !domain.is_empty() {
+            return domain;
+        }
+    }
+    if let Ok(contents) = std::fs::read_to_string(state_dir.join("slack_workspace_domain")) {
+        let domain = normalize_domain(&contents);
+        if !domain.is_empty() {
+            return domain;
+        }
+    }
+    "workspace".to_string()
 }
 
 /// How the gateway sends to Slack.

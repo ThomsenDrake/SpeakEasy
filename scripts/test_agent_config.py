@@ -2,12 +2,15 @@
 """Tests for scripts/agent_config.py: every config style, idempotency,
 backups, removal, instruction blocks, and the audit report."""
 
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -35,6 +38,11 @@ def write(path, text):
         f.write(text)
 
 
+def names(finding, field):
+    """Server names in an audit finding field (entries are {name, key})."""
+    return [e["name"] for e in finding[field]]
+
+
 # --------------------------------------------------------------- JSON styles
 d = tmpdir()
 
@@ -48,8 +56,19 @@ check("claude: existing server kept", "grafana" in data["mcpServers"])
 check("claude: backup made", os.path.exists(p + ac.BAK))
 check("claude: idempotent update", ac.add_json("claude", p, CMD) == "updated")
 check("claude: has", subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "agent_config.py"), "has", p]).returncode == 0)
-check("claude: remove restores backup", ac.remove_json("claude", p) == "restored backup")
-check("claude: backup content is the original", "slack-approval-gateway" not in open(p + ac.BAK).read() and "grafana" in open(p).read())
+# uninstall semantics: remove only our entry; a change the user made after
+# the install survives; the .bak-sag backup (the pre-install original) is
+# kept, never restored over the file
+data = json.load(open(p))
+data["numStartups"] = 99
+with open(p, "w") as f:
+    json.dump(data, f)
+check("claude: remove drops only our entry", ac.remove_json("claude", p) == "removed")
+data = json.load(open(p))
+check("claude: user edits survive the uninstall", data["numStartups"] == 99 and "grafana" in data["mcpServers"], json.dumps(data))
+check("claude: our entry gone", ac.SERVER not in data["mcpServers"])
+check("claude: backup kept (pre-install original)", "slack-approval-gateway" not in open(p + ac.BAK).read() and "grafana" in open(p + ac.BAK).read())
+check("claude: remove again is absent", ac.remove_json("claude", p) == "absent")
 
 # gemini / pi / copilot: missing file and missing parent key
 for style, parent in (("gemini", "mcpServers"), ("pi", "mcpServers"), ("copilot", "mcpServers")):
@@ -125,11 +144,16 @@ p = os.path.join(d, "goose.yaml")
 write(p, "GOOSE_TELEMETRY_ENABLED: false\nextensions:\n  chatrecall:\n    enabled: false\n    type: platform\n")
 check("goose: added under extensions", ac.add_goose(p, CMD) == "added")
 text = open(p).read()
-check("goose: block shape", "  slack-approval-gateway:\n    enabled: true\n    type: stdio\n    cmd: \"%s\"\n    args: []\n    envs: {}\n    timeout: 120" % CMD in text, text)
+check("goose: block shape", "  slack-approval-gateway:\n    enabled: true\n    type: stdio\n    cmd: \"%s\"\n    args: []\n    envs: {}\n    timeout: 86400" % CMD in text, text)
+check("goose: long tool timeout (an approval can take minutes)", "timeout: 86400" in text and "timeout: 120" not in text, text)
 check("goose: existing extension kept", "chatrecall" in text)
 check("goose: idempotent", ac.add_goose(p, CMD) == "already")
-check("goose: remove restores backup", ac.remove_goose(p) == "restored backup")
-check("goose: original restored", "slack-approval-gateway" not in open(p).read() and "chatrecall" in open(p).read())
+# a change the user made after the install must survive the uninstall
+write(p, text.replace("GOOSE_TELEMETRY_ENABLED: false", "GOOSE_TELEMETRY_ENABLED: true"))
+check("goose: remove drops only our block", ac.remove_goose(p) == "removed")
+text = open(p).read()
+check("goose: entry gone, user and other content kept", "slack-approval-gateway" not in text and "chatrecall" in text and "GOOSE_TELEMETRY_ENABLED: true" in text, text)
+check("goose: backup kept (pre-install original)", os.path.exists(p + ac.BAK) and "slack-approval-gateway" not in open(p + ac.BAK).read())
 
 # textual removal when no backup exists
 p = os.path.join(d, "goose-nobackup.yaml")
@@ -164,11 +188,16 @@ p = os.path.join(d, "codex.toml")
 write(p, 'model = "gpt-6.1-sol"\n')
 check("codex: added", ac.add_codex(p, CMD) == "added")
 text = open(p).read()
-check("codex: block shape", '[mcp_servers.%s]\ncommand = "%s"\nargs = []' % (ac.SERVER, CMD) in text, text)
+check("codex: block shape", '[mcp_servers.%s]\ncommand = "%s"\nargs = []\ntool_timeout_sec = 86400' % (ac.SERVER, CMD) in text, text)
+check("codex: long tool timeout (an approval can take minutes)", "tool_timeout_sec = 86400" in text, text)
 check("codex: existing config kept", 'model = "gpt-6.1-sol"' in text)
 check("codex: idempotent", ac.add_codex(p, CMD) == "already")
-check("codex: remove restores backup", ac.remove_codex(p) == "restored backup")
-check("codex: original restored", ac.SERVER not in open(p).read() and "gpt-6.1-sol" in open(p).read())
+# a change the user made after the install must survive the uninstall
+write(p, text.replace('model = "gpt-6.1-sol"', 'model = "gpt-6.2"'))
+check("codex: remove drops only our table", ac.remove_codex(p) == "removed")
+text = open(p).read()
+check("codex: entry gone, user edit kept", ac.SERVER not in text and 'model = "gpt-6.2"' in text, text)
+check("codex: backup kept (pre-install original)", os.path.exists(p + ac.BAK) and ac.SERVER not in open(p + ac.BAK).read())
 
 # textual removal when no backup exists
 p = os.path.join(d, "codex-nobackup.toml")
@@ -202,6 +231,32 @@ text = open(p).read()
 check("codex-entry: table and env subtable gone", "unofficial_slack" not in text and "xoxd-abcdef" not in text, text)
 check("codex-entry: other servers kept", "[mcp_servers.other]" in text and 'model = "gpt"' in text)
 
+# a comment the user appended after our table (our writers append at EOF)
+# is the user's, not ours: it must survive the removal
+p = os.path.join(d, "codex-trailing-comment.toml")
+write(p, 'model = "gpt"\n')
+ac.add_codex(p, CMD)
+with open(p, "a") as f:
+    f.write("# my note about the next table\n\n[other]\nkey = 1\n")
+check("codex-entry: trailing user comment kept", ac.remove_codex_entry(p, ac.SERVER) == "removed")
+text = open(p).read()
+check("codex-entry: comment and next table survive",
+      "# my note about the next table" in text and "[other]" in text and ac.SERVER not in text,
+      text)
+tomllib.loads(text)
+
+p = os.path.join(d, "vibe-trailing-comment.toml")
+write(p, '[[mcp_servers]]\nname = "other"\ncommand = "npx"\n')
+ac.add_vibe(p, CMD)
+with open(p, "a") as f:
+    f.write("# my vibe note\n")
+check("vibe-entry: trailing user comment kept", ac.remove_vibe(p) == "removed")
+text = open(p).read()
+check("vibe-entry: comment and other element survive",
+      "# my vibe note" in text and 'name = "other"' in text and ac.SERVER not in text,
+      text)
+tomllib.loads(text)
+
 # ------------------------------------------------------------------- audit
 p = os.path.join(d, "audit-claude.json")
 write(p, json.dumps({"mcpServers": {
@@ -209,25 +264,25 @@ write(p, json.dumps({"mcpServers": {
     ac.SERVER: {"type": "stdio", "command": CMD},
 }}))
 f = ac.audit_file(p)
-check("audit: finds direct slack server", f["direct_slack_servers"] == ["slack"], json.dumps(f))
+check("audit: finds direct slack server", names(f, "direct_slack_servers") == ["slack"], json.dumps(f))
 check("audit: finds token masked", len(f["slack_tokens"]) == 1 and f["slack_tokens"][0].startswith("xoxc-5330704") and "…" in f["slack_tokens"][0] and "9437214043493" not in f["slack_tokens"][0], json.dumps(f))
-check("audit: gateway not flagged", ac.SERVER not in f["direct_slack_servers"])
+check("audit: gateway not flagged", ac.SERVER not in names(f, "direct_slack_servers"))
 
 p = os.path.join(d, "audit-hermes.yaml")
 write(p, "platform_toolsets:\n  slack:\n    - hermes-slack\nmcp_servers:\n  executor:\n    url: https://x\n")
 f = ac.audit_file(p)
-check("audit: yaml slack key found", "slack" in f["direct_slack_servers"], json.dumps(f))
+check("audit: yaml slack key found", "slack" in names(f, "direct_slack_servers"), json.dumps(f))
 
 p = os.path.join(d, "audit-clean.json")
 write(p, json.dumps({"mcpServers": {ac.SERVER: {"command": CMD}}}))
 f = ac.audit_file(p)
-check("audit: clean file", f["direct_slack_servers"] == [] and f["slack_tokens"] == [], json.dumps(f))
+check("audit: clean file", names(f, "direct_slack_servers") == [] and f["slack_tokens"] == [], json.dumps(f))
 
 p = os.path.join(d, "audit-codex.toml")
 write(p, '[mcp_servers.unofficial_slack]\ncommand = "go"\n\n[mcp_servers.%s]\ncommand = "%s"\n' % (ac.SERVER, CMD))
 f = ac.audit_file(p)
-check("audit: toml slack server found", f["direct_slack_servers"] == ["unofficial_slack"], json.dumps(f))
-check("audit: toml gateway not flagged", ac.SERVER not in f["direct_slack_servers"])
+check("audit: toml slack server found", names(f, "direct_slack_servers") == ["unofficial_slack"], json.dumps(f))
+check("audit: toml gateway not flagged", ac.SERVER not in names(f, "direct_slack_servers"))
 
 check("audit: missing file skipped", ac.audit_file(os.path.join(d, "nope.json")) is None)
 
@@ -249,30 +304,30 @@ write(p, json.dumps({"mcpServers": {
     ac.SERVER: {"type": "stdio", "command": CMD},
 }}))
 f = ac.audit_file(p)
-check("audit: official slack mcp is expected", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
-check("audit: mistral connector is expected", f["mistral_connector_servers"] == ["mistral"], json.dumps(f))
-check("audit: no direct servers", f["direct_slack_servers"] == [], json.dumps(f))
+check("audit: official slack mcp is expected", names(f, "slack_mcp_servers") == ["slack"], json.dumps(f))
+check("audit: mistral connector is expected", names(f, "mistral_connector_servers") == ["mistral"], json.dumps(f))
+check("audit: no direct servers", names(f, "direct_slack_servers") == [], json.dumps(f))
 check("audit: mistral key masked",
       len(f["mistral_keys"]) == 1 and f["mistral_keys"][0].startswith("mstrl_abcdef")
       and "…" in f["mistral_keys"][0] and "0123456789" not in f["mistral_keys"][0],
       json.dumps(f))
 check("audit: unrelated server ignored",
-      "grafana" not in f["slack_mcp_servers"] + f["mistral_connector_servers"] + f["direct_slack_servers"],
+      "grafana" not in names(f, "slack_mcp_servers") + names(f, "mistral_connector_servers") + names(f, "direct_slack_servers"),
       json.dumps(f))
 
 p = os.path.join(d, "audit-codex-official.toml")
 write(p, '[mcp_servers.slack]\ntype = "http"\nurl = "https://mcp.slack.com/mcp"\n\n[mcp_servers.%s]\ncommand = "%s"\n' % (ac.SERVER, CMD))
 f = ac.audit_file(p)
-check("audit: toml official slack mcp is expected", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
-check("audit: toml direct servers empty", f["direct_slack_servers"] == [], json.dumps(f))
-check("audit: toml gateway not flagged", ac.SERVER not in f["slack_mcp_servers"] + f["direct_slack_servers"], json.dumps(f))
+check("audit: toml official slack mcp is expected", names(f, "slack_mcp_servers") == ["slack"], json.dumps(f))
+check("audit: toml direct servers empty", names(f, "direct_slack_servers") == [], json.dumps(f))
+check("audit: toml gateway not flagged", ac.SERVER not in names(f, "slack_mcp_servers") + names(f, "direct_slack_servers"), json.dumps(f))
 
 p = os.path.join(d, "audit-goose.yaml")
 write(p, "extensions:\n  slack:\n    enabled: true\n    type: http\n    url: https://mcp.slack.com/mcp\n  chatrecall:\n    enabled: false\n")
 f = ac.audit_file(p)
-check("audit: yaml official slack mcp is expected", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
+check("audit: yaml official slack mcp is expected", names(f, "slack_mcp_servers") == ["slack"], json.dumps(f))
 check("audit: yaml unrelated extension ignored",
-      "chatrecall" not in f["direct_slack_servers"] + f["slack_mcp_servers"], json.dumps(f))
+      "chatrecall" not in names(f, "direct_slack_servers") + names(f, "slack_mcp_servers"), json.dumps(f))
 
 p = os.path.join(d, "audit-amp.json")
 write(p, json.dumps({"amp.mcpServers": {
@@ -280,28 +335,396 @@ write(p, json.dumps({"amp.mcpServers": {
     ac.SERVER: {"command": CMD},
 }}))
 f = ac.audit_file(p)
-check("audit: amp flat key scanned", f["slack_mcp_servers"] == ["slack"], json.dumps(f))
+check("audit: amp flat key scanned", names(f, "slack_mcp_servers") == ["slack"], json.dumps(f))
 
 p = os.path.join(d, "audit-goose-providers.yaml")
 write(p, "active_provider: mistral\nproviders:\n  mistral:\n    enabled: true\n    model: zai-glm-5-2\n    context_limit: 1000000\n")
 f = ac.audit_file(p)
 check("audit: yaml llm provider is not a connector server",
-      f["mistral_connector_servers"] == [] and f["direct_slack_servers"] == [],
+      names(f, "mistral_connector_servers") == [] and names(f, "direct_slack_servers") == [],
       json.dumps(f))
 
 p = os.path.join(d, "audit-hermes-providers.yaml")
 write(p, "providers:\n  mistral-glm-5-2:\n    name: Mistral GLM 5.2\n    base_url: https://api.mistral.ai/v1\n    key_env: MISTRAL_API_KEY\n")
 f = ac.audit_file(p)
 check("audit: yaml provider with base_url is not a connector server",
-      f["mistral_connector_servers"] == [] and f["direct_slack_servers"] == [],
+      names(f, "mistral_connector_servers") == [] and names(f, "direct_slack_servers") == [],
       json.dumps(f))
 
 p = os.path.join(d, "audit-hermes-platform.yaml")
 write(p, "platform_toolsets:\n  slack:\n    - hermes-slack\nmcp_servers:\n  executor:\n    url: https://x\n")
 f = ac.audit_file(p)
 check("audit: hermes platform slack still reported as direct",
-      "slack" in f["direct_slack_servers"], json.dumps(f))
-check("audit: hermes executor not flagged", "executor" not in f["direct_slack_servers"], json.dumps(f))
+      "slack" in names(f, "direct_slack_servers"), json.dumps(f))
+check("audit: hermes executor not flagged", "executor" not in names(f, "direct_slack_servers"), json.dumps(f))
+
+# ------------------------------------------- audit + edits: vibe TOML style
+# Vibe stores servers as [[mcp_servers]] array elements; [mcp_servers.env]
+# after an element is that element's sub-table, not a server.
+p = os.path.join(d, "audit-vibe.toml")
+write(p, """# vibe config
+[[mcp_servers]]
+name = "slack"
+transport = "http"
+url = "https://mcp.slack.com/mcp"
+
+[[mcp_servers]]
+name = "direct-slack"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@korotovsky/slack-mcp-server@latest"]
+
+[mcp_servers.env]
+SLACK_MCP_XOXC_TOKEN = "xoxc-5330704053091-9437214043493-abcdef0123456789"
+
+[[mcp_servers]]
+name = "mistral"
+transport = "http"
+url = "https://api.mistral.ai/v1/mcp"
+
+[[mcp_servers]]
+name = "slack-approval-gateway"
+transport = "stdio"
+command = "%s"
+args = []
+tool_timeout_sec = 86400
+""" % CMD)
+f = ac.audit_file(p)
+check("audit: vibe official slack mcp is expected", names(f, "slack_mcp_servers") == ["slack"], json.dumps(f))
+check("audit: vibe token-based slack server is direct", names(f, "direct_slack_servers") == ["direct-slack"], json.dumps(f))
+check("audit: vibe [mcp_servers.env] is not a server",
+      "env" not in names(f, "slack_mcp_servers") + names(f, "mistral_connector_servers") + names(f, "direct_slack_servers"),
+      json.dumps(f))
+check("audit: vibe mistral connector is expected", names(f, "mistral_connector_servers") == ["mistral"], json.dumps(f))
+check("audit: vibe gateway element not flagged",
+      ac.SERVER not in names(f, "direct_slack_servers") + names(f, "slack_mcp_servers"),
+      json.dumps(f))
+check("audit: vibe token masked", len(f["slack_tokens"]) == 1 and f["slack_tokens"][0].startswith("xoxc-5330704"), json.dumps(f))
+
+# a codex-style file keeps its meaning: [mcp_servers.X] tables are servers
+p = os.path.join(d, "audit-codex-env.toml")
+write(p, '[mcp_servers.slack]\ncommand = "npx"\n\n[mcp_servers.slack.env]\nSLACK_MCP_XOXC_TOKEN = "xoxc-5330704053091-9437214043493-abcdef0123456789"\n')
+f = ac.audit_file(p)
+check("audit: codex env subtable folds into its server (direct)",
+      names(f, "direct_slack_servers") == ["slack"] and "env" not in names(f, "direct_slack_servers"),
+      json.dumps(f))
+
+# ------------------------------------------------- vibe add/remove (TOML)
+p = os.path.join(d, "vibe-add.toml")
+write(p, 'model = "magistral-medium-latest"\n')
+check("vibe: added", ac.add_vibe(p, CMD) == "added")
+text = open(p).read()
+check("vibe: element shape", '[[mcp_servers]]\nname = "%s"\ncommand = "%s"\nargs = []\ntool_timeout_sec = 86400' % (ac.SERVER, CMD) in text, text)
+check("vibe: long tool timeout (an approval can take minutes)", "tool_timeout_sec = 86400" in text, text)
+check("vibe: existing config kept", 'model = "magistral-medium-latest"' in text)
+check("vibe: idempotent", ac.add_vibe(p, CMD) == "already")
+check("vibe: backup made", os.path.exists(p + ac.BAK))
+tomllib.loads(open(p).read())  # must stay valid TOML
+
+p = os.path.join(d, "vibe-remove.toml")
+write(p, """[[mcp_servers]]
+name = "other"
+command = "npx"
+
+[[mcp_servers]]
+name = "direct-slack"
+command = "npx"
+
+[mcp_servers.env]
+SLACK_MCP_XOXC_TOKEN = "xoxc-5330704053091-9437214043493-abcdef0123456789"
+
+[[mcp_servers]]
+name = "slack-approval-gateway"
+command = "%s"
+""" % CMD)
+check("vibe-entry: removed with subtable", ac.remove_vibe_entry(p, "direct-slack") == "removed")
+text = open(p).read()
+check("vibe-entry: element and env subtable gone", "direct-slack" not in text and "xoxc-5330704" not in text, text)
+check("vibe-entry: other elements kept", 'name = "other"' in text and 'name = "%s"' % ac.SERVER in text, text)
+tomllib.loads(text)  # must stay valid TOML
+check("vibe-entry: absent when missing", ac.remove_vibe_entry(p, "direct-slack") == "absent")
+check("vibe: remove gateway element", ac.remove_vibe(p) == "removed")
+text = open(p).read()
+check("vibe: gateway gone, other kept", ac.SERVER not in text and 'name = "other"' in text, text)
+check("vibe: backup kept", os.path.exists(p + ac.BAK))
+tomllib.loads(text)
+
+# a vibe file whose only element is ours: removal leaves a valid (empty) file
+p = os.path.join(d, "vibe-only-ours.toml")
+write(p, '[[mcp_servers]]\nname = "%s"\ncommand = "%s"\n' % (ac.SERVER, CMD))
+check("vibe: remove the only element", ac.remove_vibe(p) == "removed")
+tomllib.loads(open(p).read())
+
+# ------------------------------------------------------------- set-timeout
+p = os.path.join(d, "timeout-codex.toml")
+write(p, '[mcp_servers.%s]\ncommand = "%s"\n' % (ac.SERVER, CMD))
+check("set-timeout: added to codex table", ac.set_toml_timeout(p, ac.SERVER, 86400) == "added")
+check("set-timeout: codex table has it", "tool_timeout_sec = 86400" in open(p).read())
+check("set-timeout: updated in place", ac.set_toml_timeout(p, ac.SERVER, 3600) == "updated")
+text = open(p).read()
+check("set-timeout: codex value replaced, single key", "tool_timeout_sec = 3600" in text and text.count("tool_timeout_sec") == 1, text)
+tomllib.loads(text)
+
+p = os.path.join(d, "timeout-vibe.toml")
+write(p, '[[mcp_servers]]\nname = "%s"\ncommand = "%s"\n\n[[mcp_servers]]\nname = "other"\ncommand = "npx"\n' % (ac.SERVER, CMD))
+check("set-timeout: added to vibe element", ac.set_toml_timeout(p, ac.SERVER, 86400) == "added")
+text = open(p).read()
+check("set-timeout: vibe element has it, other element untouched",
+      "tool_timeout_sec = 86400" in text and text.count("tool_timeout_sec") == 1 and 'name = "other"' in text,
+      text)
+tomllib.loads(text)
+
+p = os.path.join(d, "timeout-vibe-sub.toml")
+write(p, '[[mcp_servers]]\nname = "%s"\ncommand = "%s"\n\n[mcp_servers.env]\nFOO = "bar"\n' % (ac.SERVER, CMD))
+check("set-timeout: vibe element with subtable", ac.set_toml_timeout(p, ac.SERVER, 86400) == "added")
+text = open(p).read()
+check("set-timeout: key lands in the element, not the subtable",
+      "tool_timeout_sec = 86400" in text and text.index("tool_timeout_sec") < text.index("[mcp_servers.env]"),
+      text)
+tomllib.loads(text)
+check("set-timeout: absent for unknown server", ac.set_toml_timeout(p, "nope", 60) == "absent")
+check("set-timeout: absent for missing file", ac.set_toml_timeout(os.path.join(d, "nope.toml"), ac.SERVER, 60) == "absent")
+
+# ------------------------------------------------- set-timeout: goose YAML
+# an old install wrote 'timeout: 120'; every run must raise it to 86400
+p = os.path.join(d, "goose-timeout-old.yaml")
+write(p, "GOOSE_TELEMETRY_ENABLED: false\n# my goose config\nextensions:\n  chatrecall:\n    enabled: false\n    type: platform\n  slack-approval-gateway:\n    enabled: true\n    type: stdio\n    cmd: \"%s\"\n    args: []\n    envs: {}\n    timeout: 120\n" % CMD)
+check("set-timeout: goose old timeout updated", ac.set_timeout(p, ac.SERVER, 86400) == "updated")
+text = open(p).read()
+check("set-timeout: goose 120 becomes 86400", "    timeout: 86400\n" in text and "timeout: 120" not in text, text)
+check("set-timeout: goose comments and other extensions kept",
+      "# my goose config" in text and "chatrecall" in text and "GOOSE_TELEMETRY_ENABLED: false" in text,
+      text)
+check("set-timeout: goose single timeout line", text.count("timeout:") == 1, text)
+check("set-timeout: goose backup made", os.path.exists(p + ac.BAK))
+
+# a missing timeout line gets added after the block's last key
+p = os.path.join(d, "goose-timeout-missing.yaml")
+write(p, "extensions:\n  slack-approval-gateway:\n    enabled: true\n    type: stdio\n    cmd: \"%s\"\n    args: []\n    envs: {}\n  other:\n    command: npx\n" % CMD)
+check("set-timeout: goose missing timeout added", ac.set_timeout(p, ac.SERVER, 86400) == "added")
+text = open(p).read()
+check("set-timeout: goose timeout added at the end of the block",
+      "    envs: {}\n    timeout: 86400\n  other:" in text, text)
+check("set-timeout: goose other extension untouched", "  other:\n    command: npx\n" in text, text)
+
+# an absent entry is reported absent (and the file is not touched)
+p = os.path.join(d, "goose-timeout-absent.yaml")
+fixture = "extensions:\n  chatrecall:\n    enabled: false\n"
+write(p, fixture)
+check("set-timeout: goose absent entry", ac.set_timeout(p, ac.SERVER, 86400) == "absent")
+check("set-timeout: goose absent leaves the file untouched", open(p).read() == fixture)
+
+# a YAML block that is not under extensions: is not ours to touch
+p = os.path.join(d, "goose-timeout-wrong-parent.yaml")
+write(p, "mcp_servers:\n  slack-approval-gateway:\n    command: \"%s\"\n" % CMD)
+check("set-timeout: yaml block not under extensions is absent", ac.set_timeout(p, ac.SERVER, 86400) == "absent")
+
+# the dispatcher still handles TOML
+p = os.path.join(d, "timeout-dispatch.toml")
+write(p, '[mcp_servers.%s]\ncommand = "%s"\n' % (ac.SERVER, CMD))
+check("set-timeout: dispatches to TOML", ac.set_timeout(p, ac.SERVER, 86400) == "added")
+check("set-timeout: TOML entry has it", "tool_timeout_sec = 86400" in open(p).read())
+
+# ------------------------------- audit locations + nested per-project removal
+p = os.path.join(d, "claude-projects.json")
+proj = "/Users/test/my.project"
+write(p, json.dumps({
+    "mcpServers": {"grafana": {"command": "docker"}},
+    "projects": {
+        proj: {"mcpServers": {
+            "slack": {"type": "stdio", "command": "npx", "env": {"SLACK_MCP_XOXC_TOKEN": "xoxc-5330704053091-9437214043493-abcdef0123456789"}},
+            ac.SERVER: {"type": "stdio", "command": CMD},
+        }},
+        "/Users/test/other": {"mcpServers": {"keep": {"command": "x"}}},
+    },
+}))
+f = ac.audit_file(p)
+check("audit: per-project server found", names(f, "direct_slack_servers") == ["slack"], json.dumps(f))
+check("audit: per-project location reported",
+      f["direct_slack_servers"][0]["key"] == ["projects", proj, "mcpServers"], json.dumps(f))
+check("enforce: remove-entry removes the nested entry",
+      ac.remove_entry("claude", p, "slack", ["projects", proj, "mcpServers"]) == "removed")
+data = json.load(open(p))
+check("enforce: nested entry gone", "slack" not in data["projects"][proj]["mcpServers"], json.dumps(data))
+check("enforce: gateway and other entries kept",
+      ac.SERVER in data["projects"][proj]["mcpServers"]
+      and "grafana" in data["mcpServers"]
+      and "keep" in data["projects"]["/Users/test/other"]["mcpServers"],
+      json.dumps(data))
+check("enforce: remove-entry absent for a wrong path",
+      ac.remove_entry("claude", p, "slack", ["projects", "/nope", "mcpServers"]) == "absent")
+
+# remove-json (uninstall) also sweeps nested per-project gateway entries
+p = os.path.join(d, "claude-projects-uninstall.json")
+write(p, json.dumps({
+    "projects": {proj: {"mcpServers": {ac.SERVER: {"command": CMD}}}},
+}))
+check("uninstall: nested per-project gateway entry removed", ac.remove_json("claude", p) == "removed")
+data = json.load(open(p))
+check("uninstall: nested gateway gone", ac.SERVER not in data["projects"][proj].get("mcpServers", {}), json.dumps(data))
+
+# ------------------------------------------------------------- enforce-remove
+# enforce-remove is what install.sh --enforce runs per finding; it must
+# report what actually happened and route by config file.
+vd = os.path.join(d, ".vibe")
+p = os.path.join(vd, "config.toml")
+write(p, '[[mcp_servers]]\nname = "slack"\ncommand = "npx"\n\n[mcp_servers.env]\nSLACK_MCP_XOXC_TOKEN = "xoxc-5330704053091-9437214043493-abcdef0123456789"\n\n[[mcp_servers]]\nname = "other"\ncommand = "x"\n')
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    res = ac.enforce_remove(p, "slack", [])
+check("enforce-remove: vibe server removed", res == "removed" and "[removed]" in buf.getvalue(), buf.getvalue())
+check("enforce-remove: vibe element gone, other kept",
+      'name = "slack"' not in open(p).read() and 'name = "other"' in open(p).read())
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    res = ac.enforce_remove(p, "slack", [])
+check("enforce-remove: absent reported accurately", res == "absent" and "[absent]" in buf.getvalue(), buf.getvalue())
+
+nd = os.path.join(d, "claude-nested")
+p = os.path.join(nd, ".claude.json")
+write(p, json.dumps({"projects": {proj: {"mcpServers": {"slack": {"command": "npx", "env": {"SLACK_MCP_XOXC_TOKEN": "xoxc-5330704053091-9437214043493-abcdef0123456789"}}}}}}))
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    res = ac.enforce_remove(p, "slack", ["projects", proj, "mcpServers"])
+data = json.load(open(p))
+check("enforce-remove: nested per-project entry removed",
+      res == "removed" and "[removed]" in buf.getvalue() and "slack" not in data["projects"][proj]["mcpServers"],
+      buf.getvalue() + json.dumps(data))
+
+# a YAML config has no automatic removal: reported as edit by hand
+yp = os.path.join(d, "goose-direct.yaml")
+write(yp, "extensions:\n  slack:\n    enabled: true\n    type: stdio\n    cmd: npx\n")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    res = ac.enforce_remove(yp, "slack", ["extensions"])
+check("enforce-remove: yaml reported as edit by hand", res == "edit-by-hand" and "[edit by hand]" in buf.getvalue(), buf.getvalue())
+
+# a failing removal is reported as failed, never as removed
+bad = os.path.join(d, "claude-broken")
+bp = os.path.join(bad, ".claude.json")
+write(bp, "{not json")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    res = ac.enforce_remove(bp, "slack", [])
+check("enforce-remove: failure reported accurately", res == "failed" and "[failed]" in buf.getvalue() and "[removed]" not in buf.getvalue(), buf.getvalue())
+
+# ------------------------------------------- uninstall semantics: zed/hermes
+p = os.path.join(d, "zed-uninstall.json")
+write(p, '{\n  "context_servers": {\n    "existing": {"command": {"path": "npx"}},\n    "%s": {"command": {"path": "%s", "args": []}}\n  },\n  "ui_font_size": 14\n}\n' % (ac.SERVER, CMD))
+check("zed: remove drops only our entry", ac.remove_zed(p) == "removed")
+data = json.load(open(p))
+check("zed: other settings kept", "existing" in data["context_servers"] and data["ui_font_size"] == 14, json.dumps(data))
+check("zed: remove again is absent", ac.remove_zed(p) == "absent")
+
+# --------------------------- remove-zed is a text splice (JSONC preserved)
+# a commented JSONC fixture: every comment and every other entry must survive
+# byte-for-byte, with only the gateway entry spliced out
+p = os.path.join(d, "zed-splice-comments.json")
+fixture = (
+    "// Zed settings\n"
+    "{\n"
+    "  // language models\n"
+    '  "context_servers": {\n'
+    "    // the official slack (read-only)\n"
+    '    "slack": {"command": {"path": "npx", "args": ["slack-mcp"]}}, // official\n'
+    "    /* gateway entry below */\n"
+    '    "slack-approval-gateway": {"command": {"path": "%s", "args": []}},\n'
+    '    "existing": {"command": {"path": "npx"}},\n'
+    "  },\n"
+    '  "ui_font_size": 14, // favourite\n'
+    "}\n" % CMD
+)
+write(p, fixture)
+check("zed-splice: removed", ac.remove_zed(p) == "removed")
+text = open(p).read()
+expected = (
+    "// Zed settings\n"
+    "{\n"
+    "  // language models\n"
+    '  "context_servers": {\n'
+    "    // the official slack (read-only)\n"
+    '    "slack": {"command": {"path": "npx", "args": ["slack-mcp"]}}, // official\n'
+    "    /* gateway entry below */\n"
+    '    "existing": {"command": {"path": "npx"}},\n'
+    "  },\n"
+    '  "ui_font_size": 14, // favourite\n'
+    "}\n"
+)
+check("zed-splice: comments and other entries byte-identical", text == expected, text)
+data = json.loads(ac.strip_jsonc(text))
+check("zed-splice: result parses as JSONC",
+      ac.SERVER not in data["context_servers"] and data["context_servers"]["existing"]["command"]["path"] == "npx",
+      json.dumps(data))
+
+# first in context_servers
+p = os.path.join(d, "zed-splice-first.json")
+write(p, '{\n  "context_servers": {\n    "slack-approval-gateway": {"command": {"path": "%s", "args": []}},\n    "existing": {"command": {"path": "npx"}}\n  }\n}\n' % CMD)
+check("zed-splice: first entry removed", ac.remove_zed(p) == "removed")
+check("zed-splice: first entry spliced out cleanly",
+      open(p).read() == '{\n  "context_servers": {\n    "existing": {"command": {"path": "npx"}}\n  }\n}\n',
+      open(p).read())
+
+# last in context_servers (the comma in front of it goes too)
+p = os.path.join(d, "zed-splice-last.json")
+write(p, '{\n  "context_servers": {\n    "existing": {"command": {"path": "npx"}},\n    "slack-approval-gateway": {"command": {"path": "%s", "args": []}}\n  }\n}\n' % CMD)
+check("zed-splice: last entry removed", ac.remove_zed(p) == "removed")
+check("zed-splice: last entry spliced out, no dangling comma",
+      open(p).read() == '{\n  "context_servers": {\n    "existing": {"command": {"path": "npx"}}\n  }\n}\n',
+      open(p).read())
+
+# the only entry: add_zed's `{ "entry" }` splice is undone exactly
+p = os.path.join(d, "zed-splice-only.json")
+original = '{\n  "context_servers": {},\n  "ui_font_size": 14\n}\n'
+write(p, original)
+ac.add_zed(p, CMD)
+check("zed-splice: added into the empty object", '"slack-approval-gateway"' in open(p).read())
+check("zed-splice: only entry removed", ac.remove_zed(p) == "removed")
+check("zed-splice: empty object restored byte-for-byte", open(p).read() == original, open(p).read())
+
+# a server name that is not an entry (in a comment, or no context_servers)
+p = os.path.join(d, "zed-splice-absent.json")
+fixture = '{\n  // the slack-approval-gateway server\n  "context_servers": {"existing": {"command": {"path": "npx"}}}\n}\n'
+write(p, fixture)
+check("zed-splice: name in a comment is not an entry", ac.remove_zed(p) == "absent")
+check("zed-splice: absent leaves the file untouched", open(p).read() == fixture)
+p = os.path.join(d, "zed-splice-nocs.json")
+write(p, '{\n  "ui_font_size": 14\n}\n')
+check("zed-splice: no context_servers is absent", ac.remove_zed(p) == "absent")
+
+p = os.path.join(d, "hermes-uninstall.yaml")
+write(p, "telemetry:\n  enabled: false\nmcp_servers:\n  %s:\n    command: \"%s\"\n    args: []\n    env: {}\n  other:\n    command: npx\n" % (ac.SERVER, CMD))
+check("hermes: remove drops only our block", ac.remove_hermes(p) == "removed")
+text = open(p).read()
+check("hermes: other entries kept", "other:" in text and "telemetry:" in text and ac.SERVER not in text, text)
+
+# ------------------------------------------------- install.sh wiring (grep)
+# install.sh manages the real login service, so it cannot be run end to end
+# in tests; pin the wiring it must have instead.
+sh = open(os.path.join(ROOT, "scripts", "install.sh")).read()
+check("install.sh: zed instruction block goes to ~/.config/zed/AGENTS.md",
+      'add_instruction "$HOME_DIR/.config/zed/AGENTS.md"' in sh)
+check("install.sh: zed legacy rules file deleted on install",
+      'run rm -f "$HOME_DIR/.config/zed/rules/slack-gateway.md"' in sh)
+check("install.sh: hermes instruction block goes to ~/.hermes/SOUL.md",
+      'add_instruction "$HOME_DIR/.hermes/SOUL.md"' in sh)
+check("install.sh: hermes legacy AGENTS.md block migrated away",
+      'ac instruction-remove "$HOME_DIR/.hermes/AGENTS.md"' in sh)
+check("install.sh: uninstall removes the zed AGENTS.md block",
+      '"$HOME_DIR/.config/zed/AGENTS.md"' in sh)
+check("install.sh: uninstall removes the claude entry",
+      'ac remove-json claude "$HOME_DIR/.claude.json"' in sh)
+check("install.sh: uninstall removes the vibe entry",
+      'ac remove-vibe "$HOME_DIR/.vibe/config.toml"' in sh)
+check("install.sh: uninstall keeps .bak-sag backups for manual restore",
+      ".bak-sag backups remain" in sh and "restored from their .bak-sag backups" not in sh)
+check("install.sh: vibe registration sets a long tool timeout",
+      "--tool-timeout-sec 86400" in sh and 'set-timeout "$CFG" "$SERVER_NAME" 86400' in sh)
+check("install.sh: codex registration sets a long tool timeout",
+      'set-timeout "$CFG" "$SERVER_NAME" 86400' in sh)
+check("install.sh: goose registration sets a long tool timeout too",
+      sh.count('set-timeout "$CFG" "$SERVER_NAME" 86400') == 3)
+check("install.sh: enforce reports removed/absent/failed via enforce-remove",
+      'ac enforce-remove "$line"' in sh and "[removed] {path}" not in sh)
 
 # ------------------------------------------------------------ instruction text
 check("instruction: read via slack mcp/connector, send via the gateway",
