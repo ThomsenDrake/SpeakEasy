@@ -39,6 +39,17 @@ const USER_ARG_CANDIDATES: &[&str] = &["user_id", "user", "id"];
 /// Candidate argument names for channel-lookup tools.
 const CHANNEL_ARG_CANDIDATES: &[&str] = &["channel_id", "channel", "id"];
 
+/// The official Slack MCP server's user-lookup tool (needs `users:read`).
+const USER_LOOKUP_TOOL: &str = "slack_read_user_profile";
+
+/// The official Slack MCP server's channel-lookup tool. It lists the
+/// user's channels with their IDs and names, which is the cheapest way to
+/// map a channel ID to its name: `channels:read`/`groups:read`/`im:read`/
+/// `mpim:read`, versus the `*:history` scopes `slack_read_channel` needs
+/// or the `search:read.*` scopes `slack_search_channels` needs (and search
+/// cannot look a channel up by ID).
+const CHANNEL_LOOKUP_TOOL: &str = "slack_list_user_channels";
+
 /// A [`SlackClient`] that sends through a remote Slack MCP server.
 ///
 /// The send tool is either pinned with `SLACK_MCP_TOOL` or discovered once
@@ -301,19 +312,33 @@ impl SlackMcpClient {
         })
     }
 
-    /// The first tool whose name satisfies `predicate`.
-    fn find_tool(&self, predicate: impl Fn(&str) -> bool) -> Option<Value> {
-        self.tools()
-            .ok()?
-            .into_iter()
-            .find(|t| t.get("name").and_then(Value::as_str).is_some_and(|n| predicate(n)))
+    /// The lookup tool to call: the exact official tool name when the
+    /// server lists it, else the first tool whose name loosely matches
+    /// `predicate` (a fallback for servers that name their tools
+    /// differently). The loose match alone can pick a wrong tool — e.g.
+    /// `slack_search_users` (which needs `search:read.users` and takes a
+    /// `query`, not a `user_id`) or `slack_read_channel` (which needs the
+    /// `*:history` scopes) — so the exact name always wins.
+    fn find_lookup_tool(&self, preferred: &str, predicate: impl Fn(&str) -> bool) -> Option<Value> {
+        let tools = self.tools().ok()?;
+        tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(preferred))
+            .or_else(|| {
+                tools.iter().find(|t| {
+                    t.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| predicate(n))
+                })
+            })
+            .cloned()
     }
 
-    /// `Drake Thomsen (@drake.thomsen)` for a user ID, via a user-lookup
-    /// tool (e.g. `slack_read_user_profile`): the reply's JSON object carries
+    /// `Drake Thomsen (@drake.thomsen)` for a user ID, via the user-lookup
+    /// tool (`slack_read_user_profile`): the reply's JSON object carries
     /// the name fields, or the text carries `Real Name:`/`Username:` lines.
     fn resolve_user(&self, user_id: &str) -> Option<String> {
-        let tool = self.find_tool(|n| {
+        let tool = self.find_lookup_tool(USER_LOOKUP_TOOL, |n| {
             let n = n.to_ascii_lowercase();
             n.contains("user")
                 && (n.contains("info")
@@ -330,8 +355,9 @@ impl SlackMcpClient {
         let mut arguments = Map::new();
         arguments.insert(arg, Value::String(user_id.to_string()));
         let reply = self.call_tool(name, arguments).ok()?;
-        if let Some(obj) = json_text(&reply).and_then(|v| v.as_object().cloned()) {
-            let name = string_field(&obj, &["real_name", "display_name", "name"])
+        let (json, text) = unwrap_reply(&reply);
+        if let Some(obj) = json.as_ref().and_then(Value::as_object) {
+            let name = string_field(obj, &["real_name", "display_name", "name"])
                 .or_else(|| {
                     obj.get("user")
                         .and_then(Value::as_object)
@@ -342,7 +368,7 @@ impl SlackMcpClient {
                         .and_then(Value::as_object)
                         .and_then(|p| string_field(p, &["real_name", "display_name", "name"]))
                 });
-            let handle = string_field(&obj, &["name"])
+            let handle = string_field(obj, &["name"])
                 .or_else(|| {
                     obj.get("user")
                         .and_then(Value::as_object)
@@ -357,7 +383,7 @@ impl SlackMcpClient {
                 return Some(format_name(name, handle));
             }
         }
-        let text = text_content(&reply)?;
+        let text = text.or_else(|| text_content(&reply))?;
         let real = field_line(&text, "Real Name");
         let display = field_line(&text, "Display Name");
         let username = field_line(&text, "Username");
@@ -365,12 +391,12 @@ impl SlackMcpClient {
         Some(format_name(name, username))
     }
 
-    /// `#name` for a channel ID, via a channel-lookup tool (e.g.
-    /// `slack_read_channel` / `slack_list_channels`): the reply's JSON has a
-    /// channels array or channel object with the name, or the text opens with
+    /// `#name` for a channel ID, via the channel-lookup tool
+    /// (`slack_list_user_channels`): the reply's JSON has a channels array
+    /// (or a channel object) with the name, or the text opens with
     /// `Channel: #name (ID)`.
     fn resolve_channel(&self, channel_id: &str) -> Option<String> {
-        let tool = self.find_tool(|n| {
+        let tool = self.find_lookup_tool(CHANNEL_LOOKUP_TOOL, |n| {
             let n = n.to_ascii_lowercase();
             (n.contains("channel") || n.contains("conversation"))
                 && (n.contains("info")
@@ -379,29 +405,51 @@ impl SlackMcpClient {
                     || n.contains("read"))
         })?;
         let name = tool.get("name").and_then(Value::as_str)?;
-        let arg = pick_argument(
-            schema_properties(&tool).as_ref(),
-            CHANNEL_ARG_CANDIDATES,
-            "channel_id",
-        );
-        let mut arguments = Map::new();
-        arguments.insert(arg, Value::String(channel_id.to_string()));
+        let arguments = if name == CHANNEL_LOOKUP_TOOL {
+            // The official list tool takes no channel ID: ask for a full
+            // page of the user's channels and match the ID in the reply.
+            let mut arguments = Map::new();
+            arguments.insert("limit".to_string(), json!(200));
+            arguments
+        } else {
+            let arg = pick_argument(
+                schema_properties(&tool).as_ref(),
+                CHANNEL_ARG_CANDIDATES,
+                "channel_id",
+            );
+            let mut arguments = Map::new();
+            arguments.insert(arg, Value::String(channel_id.to_string()));
+            arguments
+        };
         let reply = self.call_tool(name, arguments).ok()?;
-        if let Some(obj) = json_text(&reply).and_then(|v| v.as_object().cloned()) {
-            if let Some(channels) = obj.get("channels").and_then(Value::as_array) {
-                for channel in channels {
-                    if channel.get("id").and_then(Value::as_str) == Some(channel_id) {
-                        if let Some(name) = channel
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
-                            return Some(format!("#{name}"));
-                        }
+        let (json, text) = unwrap_reply(&reply);
+        if let Some(value) = &json {
+            // A channels array — under "channels", or the whole payload —
+            // with the ID matched against the requested one.
+            let empty: &[Value] = &[];
+            let channels = value
+                .as_object()
+                .and_then(|o| o.get("channels"))
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .or_else(|| value.as_array().map(Vec::as_slice))
+                .unwrap_or(empty);
+            for channel in channels {
+                if channel.get("id").and_then(Value::as_str) == Some(channel_id) {
+                    if let Some(name) = channel
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        return Some(format!("#{name}"));
                     }
                 }
             }
-            if let Some(channel) = obj.get("channel").and_then(Value::as_object) {
+            if let Some(channel) = value
+                .as_object()
+                .and_then(|o| o.get("channel"))
+                .and_then(Value::as_object)
+            {
                 if let Some(name) = channel
                     .get("name")
                     .and_then(Value::as_str)
@@ -411,13 +459,41 @@ impl SlackMcpClient {
                 }
             }
         }
-        let text = text_content(&reply)?;
+        let text = text.or_else(|| text_content(&reply))?;
         let first = text.lines().next()?;
         let rest = first.strip_prefix("Channel:")?.trim();
         if rest.starts_with('#') {
             return Some(rest.split_whitespace().next()?.to_string());
         }
         None
+    }
+}
+
+/// A lookup-tool reply, unwrapped: the JSON value the tool reported — the
+/// first text block parsed as JSON, or the inner JSON of Slack's
+/// `{"result": "…"}` / `{"messages": "…"}` string wrapping (the Mistral
+/// connector proxies this same server) — plus the plain text when the
+/// wrapped string is not JSON (formatted `Key: value` lines).
+fn unwrap_reply(reply: &Value) -> (Option<Value>, Option<String>) {
+    let Some(parsed) = json_text(reply) else {
+        return (None, text_content(reply));
+    };
+    if let Some(inner) = parsed
+        .get("result")
+        .or_else(|| parsed.get("messages"))
+        .and_then(Value::as_str)
+    {
+        return match serde_json::from_str::<Value>(inner) {
+            Ok(value) if value.is_object() || value.is_array() => (Some(value), None),
+            _ => (None, Some(inner.to_string())),
+        };
+    }
+    if parsed.is_object() || parsed.is_array() {
+        (Some(parsed), None)
+    } else if let Some(text) = parsed.as_str() {
+        (None, Some(text.to_string()))
+    } else {
+        (None, text_content(reply))
     }
 }
 

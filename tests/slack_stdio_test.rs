@@ -282,6 +282,7 @@ const STDIO_ENV: &[&str] = &[
     "SLACK_STDIO_CHANNEL_ARG",
     "SLACK_STDIO_TEXT_ARG",
     "SLACK_STDIO_THREAD_ARG",
+    "SLACK_WORKSPACE_DOMAIN",
     "SLACK_MCP_XOXB_TOKEN",
     "SLACK_MCP_XOXP_TOKEN",
     "SLACK_MCP_XOXC_TOKEN",
@@ -412,6 +413,43 @@ fn from_env_credentials_transport_resolution_and_server_env() {
     assert_eq!(env.get("SLACK_MCP_LOG_LEVEL").and_then(Value::as_str), Some("debug"));
     std::env::remove_var("SLACK_MCP_ADD_MESSAGE_TOOL");
     std::env::remove_var("SLACK_MCP_LOG_LEVEL");
+
+    // --- the server command: env var > <state_dir>/slack_stdio_command file
+    // (the env var is set above; drop it so the file takes over, then put it
+    // back for the sections below)
+    std::env::remove_var("SLACK_STDIO_COMMAND");
+    let file_command = mock_command(&log, &[]);
+    std::fs::write(dir.join("slack_stdio_command"), format!("{file_command}\n")).unwrap();
+    let client = KorotovskyClient::from_env(&dir).expect("the command file must be read");
+    drop(client);
+    std::env::set_var("SLACK_STDIO_COMMAND", &command);
+
+    // --- the workspace domain for fallback permalinks: the env var wins
+    // over the <state_dir>/slack_workspace_domain file (the mock's reply has
+    // no permalink, so the gateway builds one from this domain)
+    std::fs::write(dir.join("slack_workspace_domain"), "filedomain\n").unwrap();
+    let client = KorotovskyClient::from_env(&dir).expect("from_env must build the client");
+    let send = client
+        .post_message("C0123SMOKE", None, "permalink from the domain file")
+        .expect("post_message");
+    assert!(
+        send.permalink.starts_with("https://filedomain.slack.com/archives/"),
+        "{}",
+        send.permalink
+    );
+    drop(client);
+    std::env::set_var("SLACK_WORKSPACE_DOMAIN", "envdomain");
+    let client = KorotovskyClient::from_env(&dir).expect("from_env must build the client");
+    let send = client
+        .post_message("C0123SMOKE", None, "permalink from the env domain")
+        .expect("post_message");
+    assert!(
+        send.permalink.starts_with("https://envdomain.slack.com/archives/"),
+        "{}",
+        send.permalink
+    );
+    drop(client);
+    std::env::remove_var("SLACK_WORKSPACE_DOMAIN");
 
     // --- build_client wires the korotovsky transport end to end
     std::env::set_var("SLACK_TRANSPORT", "korotovsky");

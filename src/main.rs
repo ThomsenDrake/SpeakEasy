@@ -159,6 +159,9 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     )?;
     let mut builder = TrayIconBuilder::with_id("slack-approval-gateway")
         .menu(&menu)
+        // A left click opens the window (the menu is right-click only);
+        // Tauri's default is to show the menu on left click.
+        .show_menu_on_left_click(false)
         .tooltip("SpeakEasy")
         .icon_as_template(true)
         .on_tray_icon_event(|tray, event| {
