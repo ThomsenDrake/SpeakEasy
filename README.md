@@ -33,6 +33,105 @@ asks you in the same window first.
 - **Feedback instead of a dead end.** Tell the agent what to change. It gets
   your note and can ask again.
 
+## Install with your coding agent
+
+Paste this into Claude Code, Codex, or any coding agent that can run shell
+commands on your Mac. It downloads the signed release, checks it, previews
+and runs the installer, and tells you what it set up. The agent needs to
+run those commands outside its sandbox, and asks you to allow that. To do
+it yourself instead, see [Install](#install).
+
+```text
+Install SpeakEasy on this Mac for me (https://github.com/ThomsenDrake/SpeakEasy).
+SpeakEasy puts an approval window between coding agents and Slack. Follow these
+steps exactly. Its README has details if a step's output needs explaining.
+
+Rules for the whole task:
+- Run every command yourself, in a shell on this Mac. Never use sudo.
+- Run steps 2, 3 and 4 outside your sandbox, with network access: in Codex,
+  request escalated permissions for each command; in Claude Code, approve
+  running it outside the sandbox; in Gemini CLI, restart without --sandbox.
+  Allowing only network access or home-folder writes is not enough: inside a
+  sandbox, codesign rejects a good binary and the installer cannot restart
+  SpeakEasy. If I don't allow it, stop and tell me why it's needed.
+- Never ask me to paste a Slack token, an API key, or a password into this
+  chat. Never print SpeakEasy's credential files (slack_mcp_token,
+  mistral_api_key, slack_bot_token, slack_user_token, slack_stdio_env, and
+  *.pre-takeover in ~/.slack-approval-gateway). If the installer says
+  SpeakEasy is not running, you may show me
+  `tail -n 40 ~/.slack-approval-gateway/gateway.log`.
+- Do not edit agent config files yourself, except as step 5 allows. Do not
+  run the installer with --enforce, --uninstall, or a credential option
+  unless I tell you to; if its output suggests --enforce, explain it to me
+  instead of running it.
+- Do not send a Slack message to test the install.
+- If a command fails, stop and show me its exact output.
+
+1. Check the Mac. `sw_vers -productVersion` must print 11 or later, and
+   `python3 --version` must work. If python3 is missing, stop and tell me to
+   run `xcode-select --install`.
+
+2. Download the latest release into ~/.local/share and check it. Run this
+   as one command (it replaces an earlier copy only after the new download
+   checks out):
+
+   mkdir -p ~/.local/share && cd ~/.local/share && curl -fsSLO https://github.com/ThomsenDrake/SpeakEasy/releases/latest/download/speakeasy-macos-universal.tar.gz && curl -fsSLO https://github.com/ThomsenDrake/SpeakEasy/releases/latest/download/speakeasy-macos-universal.tar.gz.sha256 && shasum -a 256 -c speakeasy-macos-universal.tar.gz.sha256 && rm -rf speakeasy-macos-universal && tar -xzf speakeasy-macos-universal.tar.gz && rm speakeasy-macos-universal.tar.gz speakeasy-macos-universal.tar.gz.sha256
+
+   Then check the binary's signature. Both commands must succeed, and the
+   second one must print exactly TeamIdentifier=4WVHZHWYK9:
+
+   codesign --verify --check-notarization -R=notarized ~/.local/share/speakeasy-macos-universal/bin/slack-approval-gateway
+   codesign -dv ~/.local/share/speakeasy-macos-universal/bin/slack-approval-gateway 2>&1 | grep TeamIdentifier
+
+   If a codesign command fails, run it again outside any sandbox, with
+   network access, before you conclude anything: only a failure there means
+   the download is bad. Then stop and show me the output.
+
+3. Preview the install. This changes nothing. The env -u part keeps Slack
+   or Mistral credentials in your environment from being picked up without
+   my say-so:
+
+   env -u SLACK_MCP_TOKEN -u MISTRAL_API_KEY -u SLACK_BOT_TOKEN -u SLACK_USER_TOKEN ~/.local/share/speakeasy-macos-universal/scripts/install.sh --dry-run
+
+   If the preview says it found several Slack MCP servers it could take
+   over, show me that list and ask which one SpeakEasy should use, or none.
+   It printed a full --take-over command for each one; if I pick one, add
+   that command's --take-over '...' option to step 4's command.
+
+4. Install, with the same env -u part. It takes a few seconds to a minute
+   and restarts SpeakEasy:
+
+   env -u SLACK_MCP_TOKEN -u MISTRAL_API_KEY -u SLACK_BOT_TOKEN -u SLACK_USER_TOKEN ~/.local/share/speakeasy-macos-universal/scripts/install.sh
+
+5. Read all of step 4's output (not the preview's), then tell me briefly:
+   - the transport: the line starting with "transport:" in the installer's
+     section "3. State dir, transport, and credentials", and any "taking
+     over your Slack MCP:" line (its output masks secrets; keep them masked);
+   - every "entry updated" line: SpeakEasy repaired an entry an older
+     version wrote;
+   - the agents marked VERIFIED in "Verify registrations";
+   - word for word, every line containing [failed], WARNING, warning:,
+     MISSING, OUTDATED, NOT GATED, or note:, with the indented lines right
+     after it;
+   - section 7's "NOT gated by SpeakEasy" list, if it has one, with what it
+     says to set by hand;
+   - the "Next steps" section.
+   For each [failed] line, the edit to make is in the lines just above it:
+   offer to make it, and make it only if I say yes. If Next steps asks for
+   my Slack workspace domain, ask me for it (acme for acme.slack.com) and
+   run the command it gives.
+
+6. Tell me to restart my coding agents, this session included, so they load
+   SpeakEasy, and then to try it as the README's "Try it" section shows.
+   To update SpeakEasy later, I can paste these instructions again (if I
+   installed it with options such as --hook-wait or --no-hooks, ask me
+   whether to pass them again). To remove it completely:
+   ~/.local/share/speakeasy-macos-universal/scripts/install.sh --uninstall --purge
+   then rm -rf ~/.local/share/speakeasy-macos-universal, and restart my
+   agents. --purge also deletes SpeakEasy's copy of any Slack login it took
+   over; without it, that copy stays in ~/.slack-approval-gateway.
+```
+
 ## How it works
 
 1. An agent calls `request_slack_message` with the message, the destination
@@ -77,7 +176,8 @@ hooks](#approval-hooks) for the agents this works with.
 ## Install
 
 SpeakEasy installs as a login service, from a release download or from
-source. Its binary, MCP server, and state folder keep an older name,
+source. A coding agent can do all of this for you: see [Install with your
+coding agent](#install-with-your-coding-agent). Its binary, MCP server, and state folder keep an older name,
 `slack-approval-gateway`.
 
 **Requirements:** macOS 11 or later and Python 3 (macOS offers to install
@@ -170,10 +270,13 @@ The installer:
    starts SpeakEasy at login with your current `PATH`, and starts it now.
 4. Registers the MCP server `slack-approval-gateway` with every agent it
    finds ([table below](#supported-agents)). It also adds a short block to
-   each agent's instructions file: read Slack through your Slack MCP server
-   or Mistral connector, and send only through `request_slack_message`.
-   Without a Slack login of its own, SpeakEasy skips the server (it couldn't
-   send), and the block tells agents to use their own Slack tool instead.
+   each agent's instructions file. An agent with SpeakEasy's approval hook
+   (next step) is told to send with its own Slack tool or
+   `request_slack_message`, since you approve either; an agent without one
+   (Zed's built-in agent) is told to send only through
+   `request_slack_message`. Without a Slack login of its own, SpeakEasy
+   skips the server (it couldn't send), and the block tells agents to use
+   their own Slack tool instead.
 5. Adds SpeakEasy's [approval hook](#approval-hooks) to every agent that
    supports hooks, so the agents' own Slack tools ask you first too.
 6. Audits those agents' config files for other ways to post to Slack, and
@@ -225,7 +328,7 @@ block their own Slack writes, since there is no SpeakEasy to ask. Use
 | `--no-hooks` | Don't add the [approval hooks](#approval-hooks), and remove ones added before. SpeakEasy then needs a Slack login of its own, so this needs a credential, a takeover, or `--transport`; without one the installer stops before changing anything. |
 | `--hook-wait SECS` | How long a hooked Slack call waits for you before it's blocked. Default 600 (10 minutes), from 60 to 86400. |
 | `--enforce` | Also remove token-based Slack MCP servers from agent configs. See [Security](#what-the-installers-audit-reports). |
-| `--dry-run` | Show what would change, and change nothing. It doesn't build, so it needs an existing `target/release` binary: run `cargo build --release` first. |
+| `--dry-run` | Show what would change, and change nothing. A release download needs nothing else. From source it doesn't build, so it needs an existing `target/release` binary: run `cargo build --release` first. |
 | `--skip-build` | Use the existing `target/release` binary. (A release download always uses its prebuilt `bin/` binary.) |
 | `--uninstall [--purge]` | See [Uninstall](#uninstall). |
 
@@ -606,14 +709,15 @@ configs, and reports:
    agent's Slack grant read-only (no `chat:write`). A Mistral connector
    can't be limited that way. The audit lists Claude Desktop's and Zed's
    Slack servers as not gated.
-2. **Token-based Slack MCP servers.** Without an approval hook, agents
-   could post through these without asking. In the hooks-only setup they
-   are how agents send, and the hooks gate them. Otherwise
-   `scripts/install.sh --enforce` removes them from the configs of Claude
-   Code (per-project entries included), Claude Desktop, Cursor, Codex,
-   Mistral Vibe, OpenCode, pi, pdev, Gemini CLI, Copilot CLI, and Amp, and
-   lists entries in goose, Zed, and Hermes configs for you to remove by
-   hand. Removing an entry doesn't revoke its token, and
+2. **Token-based Slack MCP servers.** In an agent with SpeakEasy's approval
+   hook, each write through them waits for your approval, and the audit
+   lists them as gated. Without the hook, agents could post through them
+   without asking. `scripts/install.sh --enforce` (which the installer
+   suggests only while ungated ones remain) removes them from the configs
+   of Claude Code (per-project entries included), Claude Desktop, Cursor,
+   Codex, Mistral Vibe, OpenCode, pi, pdev, Gemini CLI, Copilot CLI, and
+   Amp, and lists entries in goose, Zed, and Hermes configs for you to
+   remove by hand. Removing an entry doesn't revoke its token, and
    the file's `.bak-sag` backup may still hold it, so rotate the token in
    Slack.
 3. **Slack tokens and Mistral API keys in agent configs**, masked. Rotate
@@ -990,7 +1094,7 @@ SLACK_GATEWAY_DEMO_SEED=single ./target/debug/slack-approval-gateway --demo
 | `src/slack_mcp.rs`, `src/mistral_slack.rs` | The Slack MCP and Mistral connector transports |
 | `src/slack_stdio.rs` | The Korotovsky transport (runs your `slack-mcp-server` over stdio) |
 | `src/slack_tools.rs` | Send-tool discovery and reply parsing, shared by the transports |
-| `NOTICE.md` | Upstream license notices (Once UI, Lucide, Heroicons, …) |
+| `LICENSE`, `NOTICE.md` | SpeakEasy's MIT license; upstream license notices (Once UI, Lucide, Heroicons, …) |
 | `scripts/install.sh`, `scripts/agent_config.py` | The installer and its agent-config editor |
 | `scripts/slack_mcp_oauth.py` | The OAuth helper for the Slack MCP token |
 | `tests/`, `scripts/smoke_test.py`, `scripts/mock_korotovsky.py` | Tests and mocks |
@@ -1015,7 +1119,7 @@ runtime, secure timestamp), has Apple notarize it, and publishes
 `speakeasy-macos-universal.tar.gz` and its `.sha256` as a GitHub release
 with generated notes; a version with a `-` (`0.2.0-rc.1`) is a
 prerelease. The archive holds the binary in `bin/`, the installer scripts,
-README, NOTICE, and `THIRD_PARTY_LICENSES.md`
+README, LICENSE, NOTICE, and `THIRD_PARTY_LICENSES.md`
 (`scripts/third_party_licenses.py`: the licenses of the crates compiled
 into the binary). Running the workflow by hand (Actions → Release → Run
 workflow) does the same build without publishing and keeps the archive as
@@ -1058,3 +1162,10 @@ once, in your own terminal (the values never appear in a command line):
 A Developer ID certificate lasts five years; binaries signed before it
 expires stay valid (their signatures are timestamped), but new releases
 need a new one.
+
+## License
+
+SpeakEasy is released under the [MIT License](LICENSE). The window adapts
+material from open-source projects whose licenses are in
+[NOTICE.md](NOTICE.md); a release also carries `THIRD_PARTY_LICENSES.md`,
+the licenses of the Rust crates compiled into the binary.

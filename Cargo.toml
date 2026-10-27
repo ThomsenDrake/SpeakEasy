@@ -2,6 +2,8 @@
 name = "slack-approval-gateway"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/ThomsenDrake/SpeakEasy"
 description = "SpeakEasy: desktop approval gateway for agent-initiated Slack messages, exposed to agents as an MCP tool"
 
 [lib]

@@ -175,7 +175,7 @@ jobs:
           mkdir -p "$pkg/bin" "$pkg/scripts"
           install -m 0755 dist/slack-approval-gateway "$pkg/bin/"
           install -m 0755 scripts/install.sh scripts/agent_config.py scripts/slack_mcp_oauth.py "$pkg/scripts/"
-          install -m 0644 README.md NOTICE.md "$pkg/"
+          install -m 0644 README.md LICENSE NOTICE.md "$pkg/"
           python3 scripts/third_party_licenses.py > "$pkg/THIRD_PARTY_LICENSES.md"
           printf '%s\n' "${{ steps.version.outputs.version }}" > "$pkg/VERSION"
           # no AppleDouble or extended-attribute entries in the archive

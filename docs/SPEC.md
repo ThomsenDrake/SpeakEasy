@@ -874,10 +874,18 @@ sends real messages.
   quotes the error lines of `gateway.log`. A credential given (or stored)
   after a hooks-only install switches `slack_transport` to its transport;
   hooks-only with `--no-hooks` is refused; `--enforce` is skipped in
-  hooks-only mode. `--uninstall` lists whatever it could not remove and
-  exits 1 (a leftover hook fails closed). Instruction blocks: `gateway` when SpeakEasy
-  can send; hooks-only: `hooks` where the hook was registered, `confirm`
-  ("ask the user in chat first") elsewhere. `CODEX_HOME`, `HERMES_HOME`
+  hooks-only mode. An agent whose own settings switch its hooks off
+  (Claude Code `disableAllHooks`, Codex `[features] hooks = false`, Gemini
+  `hooksConfig`) gets the hook but is reported NOT GATED, not VERIFIED, and
+  its instruction block is not a hooked variant. Commands the installer
+  suggests are printed with its own path (`~/…/scripts/install.sh`), every
+  run prints a `transport:` line, and `--dry-run` says "would write".
+  `--uninstall` lists whatever it could not remove and
+  exits 1 (a leftover hook fails closed). Instruction blocks, when SpeakEasy
+  can send: `either` ("your Slack tool or `request_slack_message`; the user
+  approves either") where the hook was registered, `gateway` (only
+  `request_slack_message`) elsewhere; hooks-only: `hooks` where the hook was
+  registered, `confirm` ("ask the user in chat first") elsewhere. `CODEX_HOME`, `HERMES_HOME`
   and `VIBE_HOME` select those agents' hook files. Before choosing a transport it takes over the
   Slack MCP the user already has: `agent_config.py takeover-candidates`
   lists the Slack MCP servers in agent configs (Claude Desktop and Cursor
@@ -915,8 +923,9 @@ sends real messages.
   gated by the approval hook where the agent has one, and otherwise only
   asked about by the instruction block); direct token-based Slack servers
   (a `xox*` token in the entry, or an unclassifiable slack-named server)
-  are **violations** when SpeakEasy can send (in hooks-only they are how
-  agents send, and the hooks gate them), as are Slack tokens and Mistral
+  are listed as gated when the agent whose config holds them has
+  SpeakEasy's approval hook (its writes through them wait for the user),
+  and as **violations** otherwise (in hooks-only they are how agents send), as are Slack tokens and Mistral
   API keys found in agent configs. Slack servers in Claude Desktop and Zed
   are reported as NOT gated (no hooks there; Zed gets only the
   instruction block), with what to set by hand. Non-MCP Slack settings
@@ -938,7 +947,7 @@ sends real messages.
   call answers the OK code). A tag is never published unsigned; a manual
   run without the secrets is ad-hoc signed, with a warning. `speakeasy-macos-universal.tar.gz` holds
   `speakeasy-macos-universal/{bin/slack-approval-gateway, scripts/
-  {install.sh, agent_config.py, slack_mcp_oauth.py}, README.md, NOTICE.md,
+  {install.sh, agent_config.py, slack_mcp_oauth.py}, README.md, LICENSE, NOTICE.md,
   THIRD_PARTY_LICENSES.md, VERSION}`; it and its `.sha256` are published
   with `gh release create --generate-notes` (`--prerelease` for a version
   with a `-`; a re-run replaces the assets). A manual run (workflow_dispatch)
@@ -946,6 +955,8 @@ sends real messages.
   `install.sh` run from such an archive (a `bin/` binary and no
   `Cargo.toml` next to `scripts/`) installs that binary and never builds,
   and clears `com.apple.quarantine` on the installed copy.
+- `slack-approval-gateway --version` / `--help` print and exit without
+  starting or relaying to SpeakEasy.
 - First builds compile eframe/wgpu and take several minutes; that's
   expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.

@@ -91,11 +91,14 @@ Subcommands:
                               Replaces an earlier SpeakEasy hook in place
   hook-remove AGENT FILE      remove SpeakEasy's hook (other hooks are kept)
   hook-has AGENT FILE         exit 0 when SpeakEasy's hook is registered
-  instruction-add FILE [gateway|hooks|confirm]
+  instruction-add FILE [gateway|either|hooks|confirm]
                               insert/replace the managed instruction block in
                               an agent instruction file: "use the gateway's
-                              request_slack_message" (default) or, for the
-                              hooks-only setup, "use your Slack tool; the
+                              request_slack_message" (default; agents without
+                              SpeakEasy's hook), "use your Slack tool or
+                              request_slack_message; the user approves either"
+                              (hooked agents when SpeakEasy can send), or, for
+                              the hooks-only setup, "use your Slack tool; the
                               user approves each call" (hooked agents) or
                               "ask the user in chat first" (agents without
                               the hook)
@@ -164,6 +167,12 @@ You may have the Slack MCP server or the Mistral Slack connector available — u
 INSTRUCTION_HOOKS = """## Slack: every message needs the user's approval
 
 To send a Slack message, use your Slack tool (for example `slack_send_message`) as usual. Before the call runs, SpeakEasy shows the user the exact message and destination in an approval window, and the call only runs if they approve. If the call is blocked, nothing was sent: follow the reason it gives (after feedback, revise and call again; never retry a denied message). Never send Slack messages any other way: curl, webhooks, SDKs, CLIs, scripts, or the browser."""
+
+# SpeakEasy can send AND the agent has SpeakEasy's hook: both routes ask the
+# user first, so the agent may use either.
+INSTRUCTION_EITHER = """## Slack: every message needs the user's approval
+
+To send a Slack message, use your Slack tool (for example `slack_send_message`) as usual, or the MCP tool `request_slack_message` (server `slack-approval-gateway`). Either way SpeakEasy shows the user the exact message and destination in an approval window first, and only what they approve is sent. If a call is blocked, nothing was sent: follow the reason it gives (after feedback, revise and call again; never retry a denied message). Never send Slack messages any other way: curl, webhooks, SDKs, CLIs, scripts, or the browser."""
 
 # The hooks-only setup, for an agent without SpeakEasy's hook (Zed's
 # built-in agent): nothing but the instruction stands between it and Slack.
@@ -1371,7 +1380,8 @@ def instruction_add(path, variant="gateway"):
     created = text is None
     if text is None:
         text = ""
-    body = {"hooks": INSTRUCTION_HOOKS, "confirm": INSTRUCTION_CONFIRM}.get(variant, INSTRUCTION)
+    body = {"hooks": INSTRUCTION_HOOKS, "either": INSTRUCTION_EITHER,
+            "confirm": INSTRUCTION_CONFIRM}.get(variant, INSTRUCTION)
     block = MARK_BEGIN + "\n\n" + body + "\n\n" + MARK_END + "\n"
     try:
         span = _block_span(text)
@@ -3471,7 +3481,7 @@ def main(argv):
         agent, path = args
         return 0 if hook_has(agent, path) else 1
     elif cmd == "instruction-add":
-        # instruction-add FILE [gateway|hooks]
+        # instruction-add FILE [gateway|either|hooks|confirm]
         path, variant = args[0], (args[1] if len(args) > 1 else "gateway")
         print("%s: %s" % (path, instruction_add(path, variant)))
     elif cmd == "instruction-remove":

@@ -893,6 +893,18 @@ except SystemExit:
 check("zed r9: an unterminated comment makes the file invalid (refused)", ok)
 shutil.rmtree(up, ignore_errors=True)
 
+# the "either" variant: hooked agents when SpeakEasy can send
+ie = tmpdir()
+f = os.path.join(ie, "AGENTS.md")
+write(f, "# mine\n\n" + ac.MARK_BEGIN + "\n\n" + ac.INSTRUCTION + "\n\n" + ac.MARK_END + "\n")
+check("either: replaces an old gateway block in place", ac.instruction_add(f, "either") == "updated")
+t = open(f).read()
+check("either: allows the agent's own Slack tool and request_slack_message",
+      "use your Slack tool" in t and "request_slack_message" in t and "Never send through the Slack MCP" not in t
+      and t.startswith("# mine\n") and t.count(ac.MARK_BEGIN) == 1)
+check("either: idempotent", ac.instruction_add(f, "either") == "unchanged")
+shutil.rmtree(ie, ignore_errors=True)
+
 # ------------------------------------------------- install.sh wiring (grep)
 # install.sh manages the real login service, so it cannot be run end to end
 # in tests; pin the wiring it must have instead.
@@ -946,7 +958,11 @@ check("install.sh: the installed binary is not quarantined",
 wf = open(os.path.join(ROOT, ".github", "workflows", "release.yml")).read()
 check("release workflow: ships what a release install needs",
       all(x in wf for x in ('"$pkg/bin/"', "scripts/install.sh scripts/agent_config.py scripts/slack_mcp_oauth.py",
-                             "THIRD_PARTY_LICENSES.md", "NOTICE.md")))
+                             "THIRD_PARTY_LICENSES.md", "LICENSE NOTICE.md")))
+check("install.sh: hooked agents get the either variant when SpeakEasy can send",
+      'variant="either"' in sh)
+check("install.sh: the audit tells hooked token servers from ungated ones; --enforce hint only for ungated",
+      'GAPS_GATED="$GAPS_GATED$line"' in sh and 'if [ -n "$GAPS_UNGATED" ] && [ "$TRANSPORT" != "hooks-only" ]' in sh)
 check("install.sh: enforce reports removed/absent/failed via enforce-remove",
       'ac enforce-remove "$line"' in sh and "[removed] {path}" not in sh)
 

@@ -414,6 +414,29 @@ fn main() {
             }
         }
     }
+    // Answer these without starting (or relaying to) SpeakEasy.
+    if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("slack-approval-gateway {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
+        println!(
+            "SpeakEasy (slack-approval-gateway) {}\n\n\
+             Run by your coding agents as an MCP server over stdio, and as the\n\
+             login service (--serve). Install it with scripts/install.sh.\n\n\
+             Usage:\n  \
+             slack-approval-gateway            MCP server over stdio (agents start it)\n  \
+             slack-approval-gateway --serve    the background service (login item)\n  \
+             slack-approval-gateway --cli      ask on this terminal instead of a window\n  \
+             slack-approval-gateway --demo     show the window with sample requests\n  \
+             slack-approval-gateway --hook AGENT [--wait SECS]\n                                    \
+             approval hook for an agent's own Slack tools\n  \
+             slack-approval-gateway --version\n\n\
+             README: https://github.com/ThomsenDrake/SpeakEasy",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
     let cli_mode = args.iter().any(|a| a == "--cli");
     let serve_mode = args.iter().any(|a| a == "--serve");
     let demo_mode = args.iter().any(|a| a == "--demo");

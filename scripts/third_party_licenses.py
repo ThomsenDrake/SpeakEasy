@@ -86,7 +86,8 @@ def main():
     w("The SpeakEasy binary (`bin/slack-approval-gateway`) is built from these\n"
       "Rust crates (%d, for macOS), compiled in. Below is every license, notice\n"
       "and copyright file their packages ship, each text once with the crates\n"
-      "that ship it. SpeakEasy's own notices are in NOTICE.md.\n\n" % len(packages))
+      "that ship it. SpeakEasy's own license is in LICENSE, and the notices of\n"
+      "the projects its window adapts are in NOTICE.md.\n\n" % len(packages))
     if no_file:
         w("## Crates that ship no license file\n\n")
         w("Their license, as their package declares it (the full MIT, Apache-2.0\n"
