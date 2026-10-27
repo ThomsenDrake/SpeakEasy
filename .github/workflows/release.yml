@@ -1,8 +1,19 @@
 # Release build: push a tag vX.Y.Z (matching Cargo.toml's version) to test,
-# build a universal macOS binary, and publish it as a GitHub release with
+# build a universal macOS binary, sign it with the Developer ID and have
+# Apple notarize it, and publish it as a GitHub release with
 # speakeasy-macos-universal.tar.gz and its .sha256. Running the workflow by
 # hand (Actions > Release > Run workflow) does the same build and keeps the
 # archive as a workflow artifact, without publishing anything.
+#
+# Signing secrets (README, "Making a release"):
+#   MACOS_SIGNING_CERTIFICATE_P12       base64 of the Developer ID Application .p12
+#   MACOS_SIGNING_CERTIFICATE_PASSWORD  its export password
+# and for notarization either an App Store Connect API key
+#   APPLE_API_KEY_P8, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID
+# or an Apple ID with an app-specific password
+#   APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD
+# A tag is never published unsigned; a manual run without them is ad-hoc
+# signed, with a warning.
 
 name: Release
 
@@ -67,9 +78,91 @@ jobs:
           lipo -create -output dist/slack-approval-gateway \
             target/aarch64-apple-darwin/release/slack-approval-gateway \
             target/x86_64-apple-darwin/release/slack-approval-gateway
-          # ad-hoc signature over both slices (Apple silicon runs nothing unsigned)
-          codesign --force --sign - dist/slack-approval-gateway
           lipo -info dist/slack-approval-gateway
+
+      - name: Sign and notarize
+        env:
+          CERT_P12: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          bin=dist/slack-approval-gateway
+          if [ -z "$CERT_P12" ]; then
+            if [ "$GITHUB_REF_TYPE" = tag ]; then
+              echo "::error::a release must be signed: set the MACOS_SIGNING_CERTIFICATE_P12 secrets (README, \"Making a release\")"
+              exit 1
+            fi
+            echo "::warning::no signing certificate: this test build is only ad-hoc signed, not notarized"
+            # (Apple silicon runs nothing unsigned)
+            codesign --force --sign - "$bin"
+            exit 0
+          fi
+          if [ -n "$API_KEY_P8" ]; then
+            printf '%s\n' "$API_KEY_P8" > "$RUNNER_TEMP/notary-key.p8"
+            notary=(--key "$RUNNER_TEMP/notary-key.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID")
+          elif [ -n "$APPLE_ID" ]; then
+            notary=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD")
+          else
+            echo "::error::signing needs notarization credentials too: the APPLE_API_KEY_* secrets, or APPLE_ID and APPLE_APP_SPECIFIC_PASSWORD"
+            exit 1
+          fi
+
+          # a keychain of its own for the Developer ID (deleted below)
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -f pkcs12
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          # Apple's Developer ID intermediates, which an exported .p12 usually lacks
+          for ca in DeveloperIDCA DeveloperIDG2CA; do
+            curl -fsSL "https://www.apple.com/certificateauthority/$ca.cer" -o "$RUNNER_TEMP/$ca.cer"
+            security import "$RUNNER_TEMP/$ca.cer" -k "$keychain" >/dev/null 2>&1 || true
+          done
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          # shellcheck disable=SC2046 # the search list's paths have no spaces
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n 1)"
+          if [ -z "$identity" ]; then
+            echo "::error::MACOS_SIGNING_CERTIFICATE_P12 holds no Developer ID Application identity"
+            exit 1
+          fi
+          team="$(printf '%s' "$identity" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')"
+          echo "signing as: $identity"
+
+          # hardened runtime and a secure timestamp: what notarization requires
+          codesign --force --options runtime --timestamp --keychain "$keychain" \
+            --sign "$identity" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+          codesign -dv "$bin" 2>&1 | grep -E 'Authority=Developer ID|TeamIdentifier|flags'
+
+          # notarize (a bare binary can't be stapled: Gatekeeper looks the
+          # ticket up online when the downloaded binary first runs)
+          ditto -c -k --keepParent "$bin" "$RUNNER_TEMP/notarize.zip"
+          [ -n "$APPLE_ID" ] && [ -z "$API_KEY_P8" ] && notary+=(--team-id "$team")
+          out="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" "${notary[@]}" \
+            --wait --timeout 1h --output-format json)" || true
+          echo "$out"
+          id="$(printf '%s' "$out" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("id", ""))' 2>/dev/null || true)"
+          status="$(printf '%s' "$out" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("status", ""))' 2>/dev/null || true)"
+          if [ "$status" != Accepted ]; then
+            [ -n "$id" ] && xcrun notarytool log "$id" "${notary[@]}" || true
+            echo "::error::notarization was not accepted (status: ${status:-none})"
+            exit 1
+          fi
+          echo "notarized: submission $id"
+
+      - name: Check the binary
+        run: |
+          codesign --verify --strict dist/slack-approval-gateway
           # the binary answers: a non-Slack hook call gets no opinion (--ok-code)
           rc=0
           printf '%s' '{"tool_name":"Bash","tool_input":{"command":"true"}}' \
@@ -99,6 +192,12 @@ jobs:
             dist/${{ env.ARCHIVE }}.tar.gz
             dist/${{ env.ARCHIVE }}.tar.gz.sha256
           if-no-files-found: error
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/certificate.p12"
 
       - name: Publish the release
         if: github.ref_type == 'tag'

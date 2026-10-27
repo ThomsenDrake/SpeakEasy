@@ -929,9 +929,14 @@ sends real messages.
   (macOS runner): the tag must equal `Cargo.toml`'s version; `cargo test`,
   `scripts/test_agent_config.py`, `scripts/smoke_test.py` and `bash -n
   scripts/install.sh` must pass; the aarch64 and x86_64 release builds
-  (`MACOSX_DEPLOYMENT_TARGET=11.0`) are combined with `lipo`, ad-hoc
-  signed, and checked (a non-Slack `--hook claude` call answers the OK
-  code). `speakeasy-macos-universal.tar.gz` holds
+  (`MACOSX_DEPLOYMENT_TARGET=11.0`) are combined with `lipo`, signed with
+  the Developer ID from the `MACOS_SIGNING_CERTIFICATE_P12` secret
+  (hardened runtime, secure timestamp, in a temporary keychain that also
+  holds Apple's Developer ID intermediates), notarized with `notarytool`
+  (an App Store Connect API key, or an Apple ID and app-specific password;
+  a bare binary can't be stapled), and checked (a non-Slack `--hook claude`
+  call answers the OK code). A tag is never published unsigned; a manual
+  run without the secrets is ad-hoc signed, with a warning. `speakeasy-macos-universal.tar.gz` holds
   `speakeasy-macos-universal/{bin/slack-approval-gateway, scripts/
   {install.sh, agent_config.py, slack_mcp_oauth.py}, README.md, NOTICE.md,
   THIRD_PARTY_LICENSES.md, VERSION}`; it and its `.sha256` are published

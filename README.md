@@ -97,11 +97,8 @@ cd speakeasy-macos-universal
 ```
 
 The installer then installs the binary in `bin/` and never builds. The
-binary is not notarized by Apple: if you download the archive with a
-browser instead of `curl`, the installer clears the quarantine flag on the
-copy it installs, so Gatekeeper doesn't stop the login service. Each
-release also has a `.sha256` file to check the download with
-`shasum -a 256 -c`.
+binary is signed with a Developer ID and notarized by Apple. Each release
+also has a `.sha256` file to check the download with `shasum -a 256 -c`.
 
 Or build from source:
 
@@ -1012,8 +1009,9 @@ git tag v0.2.0 && git push origin v0.2.0
 ```
 
 The Release workflow (`.github/workflows/release.yml`) checks that the tag
-matches `Cargo.toml`, runs the tests, builds a universal binary
-(`lipo` of the arm64 and x86_64 builds, ad-hoc signed), and publishes
+matches `Cargo.toml`, runs the tests, builds a universal binary (`lipo` of
+the arm64 and x86_64 builds), signs it with the Developer ID (hardened
+runtime, secure timestamp), has Apple notarize it, and publishes
 `speakeasy-macos-universal.tar.gz` and its `.sha256` as a GitHub release
 with generated notes; a version with a `-` (`0.2.0-rc.1`) is a
 prerelease. The archive holds the binary in `bin/`, the installer scripts,
@@ -1022,3 +1020,41 @@ README, NOTICE, and `THIRD_PARTY_LICENSES.md`
 into the binary). Running the workflow by hand (Actions → Release → Run
 workflow) does the same build without publishing and keeps the archive as
 a workflow artifact.
+
+Signing needs repository secrets. A tag is never published without them;
+a manual run without them is only ad-hoc signed, with a warning. Set them
+once, in your own terminal (the values never appear in a command line):
+
+1. In Keychain Access, under **login → My Certificates**, export
+   **Developer ID Application: *your name* (*team ID*)** with its private
+   key as a `.p12`, with a password. (No such certificate? Create one at
+   developer.apple.com → Certificates → **+** → Developer ID Application.)
+2. Store it, then delete the file:
+
+   ```sh
+   base64 -i DeveloperID.p12 | gh secret set MACOS_SIGNING_CERTIFICATE_P12
+   gh secret set MACOS_SIGNING_CERTIFICATE_PASSWORD    # prompts for the export password
+   rm DeveloperID.p12
+   ```
+
+3. Give the workflow notarization credentials, either an App Store Connect
+   API key (App Store Connect → Users and Access → Integrations → Team
+   Keys; the Developer role is enough):
+
+   ```sh
+   gh secret set APPLE_API_KEY_P8 < AuthKey_KEYID.p8
+   gh secret set APPLE_API_KEY_ID        # the key ID
+   gh secret set APPLE_API_ISSUER_ID     # the issuer ID shown above the keys
+   ```
+
+   or your Apple ID with an app-specific password (account.apple.com →
+   Sign-In and Security → App-Specific Passwords):
+
+   ```sh
+   gh secret set APPLE_ID                    # your Apple ID email
+   gh secret set APPLE_APP_SPECIFIC_PASSWORD
+   ```
+
+A Developer ID certificate lasts five years; binaries signed before it
+expires stay valid (their signatures are timestamped), but new releases
+need a new one.
