@@ -318,9 +318,15 @@ impl KorotovskyClient {
         if let Err(e) = handshake(&mut session) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(SlackError(format!(
-                "Slack MCP server '{command}' handshake failed: {e}{}",
+            // a request that saw the server exit already carries its stderr
+            let e = e.to_string();
+            let suffix = if e.contains("server stderr:") {
+                String::new()
+            } else {
                 stderr_suffix(&session.stderr_tail)
+            };
+            return Err(SlackError(format!(
+                "Slack MCP server '{command}' handshake failed: {e}{suffix}"
             )));
         }
         Ok(Self {

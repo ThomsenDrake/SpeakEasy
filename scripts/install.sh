@@ -38,7 +38,7 @@
 # Usage:
 #   scripts/install.sh [--dry-run] [--enforce] [--uninstall] [--purge]
 #                      [--skip-build] [--slack-mcp-token xoxp-...]
-#                      [--transport slack-mcp|mistral-connector|korotovsky]
+#                      [--transport slack-mcp|mistral-connector|korotovsky|hooks-only]
 #                      [--mistral-api-key KEY] [--slack-bot-token xoxb-...]
 #                      [--slack-user-token xoxp-...] [--workspace-domain DOMAIN]
 #                      [--take-over FILE[:NAME]] [--no-take-over]
@@ -60,24 +60,33 @@
 #                 gateway; the pre-install files stay as <file>.bak-sag).
 #                 The official Slack MCP / Mistral connector servers are kept:
 #                 agents are expected to have them for reading Slack
-#                 context, and the instruction block + hook guard are the
-#                 boundary for their send tools.
-#   --uninstall   remove the MCP registrations, instruction blocks, the
-#                 LaunchAgent, and the installed binary (state dir kept)
+#                 context, and the approval hooks (5b) gate their send
+#                 tools. Skipped in the hooks-only setup, where the agents'
+#                 own servers are how they send.
+#   --uninstall   remove the MCP registrations, approval hooks, instruction
+#                 blocks, the LaunchAgent, and the installed binary (state
+#                 dir kept); exits 1 and lists what it could not remove
 #   --purge       with --uninstall: also delete the state dir (cooldowns,
 #                 sent records, token file)
 #   --skip-build  reuse the existing target/release binary
 #   --slack-mcp-token  Slack user OAuth token (xoxp-...) for the official
 #                 Slack MCP server. Stored only in
-#                 <state-dir>/slack_mcp_token (chmod 600). Without it a
-#                 placeholder is written and sends fail until you get a real
-#                 token:  scripts/slack_mcp_oauth.py --client-id ID
+#                 <state-dir>/slack_mcp_token (chmod 600). With --transport
+#                 slack-mcp and no token, a placeholder is written and
+#                 SpeakEasy cannot start until you get a real token (with no
+#                 credential at all and nothing to take over, the default is
+#                 hooks-only instead):  scripts/slack_mcp_oauth.py --client-id ID
 #                 --client-secret SECRET   (an existing token file is kept
 #                 unless this flag is given; $SLACK_MCP_TOKEN is only a
 #                 fallback)
-#   --transport   how the gateway sends to Slack (default: slack-mcp, or
-#                 hooks-only when SpeakEasy has no credential and nothing to
-#                 take over):
+#   --transport   how the gateway sends to Slack. Default: the transport of
+#                 the server taken over, or of the credential you pass
+#                 (--slack-mcp-token -> slack-mcp, --mistral-api-key ->
+#                 mistral-connector, --slack-bot-token / --slack-user-token ->
+#                 korotovsky; a flag switches an earlier choice), else the
+#                 saved choice; hooks-only when there is no credential and
+#                 nothing to take over; otherwise slack-mcp. The choice is
+#                 saved in <state-dir>/slack_transport:
 #                 hooks-only        SpeakEasy has no Slack connection of its
 #                                    own: agents send with their own Slack
 #                                    tools and the approval hooks (5b) ask you
@@ -94,11 +103,14 @@
 #                                    (slack-mcp-server,
 #                                    https://github.com/korotovsky/slack-mcp-server
 #                                    — you install it, or SpeakEasy reuses the
-#                                    command your agent runs (an npx line can
-#                                    download it); spawned as a stdio child
-#                                    process) with a Slack bot token
+#                                    command your agent runs (an npx or go run
+#                                    line can fetch it); spawned as a stdio
+#                                    child process) with a Slack bot token
 #                                    (xoxb-..., default) or user token
-#                                    (xoxp-...) — see the flags below.
+#                                    (xoxp-...) — see the flags below — or the
+#                                    login in <state-dir>/slack_stdio_env (taken
+#                                    over, or written by hand: e.g. a browser
+#                                    session's xoxc + xoxd).
 #   --mistral-api-key  Mistral API key, stored only in
 #                 <state-dir>/mistral_api_key (chmod 600). Falls back to
 #                 $MISTRAL_API_KEY. Required for the mistral-connector
@@ -111,10 +123,11 @@
 #                 passes it to the server it spawns; agents never see it.
 #   --slack-user-token  Slack user token (xoxp-...) for the korotovsky
 #                 transport, stored only in <state-dir>/slack_user_token
-#                 (chmod 600). Falls back to $SLACK_USER_TOKEN. Either this
-#                 or --slack-bot-token is required for the korotovsky
-#                 transport (a bot token is the usual choice: the server
-#                 posts as the app).
+#                 (chmod 600). Falls back to $SLACK_USER_TOKEN. The korotovsky
+#                 transport needs this or --slack-bot-token (a bot token is
+#                 the usual choice: the server posts as the app), unless
+#                 <state-dir>/slack_stdio_env holds a login (taken over, or
+#                 written by hand, e.g. a browser session).
 #   --workspace-domain  Slack workspace domain (e.g. acme for
 #                 acme.slack.com), stored in <state-dir>/slack_workspace_domain.
 #                 The korotovsky server's replies carry no permalink, so the
@@ -127,7 +140,9 @@
 #                 to <file>.pre-takeover
 #   --no-take-over  never take over an existing Slack MCP server
 #   --no-hooks    do not register the approval hooks (5b); existing ones are
-#                 removed
+#                 removed. SpeakEasy then needs a Slack login of its own: with
+#                 no credential, nothing to take over and no --transport, the
+#                 installer stops before changing anything
 #   --hook-wait SECS  how long the approval window waits before a hooked call
 #                 is blocked (default 600; 60–86400). Each agent's own hook
 #                 timeout is set 60 s longer, because an agent runs the tool
@@ -141,6 +156,11 @@ SERVER_NAME="slack-approval-gateway"
 HOME_DIR="${HOME:?no HOME}"
 DEFAULT_STATE_DIR="$HOME_DIR/.slack-approval-gateway"
 INSTALL_BIN="$HOME_DIR/.local/bin/$BIN_NAME"
+# Agents that move their config home with an environment variable: every
+# step (MCP registration, hooks, instructions, audit) uses the same place.
+CODEX_DIR="${CODEX_HOME:-$HOME_DIR/.codex}"
+VIBE_DIR="${VIBE_HOME:-$HOME_DIR/.vibe}"
+HERMES_DIR="${HERMES_HOME:-$HOME_DIR/.hermes}"
 PLIST_LABEL="com.speakeasy.slack-approval-gateway"
 PLIST_PATH="$HOME_DIR/Library/LaunchAgents/$PLIST_LABEL.plist"
 AGENT_CONFIG="$ROOT/scripts/agent_config.py"
@@ -217,6 +237,14 @@ fi
 case "$HOOK_WAIT" in
   ''|*[!0-9]*) echo "--hook-wait needs a number of seconds (60-86400)" >&2; exit 2 ;;
 esac
+case "$TRANSPORT_ARG" in
+  ''|slack-mcp|mistral-connector|korotovsky|hooks-only) ;;
+  *) echo "unknown --transport value: $TRANSPORT_ARG (expected slack-mcp, mistral-connector, korotovsky or hooks-only)" >&2; exit 2 ;;
+esac
+if [ "$TRANSPORT_ARG" = "hooks-only" ] && [ "$NO_HOOKS" = 1 ]; then
+  echo "--transport hooks-only needs the approval hooks; drop --no-hooks" >&2
+  exit 2
+fi
 if [ "$HOOK_WAIT" -lt 60 ] || [ "$HOOK_WAIT" -gt 86400 ]; then
   echo "--hook-wait needs a number of seconds (60-86400)" >&2
   exit 2
@@ -241,13 +269,14 @@ backup_once() { # back up a config file before the first modification
   if [ "$DRY_RUN" = 1 ]; then
     say "  [dry-run] backup $f -> $f.bak-sag"
   elif [ -f "$f" ] && [ ! -f "$f.bak-sag" ]; then
-    cp -p "$f" "$f.bak-sag"
+    # only the pre-install original (not a file holding SpeakEasy's content)
+    "$PY" "$AGENT_CONFIG" backup "$f" || true
   fi
 }
 
 # registered agents, as "name<TAB>config-file" rows, verified at the end
 REGISTERED_FILE="$(mktemp 2>/dev/null || echo /tmp/sag-install-registered.$$)"
-trap 'rm -f "$REGISTERED_FILE"' EXIT
+trap 'rm -f "$REGISTERED_FILE" "${OUTDATED_FILE:-}" "${REG_FAILED_FILE:-}"' EXIT
 note_registered() { # note_registered <name> <config-file>
   printf '%s\t%s\n' "$1" "$2" >> "$REGISTERED_FILE"
   say "  [ok]        $1 — $2"
@@ -257,6 +286,76 @@ note_registered_existing() {
   say "  [ok]        $1 (already registered) — $2"
 }
 note_skipped() { say "  [skip]      $1"; }
+ac_notes() { # ac_notes <output> — agent_config's messages other than its "<file>: <result>" line
+  printf '%s\n' "$1" | grep -Ev ': (added|created|updated|unchanged|registered|removed|absent)$|^$' | sed 's/^/  /' || true
+}
+try_ac() { # try_ac <agent> <file> <agent_config args...> — report a failure, don't abort
+  local agent="$1" file="$2" out; shift 2
+  if out="$(ac "$@" 2>&1)"; then
+    if [ "$DRY_RUN" = 1 ]; then printf '%s\n' "$out"; else ac_notes "$out"; fi
+    return 0
+  fi
+  printf '%s\n' "$out" | sed 's/^/  /'
+  printf '%s\t%s\n' "$agent" "$file" >> "$REG_FAILED_FILE"
+  say "  [failed]    $agent — $file was left unchanged; add SpeakEasy's entry by hand"
+  say "              (see the message above and README.md, \"Register an agent by hand\")"
+  return 1
+}
+
+long_timeout() { # long_timeout <agent> <file> — a request_slack_message call waits
+  # minutes for a human, longer than the agents' default tool timeouts
+  local out rc=0
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  [dry-run] agent_config set-timeout $2 $SERVER_NAME 86400"
+    return 0
+  fi
+  out="$("$PY" "$AGENT_CONFIG" set-timeout "$2" "$SERVER_NAME" 86400 2>&1)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    printf '%s\n' "$out" | sed 's/^/  /'
+    say "  [failed]    $1 tool timeout — give $SERVER_NAME a timeout of 86400s in $2 by hand"
+    return 0
+  fi
+  case "${out##*: }" in
+    added|updated) say "  [ok]        $1 tool timeout (86400s, ${out##*: }) — $2" ;;
+  esac
+}
+
+# agents whose existing entry could not be brought up to date, and agents
+# whose registration failed (Verify)
+OUTDATED_FILE="$(mktemp 2>/dev/null || echo /tmp/sag-install-outdated.$$)"
+REG_FAILED_FILE="$(mktemp 2>/dev/null || echo /tmp/sag-install-regfailed.$$)"
+reg_failed() { # reg_failed <agent> — its request_slack_message registration failed
+  [ -s "$REG_FAILED_FILE" ] && awk -F '\t' -v a="$1" '$1 == a { f = 1 } END { exit !f }' "$REG_FAILED_FILE"
+}
+upgrade_entry() { # upgrade_entry <agent> <style, or zed> <file> — fix an entry
+  # an older install wrote (OpenCode ignores one without "type", Zed one in
+  # the old nested form; without the tool-call timeout approvals are cut short)
+  local out rc=0
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  [dry-run] agent_config upgrade $2 $3"
+    return 0
+  fi
+  if [ "$2" = zed ]; then
+    out="$("$PY" "$AGENT_CONFIG" upgrade-zed "$3" "$INSTALL_BIN" 2>&1)" || rc=$?
+  else
+    out="$("$PY" "$AGENT_CONFIG" upgrade-json "$2" "$3" "$INSTALL_BIN" 2>&1)" || rc=$?
+  fi
+  if [ "$rc" != 0 ]; then
+    printf '%s\n' "$out" | sed 's/^/  /'
+    say "  [failed]    $1 entry is out of date — fix it by hand (see above)"
+    # a missing timeout only cuts long approvals short; anything else
+    # (OpenCode's "type", Zed's old form) keeps the entry from loading
+    if printf '%s\n' "$out" | grep -q 'by hand: {"timeout": [0-9]*}$'; then
+      printf '%s\t%s\n' "$1" "its tool-call timeout is short: long approvals fail" >> "$OUTDATED_FILE"
+    else
+      printf '%s\t%s\n' "$1" "its entry won't load as is" >> "$OUTDATED_FILE"
+    fi
+    return 0
+  fi
+  case "${out##*: }" in
+    updated*) say "  [ok]        $1 entry ${out##*: } — $3" ;;
+  esac
+}
 
 # SpeakEasy's approval hooks, as "agent<TAB>file" rows (agent_config.py
 # hook-add/hook-remove/hook-has). The Claude Code entry also covers pdev,
@@ -264,48 +363,71 @@ note_skipped() { say "  [skip]      $1"; }
 hook_targets() {
   printf '%s\t%s\n' \
     claude "$HOME_DIR/.claude/settings.json" \
-    codex "${CODEX_HOME:-$HOME_DIR/.codex}/config.toml" \
+    codex "$CODEX_DIR/config.toml" \
     gemini "$HOME_DIR/.gemini/settings.json" \
     copilot "$HOME_DIR/.copilot/hooks/speakeasy.json" \
     cursor "$HOME_DIR/.cursor/hooks.json" \
-    hermes "${HERMES_HOME:-$HOME_DIR/.hermes}/config.yaml" \
+    hermes "$HERMES_DIR/config.yaml" \
     amp "$HOME_DIR/.config/amp/plugins/speakeasy.ts" \
-    vibe "${VIBE_HOME:-$HOME_DIR/.vibe}/hooks.toml" \
+    vibe "$VIBE_DIR/hooks.toml" \
     goose "$HOME_DIR/.agents/plugins/speakeasy-slack-approval/hooks/hooks.json" \
     opencode "$HOME_DIR/.config/opencode/plugins/speakeasy-slack-approval.js" \
     pi "$HOME_DIR/.pi/agent/extensions/speakeasy-slack-gate.ts"
 }
+# what could not be removed (uninstall, --no-hooks): one line each
+LEFT_BEHIND=""
+LEFT_HOOK=0
+left_behind() { say "  [failed]    $1"; LEFT_BEHIND="$LEFT_BEHIND    - $1"$'\n'; }
 remove_all_hooks() {
   local agent file
   while IFS=$'\t' read -r agent file; do
-    ac hook-remove "$agent" "$file" || say "  [failed]    could not remove the $agent hook from $file (remove it by hand)"
+    if ! quiet_ac hook-remove "$agent" "$file"; then
+      left_behind "the $agent approval hook in $file (remove it by hand)"
+      LEFT_HOOK=1
+    fi
   done < <(hook_targets)
 }
 # Remove the request_slack_message registrations (uninstall, and the
 # hooks-only setup, where SpeakEasy cannot send).
+quiet_ac() { # agent_config, without the "absent" lines; "<file>: removed" as
+  # an aligned "[removed]" line, anything else (an error) indented
+  local out rc=0
+  out="$(ac "$@" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | grep -v -e ': absent$' -e '^$' \
+    | sed -E -e 's/^(.*): removed \(file was ours; deleted\)$/[removed]   \1 (file deleted: it held only SpeakEasy'"'"'s block)/' \
+             -e 's/^(.*): removed$/[removed]   \1/' -e 's/^/  /' || true
+  return $rc
+}
+remove_legacy_zed_rules() { # older installs wrote ~/.config/zed/rules/slack-gateway.md,
+  # which Zed never loads; instruction-remove also drops a .bak-sag of it
+  # that holds only SpeakEasy's block
+  local f="$HOME_DIR/.config/zed/rules/slack-gateway.md"
+  quiet_ac instruction-remove "$f" >/dev/null 2>&1 || true
+  run rm -f "$f"
+}
 unregister_mcp_everywhere() {
   run_ok claude mcp remove --scope user "$SERVER_NAME"
   run_ok codex mcp remove "$SERVER_NAME"
   run_ok vibe mcp remove "$SERVER_NAME"
-  ac remove-json claude "$HOME_DIR/.claude.json" || say "  [failed]    remove-json claude ~/.claude.json (edit it by hand)"
-  ac remove-json pi "$HOME_DIR/.paradev/agent/settings.json" || say "  [failed]    remove-json pi ~/.paradev/agent/settings.json (edit it by hand)"
-  ac remove-json pimcp "$HOME_DIR/.paradev/agent/mcp.json" || say "  [failed]    remove-json pimcp ~/.paradev/agent/mcp.json (edit it by hand)"
-  ac remove-json pimcp "$HOME_DIR/.pi/agent/mcp.json" || say "  [failed]    remove-json pimcp ~/.pi/agent/mcp.json (edit it by hand)"
-  ac remove-json opencode "$HOME_DIR/.config/opencode/opencode.json" || say "  [failed]    remove-json opencode ~/.config/opencode/opencode.json (edit it by hand)"
-  ac remove-json gemini "$HOME_DIR/.gemini/settings.json" || say "  [failed]    remove-json gemini ~/.gemini/settings.json (edit it by hand)"
-  ac remove-json copilot "$HOME_DIR/.copilot/mcp-config.json" || say "  [failed]    remove-json copilot ~/.copilot/mcp-config.json (edit it by hand)"
-  ac remove-json amp "$HOME_DIR/.config/amp/settings.json" || say "  [failed]    remove-json amp ~/.config/amp/settings.json (edit it by hand)"
-  ac remove-json pi "$HOME_DIR/.pi/agent/settings.json" || say "  [failed]    remove-json pi ~/.pi/agent/settings.json (edit it by hand)"
-  ac remove-zed "$HOME_DIR/.config/zed/settings.json" || say "  [failed]    remove-zed ~/.config/zed/settings.json (edit it by hand)"
-  ac remove-goose "$HOME_DIR/.config/goose/config.yaml" || say "  [failed]    remove-goose ~/.config/goose/config.yaml (edit it by hand)"
-  ac remove-hermes "$HOME_DIR/.hermes/config.yaml" || say "  [failed]    remove-hermes ~/.hermes/config.yaml (edit it by hand)"
-  ac remove-codex "$HOME_DIR/.codex/config.toml" || say "  [failed]    remove-codex ~/.codex/config.toml (edit it by hand)"
-  ac remove-vibe "$HOME_DIR/.vibe/config.toml" || say "  [failed]    remove-vibe ~/.vibe/config.toml (edit it by hand)"
+  quiet_ac remove-json claude "$HOME_DIR/.claude.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.claude.json (edit it by hand)"
+  quiet_ac remove-json pi "$HOME_DIR/.paradev/agent/settings.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.paradev/agent/settings.json (edit it by hand)"
+  quiet_ac remove-json pimcp "$HOME_DIR/.paradev/agent/mcp.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.paradev/agent/mcp.json (edit it by hand)"
+  quiet_ac remove-json pimcp "$HOME_DIR/.pi/agent/mcp.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.pi/agent/mcp.json (edit it by hand)"
+  quiet_ac remove-json opencode "$HOME_DIR/.config/opencode/opencode.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.config/opencode/opencode.json (edit it by hand)"
+  quiet_ac remove-json gemini "$HOME_DIR/.gemini/settings.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.gemini/settings.json (edit it by hand)"
+  quiet_ac remove-json copilot "$HOME_DIR/.copilot/mcp-config.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.copilot/mcp-config.json (edit it by hand)"
+  quiet_ac remove-json amp "$HOME_DIR/.config/amp/settings.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.config/amp/settings.json (edit it by hand)"
+  quiet_ac remove-json pi "$HOME_DIR/.pi/agent/settings.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.pi/agent/settings.json (edit it by hand)"
+  quiet_ac remove-zed "$HOME_DIR/.config/zed/settings.json" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.config/zed/settings.json (edit it by hand)"
+  quiet_ac remove-goose "$HOME_DIR/.config/goose/config.yaml" || left_behind "SpeakEasy's MCP entry in $HOME_DIR/.config/goose/config.yaml (edit it by hand)"
+  quiet_ac remove-hermes "$HERMES_DIR/config.yaml" || left_behind "SpeakEasy's MCP entry in $HERMES_DIR/config.yaml (edit it by hand)"
+  quiet_ac remove-codex "$CODEX_DIR/config.toml" || left_behind "SpeakEasy's MCP entry in $CODEX_DIR/config.toml (edit it by hand)"
+  quiet_ac remove-vibe "$VIBE_DIR/config.toml" || left_behind "SpeakEasy's MCP entry in $VIBE_DIR/config.toml (edit it by hand)"
 }
 
 # --------------------------------------------------------------------------- #
 hr
-say "SpeakEasy — install"
+if [ "$UNINSTALL" = 1 ]; then say "SpeakEasy — uninstall"; else say "SpeakEasy — install"; fi
 hr
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -332,29 +454,177 @@ if [ "$UNINSTALL" = 1 ]; then
   run rm -f "$PLIST_PATH"
   unregister_mcp_everywhere
   remove_all_hooks
-  for f in "$HOME_DIR/.claude/CLAUDE.md" "$HOME_DIR/.codex/AGENTS.md" \
-           "$HOME_DIR/.config/opencode/AGENTS.md" "$HOME_DIR/.vibe/AGENTS.md" \
+  for f in "$HOME_DIR/.claude/CLAUDE.md" "$CODEX_DIR/AGENTS.md" \
+           "$HOME_DIR/.config/opencode/AGENTS.md" "$VIBE_DIR/AGENTS.md" \
            "$HOME_DIR/.config/goose/.goosehints" "$HOME_DIR/.pi/agent/AGENTS.md" \
            "$HOME_DIR/.paradev/agent/AGENTS.md" "$HOME_DIR/.gemini/GEMINI.md" \
-           "$HOME_DIR/.copilot/copilot-instructions.md" "$HOME_DIR/.hermes/SOUL.md" \
-           "$HOME_DIR/.hermes/AGENTS.md" "$HOME_DIR/.config/zed/AGENTS.md"; do
-    ac instruction-remove "$f"
+           "$HOME_DIR/.copilot/copilot-instructions.md" "$HERMES_DIR/SOUL.md" \
+           "$HERMES_DIR/AGENTS.md" "$HOME_DIR/.config/zed/AGENTS.md"; do
+    quiet_ac instruction-remove "$f" || left_behind "SpeakEasy's instruction block in $f (remove it by hand)"
   done
-  run rm -f "$HOME_DIR/.config/zed/rules/slack-gateway.md"
+  remove_legacy_zed_rules
   run rm -f "$INSTALL_BIN"
   if [ "$PURGE" = 1 ]; then
     run rm -rf "$STATE_DIR"
   else
-    say "Kept state dir $STATE_DIR (cooldowns, sent records, token file)."
+    say "Kept state dir $STATE_DIR (cooldowns, sent records, any credential files)."
     say "Delete it manually with: rm -rf $STATE_DIR"
   fi
   say "Restart running agents: a session started before the uninstall keeps"
   say "its hooks, which now block Slack calls because SpeakEasy is gone."
+  if [ -n "$LEFT_BEHIND" ]; then
+    say ""
+    say "Uninstalled, except for these, which you need to remove by hand:"
+    printf '%s' "$LEFT_BEHIND"
+    if [ "$LEFT_HOOK" = 1 ]; then
+      say "A leftover approval hook blocks that agent's Slack calls until you"
+      say "remove it (it fails closed, and SpeakEasy is gone)."
+    fi
+    say "Everything else SpeakEasy added was removed; your own entries and"
+    say "settings stay."
+    exit 1
+  fi
   say "Uninstalled. SpeakEasy's own entries, approval hooks and instruction"
-  say "blocks were removed from your agent configs; your other changes to those files"
-  say "are untouched. The pre-install .bak-sag backups remain next to each"
-  say "config file for a manual full restore."
+  say "blocks were removed from your agent configs; your own entries and settings"
+  say "stay (JSON files are rewritten with standard formatting). Any .bak-sag"
+  say "files next to them are backups taken before SpeakEasy first changed"
+  say "them, for a manual restore."
   exit 0
+fi
+
+# --------------------------------------------------------------------------- #
+# credentials and take-over candidates (read-only; used from step 3 on)
+# --------------------------------------------------------------------------- #
+# Configs a Slack MCP server can be taken over from (step 3).
+TAKEOVER_FILES=(
+  "$HOME_DIR/.claude.json"
+  "$CODEX_DIR/config.toml"
+  "$HOME_DIR/.config/opencode/opencode.json"
+  "$VIBE_DIR/config.toml"
+  "$HOME_DIR/.config/goose/config.yaml"
+  "$HOME_DIR/.pi/agent/settings.json"
+  "$HOME_DIR/.pi/agent/mcp.json"
+  "$HOME_DIR/.paradev/agent/settings.json"
+  "$HOME_DIR/.paradev/agent/mcp.json"
+  "$HOME_DIR/.gemini/settings.json"
+  "$HOME_DIR/.copilot/mcp-config.json"
+  "$HOME_DIR/.config/zed/settings.json"
+  "$HOME_DIR/.config/amp/settings.json"
+  "$HERMES_DIR/config.yaml"
+  "$HOME_DIR/Library/Application Support/Claude/claude_desktop_config.json"
+  "$HOME_DIR/.cursor/mcp.json"
+  "$HOME_DIR/.claude/plugins/installed_plugins.json"
+)
+stdio_env_credential() { # slack_stdio_env holds a login the server accepts
+  local f="$STATE_DIR/slack_stdio_env"
+  [ -s "$f" ] || return 1
+  grep -Eq '^[[:space:]]*SLACK_MCP_XOX[PB]_TOKEN[[:space:]]*=[[:space:]]*[^[:space:]]' "$f" && return 0
+  grep -Eq '^[[:space:]]*SLACK_MCP_XOXC_TOKEN[[:space:]]*=[[:space:]]*[^[:space:]]' "$f" \
+    && grep -Eq '^[[:space:]]*SLACK_MCP_XOXD_TOKEN[[:space:]]*=[[:space:]]*[^[:space:]]' "$f"
+}
+flag_transport() { # the transport a credential flag given on this run implies
+  if [ -n "$MCP_TOKEN_ARG" ]; then echo slack-mcp
+  elif [ -n "$MISTRAL_KEY_ARG" ]; then echo mistral-connector
+  elif [ -n "$BOT_TOKEN_ARG$USER_TOKEN_ARG" ]; then echo korotovsky
+  fi
+}
+credential_transport() { # the transport of a credential given on this run (a
+  # flag outranks an ambient $SLACK_MCP_TOKEN), or stored after slack_transport
+  # was written (scripts/slack_mcp_oauth.py writes slack_mcp_token) — an older
+  # stored credential does not override an explicit hooks-only choice
+  local f first
+  f="$(flag_transport)"
+  if [ -n "$f" ]; then echo "$f"; return; fi
+  if [ -n "${SLACK_MCP_TOKEN:-}" ]; then echo slack-mcp; return; fi
+  for f in slack_mcp_token:slack-mcp mistral_api_key:mistral-connector \
+           slack_bot_token:korotovsky slack_user_token:korotovsky slack_stdio_env:korotovsky; do
+    [ -s "$STATE_DIR/${f%%:*}" ] || continue
+    [ "$STATE_DIR/${f%%:*}" -nt "$STATE_DIR/slack_transport" ] || continue
+    if [ "${f%%:*}" = slack_stdio_env ]; then
+      stdio_env_credential && { echo korotovsky; return; }
+      continue
+    fi
+    first="$(head -n 1 "$STATE_DIR/${f%%:*}")"
+    case "$first" in
+      xoxb-placeholder-*|xoxp-placeholder-*|mistral-placeholder-*) ;;
+      *) echo "${f#*:}"; return ;;
+    esac
+  done
+}
+placeholder() { # placeholder <file>: it holds the placeholder the installer writes
+  case "$(head -n 1 "$1" 2>/dev/null || true)" in
+    xoxb-placeholder-*|xoxp-placeholder-*|mistral-placeholder-*) return 0 ;;
+  esac
+  return 1
+}
+stored_credential() { # a real (non-placeholder) credential is already stored
+  local f first
+  stdio_env_credential && return 0
+  for f in slack_mcp_token mistral_api_key slack_bot_token slack_user_token; do
+    [ -s "$STATE_DIR/$f" ] || continue
+    first="$(head -n 1 "$STATE_DIR/$f")"
+    case "$first" in
+      xoxb-placeholder-*|xoxp-placeholder-*|mistral-placeholder-*) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+# With no credential anywhere (no flag, no stored file, nothing taken over)
+# the default is hooks-only: agents keep their own Slack tools and the hooks
+# ask first. A credential flag or $SLACK_MCP_TOKEN keeps the old default.
+CREDENTIAL_INPUT=0
+if [ -n "$MCP_TOKEN_ARG$MISTRAL_KEY_ARG$BOT_TOKEN_ARG$USER_TOKEN_ARG" ] \
+   || [ -n "${SLACK_MCP_TOKEN:-}" ]; then
+  CREDENTIAL_INPUT=1
+fi
+takeover_count() { # distinct Slack MCP servers an automatic take-over could pick
+  local files=() f
+  for f in "${TAKEOVER_FILES[@]}"; do [ -f "$f" ] && files+=("$f"); done
+  if [ "${#files[@]}" = 0 ]; then echo 0; return; fi
+  "$PY" "$AGENT_CONFIG" takeover-candidates "${files[@]}" 2>/dev/null | "$PY" -c 'import json, sys
+c = [x for x in json.load(sys.stdin) if x.get("importable")]
+print(len({x.get("fingerprint") or str(i) for i, x in enumerate(c)}))' 2>/dev/null || echo 0
+}
+# --no-hooks leaves SpeakEasy only a Slack login of its own. Refuse before
+# changing anything when it will have none: no credential given, none stored
+# (or a stored one a hooks-only setup doesn't use), and no single server it
+# would take over.
+if [ "$NO_HOOKS" = 1 ] && [ -z "$TRANSPORT_ARG" ] && [ -z "$TAKE_OVER_ARG" ]; then
+  SAVED_TRANSPORT="$(cat "$STATE_DIR/slack_transport" 2>/dev/null || true)"
+  WILL_TAKE_OVER=0
+  if [ "$NO_TAKE_OVER" = 0 ] && [ -z "$MCP_TOKEN_ARG$MISTRAL_KEY_ARG$BOT_TOKEN_ARG$USER_TOKEN_ARG" ] \
+     && ! stored_credential && [ "$(takeover_count)" = 1 ]; then
+    WILL_TAKE_OVER=1
+  fi
+  REFUSE=""
+  if [ "$WILL_TAKE_OVER" = 0 ]; then
+    if [ "$SAVED_TRANSPORT" = hooks-only ] && [ -z "$(credential_transport)" ]; then
+      REFUSE=hooks-only
+    elif [ "$SAVED_TRANSPORT" != hooks-only ] && [ "$CREDENTIAL_INPUT" = 0 ] && ! stored_credential; then
+      REFUSE=none
+    fi
+  fi
+  if [ -n "$REFUSE" ]; then
+    if [ "$REFUSE" = hooks-only ]; then
+      say "SpeakEasy is set up hooks-only ($STATE_DIR/slack_transport): with" >&2
+      say "--no-hooks it could neither send nor ask about your agents' sends." >&2
+      if stored_credential; then
+        say "A credential is stored in $STATE_DIR but this setup doesn't use it:" >&2
+        say "add --transport slack-mcp, mistral-connector or korotovsky (matching it)." >&2
+      fi
+    else
+      say "With --no-hooks SpeakEasy needs a Slack login of its own (it could neither" >&2
+      say "send nor ask about your agents' sends), and it has none." >&2
+    fi
+    if [ "$NO_TAKE_OVER" = 0 ] && [ "$(takeover_count)" -gt 1 ]; then
+      say "Several Slack MCP servers could be taken over; pick one with" >&2
+      say "--take-over FILE:NAME (run without --no-hooks to see them listed)." >&2
+    fi
+    say "Give it a credential (or --transport / --take-over), or drop --no-hooks." >&2
+    say "Nothing was changed." >&2
+    exit 2
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -413,61 +683,6 @@ if [ "$DRY_RUN" = 0 ]; then chmod 700 "$STATE_DIR"; fi
 # token. Automatic when nothing is stored yet, no credential flag is given,
 # and exactly one server can be taken over; --take-over picks one
 # explicitly; --no-take-over skips this.
-TAKEOVER_FILES=(
-  "$HOME_DIR/.claude.json"
-  "$HOME_DIR/.codex/config.toml"
-  "$HOME_DIR/.config/opencode/opencode.json"
-  "$HOME_DIR/.vibe/config.toml"
-  "$HOME_DIR/.config/goose/config.yaml"
-  "$HOME_DIR/.pi/agent/settings.json"
-  "$HOME_DIR/.pi/agent/mcp.json"
-  "$HOME_DIR/.paradev/agent/settings.json"
-  "$HOME_DIR/.paradev/agent/mcp.json"
-  "$HOME_DIR/.gemini/settings.json"
-  "$HOME_DIR/.copilot/mcp-config.json"
-  "$HOME_DIR/.config/zed/settings.json"
-  "$HOME_DIR/.config/amp/settings.json"
-  "$HOME_DIR/.hermes/config.yaml"
-  "$HOME_DIR/Library/Application Support/Claude/claude_desktop_config.json"
-  "$HOME_DIR/.cursor/mcp.json"
-  "$HOME_DIR/.claude/plugins/installed_plugins.json"
-)
-stdio_env_credential() { # slack_stdio_env holds a login the server accepts
-  local f="$STATE_DIR/slack_stdio_env"
-  [ -s "$f" ] || return 1
-  grep -Eq '^[[:space:]]*SLACK_MCP_XOX[PB]_TOKEN[[:space:]]*=[[:space:]]*[^[:space:]]' "$f" && return 0
-  grep -Eq '^[[:space:]]*SLACK_MCP_XOXC_TOKEN[[:space:]]*=[[:space:]]*[^[:space:]]' "$f" \
-    && grep -Eq '^[[:space:]]*SLACK_MCP_XOXD_TOKEN[[:space:]]*=[[:space:]]*[^[:space:]]' "$f"
-}
-credential_transport() { # the transport a given or stored credential is for
-  if [ -n "$MCP_TOKEN_ARG" ] || [ -n "${SLACK_MCP_TOKEN:-}" ]; then echo slack-mcp; return; fi
-  if [ -n "$MISTRAL_KEY_ARG" ]; then echo mistral-connector; return; fi
-  if [ -n "$BOT_TOKEN_ARG$USER_TOKEN_ARG" ]; then echo korotovsky; return; fi
-  local f first
-  for f in slack_mcp_token:slack-mcp mistral_api_key:mistral-connector \
-           slack_bot_token:korotovsky slack_user_token:korotovsky; do
-    [ -s "$STATE_DIR/${f%%:*}" ] || continue
-    first="$(head -n 1 "$STATE_DIR/${f%%:*}")"
-    case "$first" in
-      xoxb-placeholder-*|xoxp-placeholder-*|mistral-placeholder-*) ;;
-      *) echo "${f#*:}"; return ;;
-    esac
-  done
-  if stdio_env_credential; then echo korotovsky; fi
-}
-stored_credential() { # a real (non-placeholder) credential is already stored
-  local f first
-  stdio_env_credential && return 0
-  for f in slack_mcp_token mistral_api_key slack_bot_token slack_user_token; do
-    [ -s "$STATE_DIR/$f" ] || continue
-    first="$(head -n 1 "$STATE_DIR/$f")"
-    case "$first" in
-      xoxb-placeholder-*|xoxp-placeholder-*|mistral-placeholder-*) ;;
-      *) return 0 ;;
-    esac
-  done
-  return 1
-}
 TAKEOVER_TRANSPORT=""
 TAKEOVER_HEAD=""
 TAKEOVER_PICK=""
@@ -538,7 +753,8 @@ if want:
         else:
             take(c)
     elif not usable and match:
-        print("error\t--take-over %s: %s" % (want, match[0]["reason"]))
+        print("error\t--take-over %s: %s" % (want, "; ".join(
+            "server %s: %s" % (c["name"], c["reason"]) for c in match)))
     elif not usable:
         print("error\t--take-over %s: no Slack MCP server there" % want)
     else:
@@ -551,16 +767,19 @@ if auto and len(usable) == 1:
 elif auto and len(usable) > 1:
     print("many")
     for c in usable:
-        print("    scripts/install.sh --take-over '%s:%s'   # %s" % (short(c["file"]), c["name"], c["summary"]))
+        # nothing after the command: a trailing "# comment" breaks pasting
+        # into zsh, where interactive comments are off by default
+        print("    %s (server %s) in %s:" % (c["summary"], c["name"], short(c["file"])))
+        print("      scripts/install.sh --take-over '%s:%s'" % (short(c["file"]), c["name"]))
 else:
     print("none")
     if auto:
         for c in cands:
             if not c["importable"]:
-                print("    %s in %s: %s" % (c["summary"], short(c["file"]), c["reason"]))
+                print("    %s (server %s) in %s: %s" % (c["summary"], c["name"], short(c["file"]), c["reason"]))
 EOF
 )"
-  TAKEOVER_HEAD="$(printf '%s\n' "$TAKEOVER_PICK" | head -n 1)"
+  TAKEOVER_HEAD="${TAKEOVER_PICK%%$'\n'*}"
   case "$TAKEOVER_HEAD" in
     take*)
       IFS=$'\t' read -r _ TAKEOVER_FILE TAKEOVER_NAME TAKEOVER_TRANSPORT TAKEOVER_SUMMARY <<< "$TAKEOVER_HEAD"
@@ -594,20 +813,15 @@ EOF
     many)
       say "  Found several Slack MCP servers SpeakEasy could take over; pick one:"
       printf '%s\n' "$TAKEOVER_PICK" | tail -n +2
-      if [ "$ENFORCE" = 1 ]; then
-        # --enforce would remove these from the agents' configs, and the
-        # commands above would then have nothing left to take over.
-        say "  Pick one with --take-over before using --enforce." >&2
-        exit 2
-      fi
       ;;
     none)
       if [ "$(printf '%s\n' "$TAKEOVER_PICK" | wc -l)" -gt 1 ]; then
         say "  Found Slack MCP servers SpeakEasy cannot take over:"
         printf '%s\n' "$TAKEOVER_PICK" | tail -n +2
-        say "  The agents keep using them: SpeakEasy's approval hooks (step 5b) make"
-        say "  each Slack write wait for you. To also give SpeakEasy a login of its"
-        say "  own, see README.md, \"If there's nothing to take over\"."
+        say "  The agents keep using them. In agents with hooks, SpeakEasy's approval"
+        say "  hooks (step 5b) make each Slack write wait for you (Claude Desktop and"
+        say "  Zed have none; see step 7). To also give SpeakEasy a login of its own,"
+        say "  see README.md, \"If there's nothing to take over\"."
       fi
       ;;
   esac
@@ -623,14 +837,6 @@ esac
 if [ "$TRANSPORT_ARG" = "hooks-only" ] && [ "$NO_HOOKS" = 1 ]; then
   say "--transport hooks-only needs the approval hooks; drop --no-hooks" >&2
   exit 2
-fi
-# With no credential anywhere (no flag, no stored file, nothing taken over)
-# the default is hooks-only: agents keep their own Slack tools and the hooks
-# ask first. A credential flag or $SLACK_MCP_TOKEN keeps the old default.
-CREDENTIAL_INPUT=0
-if [ -n "$MCP_TOKEN_ARG$MISTRAL_KEY_ARG$BOT_TOKEN_ARG$USER_TOKEN_ARG" ] \
-   || [ -n "${SLACK_MCP_TOKEN:-}" ]; then
-  CREDENTIAL_INPUT=1
 fi
 TRANSPORT_FILE="$STATE_DIR/slack_transport"
 if [ -n "$TAKEOVER_TRANSPORT" ]; then
@@ -661,7 +867,7 @@ elif [ -f "$TRANSPORT_FILE" ]; then
         else
           say "  [dry-run] write $TRANSPORT_FILE ($TRANSPORT)"
         fi
-        say "  transport: $TRANSPORT (was hooks-only; SpeakEasy now has a $TRANSPORT"
+        say "  transport: $TRANSPORT (was hooks-only; you gave SpeakEasy a $TRANSPORT"
         say "  credential, so request_slack_message is registered again)"
       else
         TRANSPORT="hooks-only"
@@ -669,8 +875,19 @@ elif [ -f "$TRANSPORT_FILE" ]; then
       fi
       ;;
     slack-mcp|mistral-connector|korotovsky)
-      TRANSPORT="$EXISTING_TRANSPORT"
-      say "  keeping existing transport selection in $TRANSPORT_FILE ($EXISTING_TRANSPORT)"
+      FLAG_TRANSPORT="$(flag_transport)"
+      if [ -n "$FLAG_TRANSPORT" ] && [ "$FLAG_TRANSPORT" != "$EXISTING_TRANSPORT" ]; then
+        TRANSPORT="$FLAG_TRANSPORT"
+        if [ "$DRY_RUN" = 0 ]; then
+          printf '%s\n' "$TRANSPORT" > "$TRANSPORT_FILE"
+        else
+          say "  [dry-run] write $TRANSPORT_FILE ($TRANSPORT)"
+        fi
+        say "  transport: $TRANSPORT (was $EXISTING_TRANSPORT; you gave a $TRANSPORT credential)"
+      else
+        TRANSPORT="$EXISTING_TRANSPORT"
+        say "  keeping existing transport selection in $TRANSPORT_FILE ($EXISTING_TRANSPORT)"
+      fi
       ;;
     *)
       # The old bot-token transport ("direct") was removed: the gateway no
@@ -692,11 +909,30 @@ elif [ "$CREDENTIAL_INPUT" = 0 ] && [ "$NO_HOOKS" = 0 ] && ! stored_credential; 
   else
     say "  [dry-run] write $TRANSPORT_FILE ($TRANSPORT)"
   fi
-  say "  transport: hooks-only (SpeakEasy has no Slack login and found none it"
-  say "  could take over; your agents keep sending with their own Slack tools"
-  say "  and the approval hooks ask you first — see step 5b)"
+  if [ "${TAKEOVER_HEAD:-}" = "many" ]; then
+    say "  transport: hooks-only for now (SpeakEasy found several Slack MCP servers"
+    say "  it could take over — pick one with a --take-over command above; until"
+    say "  then your agents keep sending with their own Slack tools, and in agents"
+    say "  with hooks the approval hooks ask you first — see steps 5b and 7)"
+  else
+    say "  transport: hooks-only (SpeakEasy has no Slack login and found none it"
+    say "  could take over; your agents keep sending with their own Slack tools,"
+    say "  and in agents with hooks the approval hooks ask you first — see steps"
+    say "  5b and 7)"
+  fi
 else
-  say "  transport: slack-mcp (default; SLACK_TRANSPORT or $TRANSPORT_FILE can change it)"
+  CRED_TRANSPORT="$(credential_transport)"
+  TRANSPORT="${CRED_TRANSPORT:-slack-mcp}"
+  if [ "$DRY_RUN" = 0 ]; then
+    printf '%s\n' "$TRANSPORT" > "$TRANSPORT_FILE"
+  else
+    say "  [dry-run] write $TRANSPORT_FILE ($TRANSPORT)"
+  fi
+  if [ -n "$CRED_TRANSPORT" ]; then
+    say "  transport: $TRANSPORT (from your credential; written to $TRANSPORT_FILE)"
+  else
+    say "  transport: slack-mcp (default; written to $TRANSPORT_FILE)"
+  fi
 fi
 if [ "$TRANSPORT" = "hooks-only" ] && [ "$NO_HOOKS" = 1 ]; then
   say "SpeakEasy is set up hooks-only ($TRANSPORT_FILE): with --no-hooks it could" >&2
@@ -728,7 +964,7 @@ if [ "$TAKEOVER_TRANSPORT" = "mistral-connector" ]; then
 elif [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
   if [ -n "$MISTRAL_KEY_ARG" ]; then
     MISTRAL_KEY="$MISTRAL_KEY_ARG"
-  elif [ ! -f "$MISTRAL_KEY_FILE" ]; then
+  elif [ ! -f "$MISTRAL_KEY_FILE" ] || placeholder "$MISTRAL_KEY_FILE"; then
     MISTRAL_KEY="${MISTRAL_API_KEY:-}"
   else
     MISTRAL_KEY=""
@@ -743,6 +979,7 @@ elif [ "$TRANSPORT" = "mistral-connector" ] || [ -n "$MISTRAL_KEY_ARG" ]; then
       say "  [dry-run] write $MISTRAL_KEY_FILE (chmod 600)"
     fi
     say "  wrote $MISTRAL_KEY_FILE (chmod 600) — the only place the Mistral API key lives"
+    if [ -z "$MISTRAL_KEY_ARG" ]; then say "  (the key came from \$MISTRAL_API_KEY in your environment)"; fi
     say "  (Slack credentials stay in the Mistral console; connect the Slack"
     say "   workspace to the Slack connector there before sending)"
   elif [ -f "$MISTRAL_KEY_FILE" ]; then
@@ -775,7 +1012,7 @@ if [ "$TAKEOVER_TRANSPORT" = "slack-mcp" ]; then
 elif [ "$TRANSPORT" = "slack-mcp" ]; then
   if [ -n "$MCP_TOKEN_ARG" ]; then
     MCP_TOKEN="$MCP_TOKEN_ARG"
-  elif [ ! -f "$MCP_TOKEN_FILE" ]; then
+  elif [ ! -f "$MCP_TOKEN_FILE" ] || placeholder "$MCP_TOKEN_FILE"; then
     MCP_TOKEN="${SLACK_MCP_TOKEN:-}"
   else
     MCP_TOKEN=""
@@ -790,6 +1027,7 @@ elif [ "$TRANSPORT" = "slack-mcp" ]; then
       say "  [dry-run] write $MCP_TOKEN_FILE (chmod 600)"
     fi
     say "  wrote $MCP_TOKEN_FILE (chmod 600) — the only place the Slack user token lives"
+    if [ -z "$MCP_TOKEN_ARG" ]; then say "  (the token came from \$SLACK_MCP_TOKEN in your environment)"; fi
     say "  (the gateway presents it to the Slack MCP server; it is a user token,"
     say "   not a bot token, and agents never see it)"
   elif [ -f "$MCP_TOKEN_FILE" ]; then
@@ -841,14 +1079,14 @@ if [ "$TRANSPORT" = "korotovsky" ]; then
   if [ -n "$TAKEOVER_TRANSPORT" ] || stdio_env_credential; then STDIO_LOGIN=1; fi
   if [ -n "$BOT_TOKEN_ARG" ]; then
     BOT_TOKEN="$BOT_TOKEN_ARG"
-  elif [ ! -f "$BOT_TOKEN_FILE" ] && [ "$STDIO_LOGIN" = 0 ]; then
+  elif { [ ! -f "$BOT_TOKEN_FILE" ] || placeholder "$BOT_TOKEN_FILE"; } && [ "$STDIO_LOGIN" = 0 ]; then
     BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
   else
     BOT_TOKEN=""
   fi
   if [ -n "$USER_TOKEN_ARG" ]; then
     USER_TOKEN="$USER_TOKEN_ARG"
-  elif [ ! -f "$USER_TOKEN_FILE" ] && [ "$STDIO_LOGIN" = 0 ]; then
+  elif { [ ! -f "$USER_TOKEN_FILE" ] || placeholder "$USER_TOKEN_FILE"; } && [ "$STDIO_LOGIN" = 0 ]; then
     USER_TOKEN="${SLACK_USER_TOKEN:-}"
   else
     USER_TOKEN=""
@@ -862,7 +1100,9 @@ if [ "$TRANSPORT" = "korotovsky" ]; then
       say "  [dry-run] write $BOT_TOKEN_FILE (chmod 600)"
     fi
     say "  wrote $BOT_TOKEN_FILE (chmod 600) — the only place the Slack bot token lives"
-  elif [ -f "$BOT_TOKEN_FILE" ]; then
+    if [ -z "$BOT_TOKEN_ARG" ]; then say "  (the token came from \$SLACK_BOT_TOKEN in your environment)"; fi
+  elif [ -f "$BOT_TOKEN_FILE" ] \
+       && ! { [ "$STDIO_LOGIN" = 1 ] && grep -q '^xoxb-placeholder-' "$BOT_TOKEN_FILE"; }; then
     say "  keeping existing $BOT_TOKEN_FILE (pass --slack-bot-token to replace it)"
   fi
   if [ -n "$USER_TOKEN" ]; then
@@ -874,7 +1114,9 @@ if [ "$TRANSPORT" = "korotovsky" ]; then
       say "  [dry-run] write $USER_TOKEN_FILE (chmod 600)"
     fi
     say "  wrote $USER_TOKEN_FILE (chmod 600) — the only place the Slack user token lives"
-  elif [ -f "$USER_TOKEN_FILE" ]; then
+    if [ -z "$USER_TOKEN_ARG" ]; then say "  (the token came from \$SLACK_USER_TOKEN in your environment)"; fi
+  elif [ -f "$USER_TOKEN_FILE" ] \
+       && ! { [ "$STDIO_LOGIN" = 1 ] && grep -q '^xoxp-placeholder-' "$USER_TOKEN_FILE"; }; then
     say "  keeping existing $USER_TOKEN_FILE (pass --slack-user-token to replace it)"
   fi
   if [ -n "$TAKEOVER_TRANSPORT" ] || stdio_env_credential; then
@@ -992,18 +1234,83 @@ sleep 1
 run_ok launchctl bootout "gui/$(id -u)/$PLIST_LABEL"
 run launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" || run_ok true
 run_ok launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL"
+socket_answers() { # the instance answers MCP on its socket. A bare connect
+  # is not enough: the socket is bound before the Slack client is built (a
+  # taken-over server's handshake can still fail and stop SpeakEasy)
+  [ -S "$STATE_DIR/gateway.sock" ] && "$PY" -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(3)
+s.connect(sys.argv[1])
+s.sendall(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"install-check\",\"version\":\"0\"}}}\n")
+reply = b""
+while not reply.endswith(b"\n"):
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    reply += chunk
+sys.exit(0 if b"slack-approval-gateway" in reply else 1)' "$STATE_DIR/gateway.sock" 2>/dev/null
+}
 if [ "$DRY_RUN" = 0 ]; then
-  for _ in $(seq 1 50); do
-    if [ -S "$STATE_DIR/gateway.sock" ]; then break; fi
-    sleep 0.2
+  for _ in $(seq 1 30); do
+    if socket_answers; then break; fi
+    sleep 1
   done
 fi
-if [ -S "$STATE_DIR/gateway.sock" ]; then
-  PID="$(launchctl print "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null | sed -n 's/.*pid = \([0-9]*\).*/\1/p' | head -1)"
+SERVICE_UP=1
+if [ "$DRY_RUN" = 0 ] && socket_answers; then
+  # (|| true: under pipefail a service launchd doesn't know would end the run)
+  PID="$(launchctl print "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null | sed -n 's/.*pid = \([0-9]*\).*/\1/p' | head -1 || true)"
   say "  service running (pid ${PID:-?}); MCP socket: $STATE_DIR/gateway.sock"
+elif [ "$DRY_RUN" = 1 ]; then
+  say "  [dry-run] (the service would start now)"
 else
-  say "  WARNING: service socket not up yet; check:"
+  SERVICE_UP=0
+  say "  WARNING: SpeakEasy is not running (it may have stopped at startup); check:"
   say "    launchctl print gui/$(id -u)/$PLIST_LABEL   and   $STATE_DIR/gateway.log"
+  if [ -f "$STATE_DIR/gateway.log" ]; then
+    # SpeakEasy's last error and what follows it (e.g. the Slack server's
+    # stderr, whose own lines may say "error" too); without one, the last
+    # lines that mention an error, or the last lines
+    awk '{ l[NR] = $0 } /^slack-approval-gateway: / { n = NR } /[Ee]rror/ { e = NR }
+         END { s = n ? n : e ? e : (NR > 3 ? NR - 2 : 1); for (i = s; i <= NR && i < s + 8; i++) print l[i] }' \
+      "$STATE_DIR/gateway.log" | sed 's/^/      | /'
+  fi
+  if [ "$NO_HOOKS" = 0 ]; then
+    say "  Until it runs, the approval hooks block your agents' own Slack writes"
+    say "  (nothing is sent without your approval)."
+  fi
+  case "$TRANSPORT" in
+    hooks-only)
+      say "  SpeakEasy needs no credential in this setup; once the log is clear,"
+      say "  start it: launchctl kickstart -k gui/$(id -u)/$PLIST_LABEL" ;;
+    korotovsky)
+      say "  SpeakEasy starts the Slack MCP server (the command in"
+      say "  $STATE_DIR/slack_stdio_command, or slack-mcp-server"
+      say "  on your PATH) and stops when it fails; the log lines above say why."
+      say "  Check that the server is installed and runs, and that its login"
+      say "  works: a token (--slack-bot-token / --slack-user-token), or the one in"
+      say "  $STATE_DIR/slack_stdio_env (a browser-session login expires;"
+      say "  if you took it over, sign in again there and re-run --take-over)." ;;
+    mistral-connector)
+      say "  The Mistral connector transport needs a valid Mistral API key"
+      say "  (scripts/install.sh --mistral-api-key …) and your Slack workspace"
+      say "  connected to the Slack connector in the Mistral console." ;;
+    *)
+      if [ -s "$STATE_DIR/slack_mcp_token" ] \
+         && ! grep -q '^xoxp-placeholder-' "$STATE_DIR/slack_mcp_token"; then
+        say "  SpeakEasy has a Slack user token ($STATE_DIR/slack_mcp_token);"
+        say "  the log lines above say why it failed (a revoked or expired token,"
+        say "  or no network). If you took it over from an agent, sign in again"
+        say "  there and re-run with --take-over FILE:NAME; or get a new token with"
+        say "  scripts/slack_mcp_oauth.py or --slack-mcp-token xoxp-…"
+      else
+        say "  The Slack MCP transport needs a Slack user token: run"
+        say "  scripts/slack_mcp_oauth.py, or scripts/install.sh --slack-mcp-token xoxp-…"
+      fi ;;
+  esac
+  if [ "$TRANSPORT" != "hooks-only" ] && [ "$NO_HOOKS" = 0 ]; then
+    say "  Or run the installer with --transport hooks-only (no Slack login needed)."
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -1023,20 +1330,25 @@ else
 # --- Claude Code (user scope so every project gets it)
 if command -v claude >/dev/null 2>&1; then
   CFG="$HOME_DIR/.claude.json"
+  CLAUDE_ENTRY="$("$PY" -c 'import json, sys; sys.path.insert(0, sys.argv[2]); import agent_config as a
+print(json.dumps(a.JSON_STYLES["claude"][1](sys.argv[1])))' "$INSTALL_BIN" "$ROOT/scripts")"
   if has "$CFG"; then
     note_registered_existing claude "$CFG"
   else
     backup_once "$CFG"
     if [ "$DRY_RUN" = 0 ]; then
-      if ! claude mcp add --scope user --transport stdio "$SERVER_NAME" -- "$INSTALL_BIN" >/dev/null 2>&1; then
-        say "  (claude mcp add failed; editing .claude.json directly)"
-        "$PY" "$AGENT_CONFIG" add-json claude "$CFG" "$INSTALL_BIN"
+      # add-json: `claude mcp add` cannot set the tool-call timeout
+      if ! claude mcp add-json --scope user "$SERVER_NAME" "$CLAUDE_ENTRY" >/dev/null 2>&1; then
+        say "  (claude mcp add-json failed; editing .claude.json directly)"
+        try_ac claude "$CFG" add-json claude "$CFG" "$INSTALL_BIN" || REG_FAILED=1
       fi
     else
-      say "  [dry-run] claude mcp add --scope user --transport stdio $SERVER_NAME -- $INSTALL_BIN"
+      say "  [dry-run] claude mcp add-json --scope user $SERVER_NAME '$CLAUDE_ENTRY'"
     fi
-    note_registered claude "$CFG"
+    [ "${REG_FAILED:-0}" = 1 ] || note_registered claude "$CFG"
+    REG_FAILED=0
   fi
+  if has "$CFG"; then upgrade_entry claude claude "$CFG"; fi
 else
   note_skipped "claude (not installed)"
 fi
@@ -1049,16 +1361,18 @@ if command -v pdev >/dev/null 2>&1 || [ -d "$HOME_DIR/.paradev" ]; then
   if has "$CFG"; then
     note_registered_existing pdev "$CFG"
   else
-    ac add-json pimcp "$CFG" "$INSTALL_BIN"
-    note_registered pdev "$CFG"
+    if try_ac pdev "$CFG" add-json pimcp "$CFG" "$INSTALL_BIN"; then
+      note_registered pdev "$CFG"
+    fi
   fi
+  if has "$CFG"; then upgrade_entry pdev pimcp "$CFG"; fi
 else
   note_skipped "pdev (not installed)"
 fi
 
 # --- Codex
 if command -v codex >/dev/null 2>&1; then
-  CFG="$HOME_DIR/.codex/config.toml"
+  CFG="$CODEX_DIR/config.toml"
   if has "$CFG"; then
     note_registered_existing codex "$CFG"
   else
@@ -1066,17 +1380,18 @@ if command -v codex >/dev/null 2>&1; then
     if [ "$DRY_RUN" = 0 ]; then
       if ! codex mcp add "$SERVER_NAME" -- "$INSTALL_BIN" >/dev/null 2>&1; then
         say "  (codex mcp add failed; appending to config.toml)"
-        "$PY" "$AGENT_CONFIG" add-codex "$CFG" "$INSTALL_BIN"
+        try_ac codex "$CFG" add-codex "$CFG" "$INSTALL_BIN" || REG_FAILED=1
       fi
     else
       say "  [dry-run] codex mcp add $SERVER_NAME -- $INSTALL_BIN"
     fi
-    note_registered codex "$CFG"
+    [ "${REG_FAILED:-0}" = 1 ] || note_registered codex "$CFG"
+    REG_FAILED=0
   fi
   # `codex mcp add` has no timeout flag; a request_slack_message call
   # blocks on a human approval for minutes (codex's default tool timeout
   # is 60s), so give the entry a long tool_timeout_sec
-  run_ok "$PY" "$AGENT_CONFIG" set-timeout "$CFG" "$SERVER_NAME" 86400
+  long_timeout codex "$CFG"
 else
   note_skipped "codex (not installed)"
 fi
@@ -1087,16 +1402,18 @@ if command -v opencode >/dev/null 2>&1 || [ -f "$HOME_DIR/.config/opencode/openc
   if has "$CFG"; then
     note_registered_existing opencode "$CFG"
   else
-    ac add-json opencode "$CFG" "$INSTALL_BIN"
-    note_registered opencode "$CFG"
+    if try_ac opencode "$CFG" add-json opencode "$CFG" "$INSTALL_BIN"; then
+      note_registered opencode "$CFG"
+    fi
   fi
+  if has "$CFG"; then upgrade_entry opencode opencode "$CFG"; fi
 else
   note_skipped "opencode (not installed)"
 fi
 
 # --- Mistral Vibe
 if command -v vibe >/dev/null 2>&1; then
-  CFG="$HOME_DIR/.vibe/config.toml"
+  CFG="$VIBE_DIR/config.toml"
   if has "$CFG"; then
     note_registered_existing vibe "$CFG"
   else
@@ -1109,16 +1426,17 @@ if command -v vibe >/dev/null 2>&1; then
       if ! vibe mcp add "$SERVER_NAME" --transport stdio --command "$INSTALL_BIN" --tool-timeout-sec 86400 >/dev/null 2>&1 \
          && ! vibe mcp add "$SERVER_NAME" --transport stdio --command "$INSTALL_BIN" >/dev/null 2>&1; then
         say "  (vibe mcp add failed; appending to config.toml)"
-        "$PY" "$AGENT_CONFIG" add-vibe "$CFG" "$INSTALL_BIN"
+        try_ac vibe "$CFG" add-vibe "$CFG" "$INSTALL_BIN" || REG_FAILED=1
       fi
     else
       say "  [dry-run] vibe mcp add $SERVER_NAME --transport stdio --command $INSTALL_BIN --tool-timeout-sec 86400"
     fi
-    note_registered vibe "$CFG"
+    [ "${REG_FAILED:-0}" = 1 ] || note_registered vibe "$CFG"
+    REG_FAILED=0
   fi
   # make sure the entry has a long tool_timeout_sec whether the CLI wrote
   # it or an older vibe without --tool-timeout-sec did
-  run_ok "$PY" "$AGENT_CONFIG" set-timeout "$CFG" "$SERVER_NAME" 86400
+  long_timeout vibe "$CFG"
 else
   note_skipped "vibe (not installed)"
 fi
@@ -1129,13 +1447,14 @@ if command -v goose >/dev/null 2>&1 || [ -f "$HOME_DIR/.config/goose/config.yaml
   if has "$CFG"; then
     note_registered_existing goose "$CFG"
   else
-    ac add-goose "$CFG" "$INSTALL_BIN"
-    note_registered goose "$CFG"
+    if try_ac goose "$CFG" add-goose "$CFG" "$INSTALL_BIN"; then
+      note_registered goose "$CFG"
+    fi
   fi
   # a request_slack_message call blocks on a human approval for minutes
   # (goose cancels the call when its timeout expires; older installs wrote
   # timeout: 120), so set a long timeout on every run
-  run_ok "$PY" "$AGENT_CONFIG" set-timeout "$CFG" "$SERVER_NAME" 86400
+  long_timeout goose "$CFG"
 else
   note_skipped "goose (not installed)"
 fi
@@ -1148,9 +1467,11 @@ if command -v pi >/dev/null 2>&1 || [ -d "$HOME_DIR/.pi/agent" ]; then
   if has "$CFG"; then
     note_registered_existing pi "$CFG"
   else
-    ac add-json pimcp "$CFG" "$INSTALL_BIN"
-    note_registered pi "$CFG"
+    if try_ac pi "$CFG" add-json pimcp "$CFG" "$INSTALL_BIN"; then
+      note_registered pi "$CFG"
+    fi
   fi
+  if has "$CFG"; then upgrade_entry pi pimcp "$CFG"; fi
 else
   note_skipped "pi (not installed)"
 fi
@@ -1161,14 +1482,16 @@ if [ -d "$HOME_DIR/.gemini" ]; then
   if has "$CFG"; then
     note_registered_existing gemini "$CFG"
   else
-    ac add-json gemini "$CFG" "$INSTALL_BIN"
-    if command -v gemini >/dev/null 2>&1 && gemini --version >/dev/null 2>&1; then
-      note_registered gemini "$CFG"
-    else
-      say "  [ok]        gemini (config written; CLI not currently on PATH) — $CFG"
-      printf '%s\t%s\n' gemini "$CFG" >> "$REGISTERED_FILE"
+    if try_ac gemini "$CFG" add-json gemini "$CFG" "$INSTALL_BIN"; then
+      if command -v gemini >/dev/null 2>&1 && gemini --version >/dev/null 2>&1; then
+        note_registered gemini "$CFG"
+      else
+        say "  [ok]        gemini (config written; CLI not currently on PATH) — $CFG"
+        printf '%s\t%s\n' gemini "$CFG" >> "$REGISTERED_FILE"
+      fi
     fi
   fi
+  if has "$CFG"; then upgrade_entry gemini gemini "$CFG"; fi
 else
   note_skipped "gemini (not installed)"
 fi
@@ -1179,9 +1502,11 @@ if [ -d "$HOME_DIR/.copilot" ]; then
   if has "$CFG"; then
     note_registered_existing copilot "$CFG"
   else
-    ac add-json copilot "$CFG" "$INSTALL_BIN"
-    note_registered copilot "$CFG"
+    if try_ac copilot "$CFG" add-json copilot "$CFG" "$INSTALL_BIN"; then
+      note_registered copilot "$CFG"
+    fi
   fi
+  if has "$CFG"; then upgrade_entry copilot copilot "$CFG"; fi
 else
   note_skipped "copilot (not installed)"
 fi
@@ -1192,9 +1517,13 @@ if command -v zed >/dev/null 2>&1 || [ -d "$HOME_DIR/.config/zed" ]; then
   if has "$CFG"; then
     note_registered_existing zed "$CFG"
   else
-    ac add-zed "$CFG" "$INSTALL_BIN"
-    note_registered zed "$CFG"
+    if try_ac zed "$CFG" add-zed "$CFG" "$INSTALL_BIN"; then
+      note_registered zed "$CFG"
+    fi
   fi
+  if has "$CFG"; then upgrade_entry zed zed "$CFG"; fi
+  say "              (Zed ends an MCP tool call after 10 minutes, whatever the"
+  say "               settings; SpeakEasy withdraws a Zed request just before)"
 else
   note_skipped "zed (not installed)"
 fi
@@ -1205,22 +1534,60 @@ if command -v amp >/dev/null 2>&1 || [ -f "$HOME_DIR/.config/amp/settings.json" 
   if has "$CFG"; then
     note_registered_existing amp "$CFG"
   else
-    ac add-json amp "$CFG" "$INSTALL_BIN"
-    note_registered amp "$CFG"
+    if try_ac amp "$CFG" add-json amp "$CFG" "$INSTALL_BIN"; then
+      note_registered amp "$CFG"
+    fi
   fi
+  say "              (Amp ends an MCP tool call after 5 minutes, whatever the"
+  say "               settings; SpeakEasy then withdraws the request)"
 else
   note_skipped "amp (not installed)"
 fi
 
 # --- Hermes Agent
-if command -v hermes >/dev/null 2>&1 || [ -d "$HOME_DIR/.hermes" ]; then
-  CFG="$HOME_DIR/.hermes/config.yaml"
+if command -v hermes >/dev/null 2>&1 || [ -d "$HERMES_DIR" ]; then
+  CFG="$HERMES_DIR/config.yaml"
   if has "$CFG"; then
     note_registered_existing hermes "$CFG"
   else
-    ac add-hermes "$CFG" "$INSTALL_BIN"
-    note_registered hermes "$CFG"
+    if try_ac hermes "$CFG" add-hermes "$CFG" "$INSTALL_BIN"; then
+      note_registered hermes "$CFG"
+    fi
   fi
+  long_timeout hermes "$CFG"
+  # Hermes before 0.21.6 fails every stdio MCP tool call (an inverted
+  # liveness check); before 0.22.3 its tool executor cuts a call off after
+  # 7 minutes whatever the server's timeout. A script install records its
+  # version in hermes-agent/install-stamp.json (baseVersion; pyproject.toml
+  # says 0.0.0 since 0.21.6); Hermes installed some other way gets no note.
+  HERMES_AGE="$("$PY" - "$HERMES_DIR/hermes-agent" <<'EOF' 2>/dev/null || true
+import json, os, re, sys
+d = sys.argv[1]
+v = ""
+try:
+    v = json.load(open(os.path.join(d, "install-stamp.json"))).get("baseVersion") or ""
+except (OSError, ValueError, AttributeError):
+    pass
+if not v:
+    try:
+        m = re.search(r'^version\s*=\s*"([0-9.]+)"', open(os.path.join(d, "pyproject.toml")).read(), re.M)
+        v = m.group(1) if m else ""
+    except OSError:
+        pass
+t = tuple(int(x) for x in str(v).split(".")[:3] if x.isdigit())
+if t and t != (0, 0, 0):
+    print("broken" if t < (0, 21, 6) else "short" if t < (0, 22, 3) else "ok", v)
+EOF
+)"
+  HERMES_VERSION="${HERMES_AGE#* }"
+  case "$HERMES_AGE" in
+    broken\ *)
+      say "  note: Hermes $HERMES_VERSION fails every stdio MCP tool call, so it can't"
+      say "        use request_slack_message. Update it: hermes update" ;;
+    short\ *)
+      say "  note: Hermes $HERMES_VERSION cuts a tool call off after 7 minutes; for"
+      say "        longer approvals, update it: hermes update" ;;
+  esac
 else
   note_skipped "hermes (not installed)"
 fi
@@ -1234,8 +1601,13 @@ fi
 fi
 
 say ""
+if [ "$TRANSPORT" = "hooks-only" ]; then
+say "  Superset workspaces run these same agent CLIs as this user, so they"
+say "  pick up the approval hooks (5b) automatically — no per-workspace setup."
+else
 say "  Superset workspaces run these same agent CLIs as this user, so they"
 say "  pick up the registrations above automatically — no per-workspace setup."
+fi
 
 # --------------------------------------------------------------------------- #
 # 5b. approval hooks: the agents' own Slack tools ask SpeakEasy first
@@ -1245,18 +1617,19 @@ say "5b. Approval hooks for the agents' own Slack tools"
 hr
 # "agent<TAB>file" rows of the hooks registered here, verified at the end
 HOOKED_FILE="$(mktemp 2>/dev/null || echo /tmp/sag-install-hooked.$$)"
-trap 'rm -f "$REGISTERED_FILE" "$HOOKED_FILE"' EXIT
+HOOK_FAILED_FILE="$(mktemp 2>/dev/null || echo /tmp/sag-install-hookfail.$$)"
+trap 'rm -f "$REGISTERED_FILE" "$HOOKED_FILE" "$HOOK_FAILED_FILE" "$OUTDATED_FILE" "$REG_FAILED_FILE"' EXIT
 hook_detected() { # hook_detected <agent> — is the agent installed here?
   case "$1" in
     claude) [ -d "$HOME_DIR/.claude" ] || command -v claude >/dev/null 2>&1 \
               || [ -d "$HOME_DIR/.paradev" ] ;;
-    codex) [ -d "${CODEX_HOME:-$HOME_DIR/.codex}" ] || command -v codex >/dev/null 2>&1 ;;
+    codex) [ -d "$CODEX_DIR" ] || command -v codex >/dev/null 2>&1 ;;
     gemini) [ -d "$HOME_DIR/.gemini" ] ;;
     copilot) [ -d "$HOME_DIR/.copilot" ] ;;
-    cursor) [ -d "$HOME_DIR/.cursor" ] ;;
-    hermes) [ -f "${HERMES_HOME:-$HOME_DIR/.hermes}/config.yaml" ] ;;
-    amp) [ -d "$HOME_DIR/.config/amp" ] ;;
-    vibe) [ -d "${VIBE_HOME:-$HOME_DIR/.vibe}" ] || command -v vibe >/dev/null 2>&1 ;;
+    cursor) [ -d "$HOME_DIR/.cursor" ] || command -v cursor-agent >/dev/null 2>&1 ;;
+    hermes) [ -f "$HERMES_DIR/config.yaml" ] || command -v hermes >/dev/null 2>&1 ;;
+    amp) [ -d "$HOME_DIR/.config/amp" ] || command -v amp >/dev/null 2>&1 ;;
+    vibe) [ -d "$VIBE_DIR" ] || command -v vibe >/dev/null 2>&1 ;;
     goose) [ -d "$HOME_DIR/.config/goose" ] || command -v goose >/dev/null 2>&1 ;;
     opencode) [ -d "$HOME_DIR/.config/opencode" ] || command -v opencode >/dev/null 2>&1 ;;
     pi) [ -d "$HOME_DIR/.pi/agent" ] || command -v pi >/dev/null 2>&1 ;;
@@ -1275,11 +1648,14 @@ else
       note_skipped "$agent hook (not installed)"
       continue
     fi
-    if ac hook-add "$agent" "$file" "$INSTALL_BIN" "$HOOK_WAIT" "$STATE_DIR"; then
+    if HOOK_OUT="$(ac hook-add "$agent" "$file" "$INSTALL_BIN" "$HOOK_WAIT" "$STATE_DIR" 2>&1)"; then
+      if [ "$DRY_RUN" = 1 ]; then printf '%s\n' "$HOOK_OUT"; fi
       printf '%s\t%s\n' "$agent" "$file" >> "$HOOKED_FILE"
       say "  [ok]        $agent hook — $file"
     else
-      say "  [failed]    $agent hook — $file (see the error above)"
+      printf '%s\n' "$HOOK_OUT" | sed 's/^/  /'
+      say "  [failed]    $agent hook — $file (see above)"
+      printf '%s\t%s\n' "$agent" "$file" >> "$HOOK_FAILED_FILE"
     fi
   done < <(hook_targets)
   if [ -d "$HOME_DIR/.paradev" ]; then
@@ -1293,6 +1669,9 @@ else
     if [ "$TRANSPORT" = "hooks-only" ]; then
       note_skipped "zed (its built-in agent has no hooks; Zed asks before each MCP"
       say "              tool call unless you chose Always allow for it)"
+    elif reg_failed zed; then
+      note_skipped "zed (its built-in agent has no hooks, and its registration failed:"
+      say "              see step 5)"
     else
       note_skipped "zed (its built-in agent has no hooks; it uses request_slack_message)"
     fi
@@ -1318,28 +1697,36 @@ hr
 # approves each call" where the hook was registered, and "ask the user in
 # chat first" where it wasn't (Zed's built-in agent has no hooks).
 hooked() { # hooked <agent> — the approval hook was registered for it
-  [ -s "$HOOKED_FILE" ] && cut -f1 "$HOOKED_FILE" | grep -qx "$1"
+  [ -s "$HOOKED_FILE" ] && awk -F '\t' -v a="$1" '$1 == a { f = 1 } END { exit !f }' "$HOOKED_FILE"
 }
-add_instruction() { # add_instruction <file> <hook agent, or "none">
+add_instruction() { # add_instruction <file> <hook agent, or "none"> [<registered agent>]
+  # (an agent whose registration failed has no request_slack_message either)
   local variant="gateway"
-  if [ "$TRANSPORT" = "hooks-only" ]; then
+  if [ "$TRANSPORT" = "hooks-only" ] || reg_failed "${3:-$2}"; then
     if [ "$2" != none ] && hooked "$2"; then variant="hooks"; else variant="confirm"; fi
   fi
-  ac instruction-add "$1" "$variant"
+  local result
+  if result="$(ac instruction-add "$1" "$variant" 2>&1)"; then
+    if [ "$DRY_RUN" = 1 ]; then say "$result"; return; fi
+    say "  [ok]        instruction block (${result##*: }) — $1"
+  else
+    printf '%s\n' "$result" | sed 's/^/  /'
+    say "  [failed]    instruction block — $1"
+  fi
 }
 if [ -f "$HOME_DIR/.claude.json" ] || [ -d "$HOME_DIR/.claude" ]; then
   add_instruction "$HOME_DIR/.claude/CLAUDE.md" claude
 fi
-if [ -f "$HOME_DIR/.codex/config.toml" ]; then
-  add_instruction "$HOME_DIR/.codex/AGENTS.md" codex
+if [ -f "$CODEX_DIR/config.toml" ] || hooked codex; then
+  add_instruction "$CODEX_DIR/AGENTS.md" codex
 fi
-if [ -f "$HOME_DIR/.config/opencode/opencode.json" ]; then
+if [ -f "$HOME_DIR/.config/opencode/opencode.json" ] || hooked opencode; then
   add_instruction "$HOME_DIR/.config/opencode/AGENTS.md" opencode
 fi
-if [ -f "$HOME_DIR/.vibe/config.toml" ]; then
-  add_instruction "$HOME_DIR/.vibe/AGENTS.md" vibe
+if [ -f "$VIBE_DIR/config.toml" ] || hooked vibe; then
+  add_instruction "$VIBE_DIR/AGENTS.md" vibe
 fi
-if [ -f "$HOME_DIR/.config/goose/config.yaml" ]; then
+if [ -f "$HOME_DIR/.config/goose/config.yaml" ] || hooked goose; then
   add_instruction "$HOME_DIR/.config/goose/.goosehints" goose
 fi
 if [ -d "$HOME_DIR/.pi/agent" ]; then
@@ -1347,28 +1734,29 @@ if [ -d "$HOME_DIR/.pi/agent" ]; then
 fi
 if [ -d "$HOME_DIR/.paradev/agent" ]; then
   # pdev runs the Claude Code hooks
-  add_instruction "$HOME_DIR/.paradev/agent/AGENTS.md" claude
+  add_instruction "$HOME_DIR/.paradev/agent/AGENTS.md" claude pdev
 fi
-if [ -f "$HOME_DIR/.gemini/settings.json" ]; then
+if [ -f "$HOME_DIR/.gemini/settings.json" ] || hooked gemini; then
   add_instruction "$HOME_DIR/.gemini/GEMINI.md" gemini
 fi
-if [ -f "$HOME_DIR/.copilot/mcp-config.json" ]; then
+if [ -f "$HOME_DIR/.copilot/mcp-config.json" ] || hooked copilot; then
   add_instruction "$HOME_DIR/.copilot/copilot-instructions.md" copilot
 fi
-if [ -f "$HOME_DIR/.hermes/config.yaml" ]; then
+if [ -f "$HERMES_DIR/config.yaml" ] || hooked hermes; then
   # Hermes loads global instructions from SOUL.md (HERMES_HOME), never from
   # ~/.hermes/AGENTS.md (that file is only read from a working directory)
-  add_instruction "$HOME_DIR/.hermes/SOUL.md" hermes
-  if has "$HOME_DIR/.hermes/AGENTS.md"; then
-    say "  migrating: removing the old block from $HOME_DIR/.hermes/AGENTS.md"
-    ac instruction-remove "$HOME_DIR/.hermes/AGENTS.md"
+  add_instruction "$HERMES_DIR/SOUL.md" hermes
+  if grep -qF '<<< slack-approval-gateway <<<' "$HERMES_DIR/AGENTS.md" 2>/dev/null; then
+    say "  migrating: removing the old block from $HERMES_DIR/AGENTS.md"
+    quiet_ac instruction-remove "$HERMES_DIR/AGENTS.md" >/dev/null \
+      || say "  [failed]    could not remove it; delete SpeakEasy's block from $HERMES_DIR/AGENTS.md by hand"
   fi
 fi
 if [ -f "$HOME_DIR/.config/zed/settings.json" ]; then
   # Zed reads user-level instructions from ~/.config/zed/AGENTS.md; the old
   # rules/slack-gateway.md location is never loaded, so drop it
-  add_instruction "$HOME_DIR/.config/zed/AGENTS.md" none
-  run rm -f "$HOME_DIR/.config/zed/rules/slack-gateway.md"
+  add_instruction "$HOME_DIR/.config/zed/AGENTS.md" none zed
+  remove_legacy_zed_rules
 fi
 
 # --------------------------------------------------------------------------- #
@@ -1379,9 +1767,9 @@ say "7. Enforcement audit (exclusive sending path)"
 hr
 AUDIT_FILES=(
   "$HOME_DIR/.claude.json"
-  "$HOME_DIR/.codex/config.toml"
+  "$CODEX_DIR/config.toml"
   "$HOME_DIR/.config/opencode/opencode.json"
-  "$HOME_DIR/.vibe/config.toml"
+  "$VIBE_DIR/config.toml"
   "$HOME_DIR/.config/goose/config.yaml"
   "$HOME_DIR/.pi/agent/settings.json"
   "$HOME_DIR/.pi/agent/mcp.json"
@@ -1391,7 +1779,7 @@ AUDIT_FILES=(
   "$HOME_DIR/.copilot/mcp-config.json"
   "$HOME_DIR/.config/zed/settings.json"
   "$HOME_DIR/.config/amp/settings.json"
-  "$HOME_DIR/.hermes/config.yaml"
+  "$HERMES_DIR/config.yaml"
   "$HOME_DIR/Library/Application Support/Claude/claude_desktop_config.json"
   "$HOME_DIR/.cursor/mcp.json"
 )
@@ -1431,32 +1819,81 @@ report_pairs() { # report_pairs <pairs> — one "    - file (server: name)" per 
 EXPECTED_SLACK_MCP="$(audit_pairs slack_mcp_servers)"
 EXPECTED_MISTRAL="$(audit_pairs mistral_connector_servers)"
 GAPS="$(audit_pairs direct_slack_servers)"
+OTHER_SLACK="$(audit_pairs other_slack_paths)"
 TOKENS="$(audit_pairs slack_tokens)"
 MISTRAL_KEYS="$(audit_pairs mistral_keys)"
 
 if [ -n "$EXPECTED_SLACK_MCP" ]; then
-  say "  Official Slack MCP servers in agent configs (expected: agents read"
-  say "  Slack context through them; the instruction block routes all sending"
-  say "  through the gateway):"
+  if [ "$TRANSPORT" = "hooks-only" ]; then
+    say "  Official Slack MCP servers in agent configs (agents read and send"
+    say "  through them):"
+  else
+    say "  Official Slack MCP servers in agent configs (expected: agents read"
+    say "  Slack context through them; where SpeakEasy is registered, the"
+    say "  instruction block routes sending through request_slack_message):"
+  fi
   report_pairs "$EXPECTED_SLACK_MCP"
 fi
 if [ -n "$EXPECTED_MISTRAL" ]; then
-  say "  Mistral connector servers in agent configs (expected: same — they"
-  say "  expose the Slack connector for reading):"
+  say "  Mistral connector servers in agent configs (agents read Slack"
+  say "  through them):"
   report_pairs "$EXPECTED_MISTRAL"
 fi
 if [ -n "$EXPECTED_SLACK_MCP" ] || [ -n "$EXPECTED_MISTRAL" ]; then
-  say "  Both also expose send tools (slack_send_message). In agents with"
-  say "  SpeakEasy's approval hook (5b) every such send waits for your approval;"
-  say "  elsewhere the boundary is the instruction block. --enforce keeps these"
-  say "  (agents are expected to have them)."
+  if [ "$NO_HOOKS" = 1 ]; then
+    say "  These also have send tools (slack_send_message). With --no-hooks"
+    say "  only the instruction block (where the agent has one) asks agents"
+    say "  not to use them."
+  else
+    say "  These also have send tools (slack_send_message). In agents with"
+    say "  SpeakEasy's approval hook (5b) every such send waits for your approval;"
+    say "  elsewhere only the instruction block (where the agent has one) asks"
+    say "  the agent to behave."
+  fi
+  if [ "$TRANSPORT" != "hooks-only" ]; then
+    say "  --enforce keeps these (agents are expected to have them)."
+  fi
 fi
-if [ -n "$GAPS" ]; then
+# Clients SpeakEasy can neither hook nor instruct
+GAPS_KEPT="$GAPS"
+if [ "$ENFORCE" = 1 ] && [ "$TRANSPORT" != "hooks-only" ]; then
+  # --enforce below removes the ones it can edit
+  GAPS_KEPT=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if ! "$PY" "$AGENT_CONFIG" can-enforce "$("$PY" -c 'import json,sys; print(json.loads(sys.argv[1])[0])' "$line")"; then
+      GAPS_KEPT="$GAPS_KEPT$line"$'\n'
+    fi
+  done <<< "$GAPS"
+fi
+NOT_GATED="$(printf '%s\n%s\n%s\n' "$EXPECTED_SLACK_MCP" "$EXPECTED_MISTRAL" "$GAPS_KEPT" | grep -E 'claude_desktop_config\.json|/\.config/zed/' || true)"
+if [ -n "$NOT_GATED" ]; then
+  say "  NOT gated by SpeakEasy (these clients have no hooks; Zed gets only the"
+  say "  instruction block). In Claude Desktop, set the Slack send tools to"
+  say "  Needs approval; in Zed, don't choose Always allow for them:"
+  report_pairs "$NOT_GATED"
+fi
+GAPS_HOOKED="$(printf '%s\n' "$GAPS" | grep -vE 'claude_desktop_config\.json|/\.config/zed/' || true)"
+if [ -n "$GAPS" ] && [ "$TRANSPORT" = "hooks-only" ]; then
+  if [ -n "$GAPS_HOOKED" ]; then
+    say "  Token-based Slack MCP servers in agent configs (in the hooks-only setup"
+    say "  they are how agents send; in agents with the approval hook (5b) each"
+    say "  write waits for your approval):"
+    report_pairs "$GAPS_HOOKED"
+  fi
+elif [ -n "$GAPS" ]; then
   say "  Direct Slack MCP servers in agent configs (agents could send"
   say "  without the gateway):"
   report_pairs "$GAPS"
 else
   say "  No direct (token-based) Slack MCP servers in agent configs."
+fi
+if [ -n "$OTHER_SLACK" ]; then
+  say "  Other Slack integrations in agent configs (not MCP servers; SpeakEasy"
+  say "  doesn't gate them, and --enforce leaves them alone — e.g. Hermes's"
+  say "  platform_toolsets.slack, which matters only when Hermes runs as a"
+  say "  Slack bot):"
+  report_pairs "$OTHER_SLACK"
 fi
 if [ -n "$TOKENS" ]; then
   say "  Slack tokens found in agent configs (masked):"
@@ -1464,15 +1901,22 @@ if [ -n "$TOKENS" ]; then
     [ -n "$line" ] || continue
     "$PY" -c 'import json,sys; p,t=json.loads(sys.argv[1]); print(f"    - {p}  ({t})")' "$line"
   done <<< "$TOKENS"
-  say "  (these belong to direct Slack MCP servers; --enforce removes the"
-  say "   server entries but cannot scrub every copy — rotate the tokens in"
-  say "   Slack if you want them gone for good)"
-  if [ -n "$TAKEOVER_TRANSPORT" ] || stored_credential; then
+  if [ "$TRANSPORT" != "hooks-only" ]; then
+    say "  (these belong to direct Slack MCP servers; --enforce removes the"
+    say "   server entries but cannot scrub every copy — rotate the tokens in"
+    say "   Slack if you want them gone for good)"
+  fi
+  if [ "$TRANSPORT" = "slack-mcp" ] || [ "$TRANSPORT" = "korotovsky" ]; then
     say "  If one of these is the login SpeakEasy took over, SpeakEasy sends"
     say "  with it too: rotating it (or signing out of that browser session)"
-    say "  stops SpeakEasy as well. To take it from the agent, use --enforce"
-    say "  and delete that config's .bak-sag backup; after rotating, run"
-    say "  --take-over again or update the file in $STATE_DIR."
+    if [ "$ENFORCE" = 1 ]; then
+      say "  stops SpeakEasy as well. --enforce removes the agent's copy below;"
+      say "  delete that config's .bak-sag backup too (it still holds the token)."
+    else
+      say "  stops SpeakEasy as well. To take it from the agent, use --enforce"
+      say "  and delete that config's .bak-sag backup; after rotating, run"
+      say "  --take-over again or update the file in $STATE_DIR."
+    fi
   fi
 fi
 if [ -n "$MISTRAL_KEYS" ]; then
@@ -1534,15 +1978,36 @@ elif [ "$ENFORCE" = 1 ]; then
       say "  Backups of the originals: <file>.bak-sag (kept — restore one by"
       say "  hand if you ever want the pre-install file back)"
     fi
-    say "  Kept (expected in agents): the official Slack MCP / Mistral"
-    say "  connector servers — see the report above."
+    if [ -n "$EXPECTED_SLACK_MCP" ] || [ -n "$EXPECTED_MISTRAL" ]; then
+      say "  Kept (expected in agents): the official Slack MCP / Mistral"
+      say "  connector servers listed above (a server holding a Slack token"
+      say "  counts as direct, even an official one, and is handled above)."
+    fi
   fi
 fi
 
 if [ "$DRY_RUN" = 0 ]; then
   DIR_MODE="$(stat -f '%Lp' "$STATE_DIR" 2>/dev/null || echo '?')"
-  TOK_MODE="$(stat -f '%Lp' "$MCP_TOKEN_FILE" 2>/dev/null || echo '?')"
-  say "  state dir $STATE_DIR (mode $DIR_MODE), Slack MCP token file mode $TOK_MODE (want 600)"
+  CRED_FILE=""
+  case "$TRANSPORT" in
+    slack-mcp) CRED_FILE="$STATE_DIR/slack_mcp_token" ;;
+    mistral-connector) CRED_FILE="$STATE_DIR/mistral_api_key" ;;
+    korotovsky)
+      for f in slack_stdio_env slack_user_token slack_bot_token; do
+        if [ -f "$STATE_DIR/$f" ]; then CRED_FILE="$STATE_DIR/$f"; break; fi
+      done ;;
+  esac
+  if [ -n "$CRED_FILE" ] && [ -f "$CRED_FILE" ]; then
+    say "  state dir $STATE_DIR (mode $DIR_MODE), $(basename "$CRED_FILE") mode $(stat -f '%Lp' "$CRED_FILE") (want 600)"
+  elif [ "$TRANSPORT" = "hooks-only" ]; then
+    if stored_credential; then
+      say "  state dir $STATE_DIR (mode $DIR_MODE); hooks-only: SpeakEasy doesn't use the credential stored there"
+    else
+      say "  state dir $STATE_DIR (mode $DIR_MODE); hooks-only: no Slack credential stored"
+    fi
+  else
+    say "  state dir $STATE_DIR (mode $DIR_MODE)"
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -1553,7 +2018,7 @@ say "8. Self-test (MCP handshake through a spawned process)"
 hr
 if [ "$DRY_RUN" = 1 ]; then
   say "  [dry-run] skipped"
-elif [ -S "$STATE_DIR/gateway.sock" ]; then
+elif socket_answers; then
   # perl ships with macOS; GNU timeout does not. `alarm shift; exec @ARGV`
   # runs the command under a 15 s alarm.
   SELF_TEST="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"install-self-test","version":"0"}}}' \
@@ -1566,7 +2031,8 @@ elif [ -S "$STATE_DIR/gateway.sock" ]; then
     say "        $STATE_DIR/gateway.log"
   fi
 else
-  say "  skipped (service socket not up)"
+  say "  WARN: skipped — SpeakEasy is not answering (see step 4 and"
+  say "        $STATE_DIR/gateway.log)"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -1580,7 +2046,11 @@ if [ "$DRY_RUN" = 1 ]; then
 else
   MISSING=0
   while IFS=$'\t' read -r name cfg; do
-    if has "$cfg"; then
+    WHY="$( [ -s "$OUTDATED_FILE" ] && awk -F '\t' -v n="$name" '$1 == n { print $2; exit }' "$OUTDATED_FILE" || true)"
+    if [ -n "$WHY" ]; then
+      say "  OUTDATED    $name ($cfg; $WHY — see above)"
+      MISSING=1
+    elif has "$cfg"; then
       say "  VERIFIED    $name ($cfg)"
     else
       say "  MISSING     $name ($cfg)"
@@ -1595,6 +2065,13 @@ else
       MISSING=1
     fi
   done < "$HOOKED_FILE"
+  while IFS=$'\t' read -r agent cfg; do
+    say "  NOT GATED   $agent — its hook was not added ($cfg; see above)"
+  done < "$HOOK_FAILED_FILE"
+  while IFS=$'\t' read -r agent cfg; do
+    say "  MISSING     $agent ($cfg; it was not registered, see above)"
+    MISSING=1
+  done < "$REG_FAILED_FILE"
   # The hook binary itself: a non-Slack call gets no opinion (exit 0).
   if [ -s "$HOOKED_FILE" ]; then
     HOOK_RC=0
@@ -1618,7 +2095,11 @@ say "Summary"
 hr
 say "  Binary:     $INSTALL_BIN"
 say "  Service:    $PLIST_LABEL (launchctl; logs in $STATE_DIR/gateway.log)"
-say "  State dir:  $STATE_DIR (cooldowns, sent records, token, socket)"
+if [ "$TRANSPORT" = "hooks-only" ]; then
+  say "  State dir:  $STATE_DIR (cooldowns, sent records, socket)"
+else
+  say "  State dir:  $STATE_DIR (cooldowns, sent records, credential, socket)"
+fi
 say ""
 say "Next steps:"
 # A stored credential counts only if it is not the placeholder the installer
@@ -1650,23 +2131,53 @@ if [ -n "$TAKEOVER_TRANSPORT" ] \
    || { [ "$TRANSPORT" = "korotovsky" ] && stdio_env_credential; }; then
   CREDENTIAL_OK=1
 fi
-if [ "$TRANSPORT" = "hooks-only" ]; then CREDENTIAL_OK=1; fi
 STEP=1
-if [ "$CREDENTIAL_OK" = 0 ] && [ "${TAKEOVER_HEAD:-}" = "many" ]; then
+if [ "$SERVICE_UP" = 0 ]; then
+  say "  $STEP. Get SpeakEasy running first: see the WARNING in step 4 and"
+  if [ "$NO_HOOKS" = 1 ]; then
+    say "      $STATE_DIR/gateway.log. Until it runs, no SpeakEasy window"
+    say "      appears and request_slack_message fails."
+  else
+    say "      $STATE_DIR/gateway.log. Until it runs, no SpeakEasy window"
+    say "      appears and the approval hooks block your agents' Slack writes."
+  fi
+  STEP=$((STEP + 1))
+fi
+if [ "${TAKEOVER_HEAD:-}" = "many" ] && { [ "$CREDENTIAL_OK" = 0 ] || [ "$TRANSPORT" = "hooks-only" ]; }; then
   # several Slack MCP servers could be taken over: picking one is the step
-  say "  $STEP. Pick the Slack MCP server SpeakEasy should take over:"
+  if [ "$TRANSPORT" = "hooks-only" ]; then
+    say "  $STEP. Optional: give SpeakEasy a Slack login of its own by taking over"
+    say "      one of these (the approval hooks work without it; with it, Zed's"
+    say "      built-in agent, which has no hooks, gets request_slack_message too):"
+  else
+    say "  $STEP. Pick the Slack MCP server SpeakEasy should take over:"
+  fi
   printf '%s\n' "$TAKEOVER_PICK" | tail -n +2 | sed 's/^    /       /'
   STEP=$((STEP + 1))
   CREDENTIAL_OK=1
 fi
+if [ "$TRANSPORT" = "hooks-only" ]; then CREDENTIAL_OK=1; fi
 if [ "$TRANSPORT" = "hooks-only" ]; then
   CREDENTIAL_OK=1
   say "  $STEP. Nothing to set up for Slack: SpeakEasy needs no login in this"
-  say "      setup. Your agents keep their own Slack MCP (Claude Code's Slack"
-  say "      plugin, …); each Slack write they make waits for you in the"
-  say "      SpeakEasy window. To also give agents without hooks (Zed's built-in"
-  say "      agent) the request_slack_message tool, give SpeakEasy a Slack login"
-  say "      of its own (see README.md) and re-run the installer."
+  say "      setup. Your agents keep their own Slack tools; in every agent with"
+  say "      SpeakEasy's approval hook (5b), each Slack write waits for you in"
+  say "      the SpeakEasy window. To also give Zed's built-in agent (no hooks)"
+  say "      the request_slack_message tool, give SpeakEasy a Slack login of its"
+  say "      own (see README.md) and re-run the installer."
+  if stored_credential; then
+    say "      (A Slack/Mistral credential is stored in $STATE_DIR, but this"
+    say "      setup doesn't use it. To use it: scripts/install.sh --transport"
+    say "      slack-mcp, mistral-connector or korotovsky, matching the credential.)"
+  fi
+  if [ -s "$HOOK_FAILED_FILE" ]; then
+    say "      Except: $(cut -f1 "$HOOK_FAILED_FILE" | tr '\n' ' ')— their hook was not"
+    say "      added (see step 5b), so their Slack writes are not gated until you add it."
+  fi
+  if printf '%s\n' "$NOT_GATED" | grep -q 'claude_desktop_config\.json'; then
+    say "      Not gated: Claude Desktop (no hooks; set its Slack send tools to"
+    say "      Needs approval — see step 7)."
+  fi
   STEP=$((STEP + 1))
 elif [ "$TRANSPORT" = "mistral-connector" ]; then
   if [ "$CREDENTIAL_OK" = 0 ]; then
@@ -1680,13 +2191,13 @@ elif [ "$TRANSPORT" = "mistral-connector" ]; then
   fi
 elif [ "$TRANSPORT" = "korotovsky" ]; then
   if [ "$CREDENTIAL_OK" = 0 ]; then
-    say "  $STEP. Install a Slack token for the korotovsky transport:"
+    say "  $STEP. Give the korotovsky transport a Slack login: your browser"
+    say "      session's xoxc/xoxd in $STATE_DIR/slack_stdio_env, or a token:"
     say "        scripts/install.sh --transport korotovsky --slack-bot-token xoxb-your-bot-token"
-    say "      (or --slack-user-token xoxp-...; see the scopes in README.md — the"
-    say "       gateway spawns the slack-mcp-server you installed"
-    say "       (https://github.com/korotovsky/slack-mcp-server) as a stdio child)"
-    say "      (re-running the installer restarts the service, which reads the"
-    say "       file at startup)"
+    say "      (or --slack-user-token xoxp-…). See README.md, \"If there's nothing"
+    say "      to take over\" → Korotovsky server. SpeakEasy spawns the"
+    say "      slack-mcp-server you installed as a stdio child; re-running the"
+    say "      installer restarts the service, which reads the login at startup."
     STEP=$((STEP + 1))
   fi
   if [ ! -s "$STATE_DIR/slack_workspace_domain" ]; then
@@ -1697,19 +2208,17 @@ elif [ "$TRANSPORT" = "korotovsky" ]; then
   fi
 else
   if [ "$CREDENTIAL_OK" = 0 ]; then
-    say "  $STEP. Get a Slack user token for the Slack MCP server (one-time):"
+    say "  $STEP. Get a Slack user token for the Slack MCP server (one-time). Set"
+    say "      up a Slack app as README.md, \"If there's nothing to take over\" →"
+    say "      Slack MCP describes (its MCP server turned on, the redirect URL"
+    say "      http://127.0.0.1:3118/callback, the user scopes listed there), then:"
     say "        scripts/slack_mcp_oauth.py --client-id YOUR_SLACK_APP_CLIENT_ID \\"
     say "            --client-secret YOUR_SLACK_APP_CLIENT_SECRET"
-    say "      It opens the Slack authorize page, verifies the token against"
-    say "      https://mcp.slack.com/mcp, and writes $MCP_TOKEN_FILE (chmod 600)."
-    say "      You need a Slack app (directory-published or internal) with the"
-    say "      redirect URL http://127.0.0.1:3118/callback and the user scopes"
-    say "      chat:write, users:read, channels:read — see README.md."
-    say "      Or set the token directly:"
+    say "      It verifies the token against https://mcp.slack.com/mcp and writes"
+    say "      $MCP_TOKEN_FILE (chmod 600). Or set a token directly:"
     say "        scripts/install.sh --slack-mcp-token xoxp-your-user-token"
-    say "      Then restart the service so it picks the token up:"
-    say "        launchctl kickstart -k gui/$(id -u)/com.speakeasy.slack-approval-gateway"
-    say "      (re-running the installer restarts it too)"
+    say "      Then run the installer again: it restarts SpeakEasy, which reads the"
+    say "      token at startup."
     STEP=$((STEP + 1))
   fi
 fi
@@ -1729,5 +2238,7 @@ else
 fi
 say ""
 say "  Uninstall: scripts/install.sh --uninstall"
-say "  Enforce exclusivity (remove direct Slack MCP servers from agents):"
-say "     scripts/install.sh --enforce"
+if [ -n "$GAPS" ] && [ "$TRANSPORT" != "hooks-only" ] && [ "${TAKEOVER_HEAD:-}" != "many" ] && [ "$ENFORCE" = 0 ]; then
+  say "  Enforce exclusivity (remove direct Slack MCP servers from agents):"
+  say "     scripts/install.sh --enforce"
+fi

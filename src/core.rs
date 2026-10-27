@@ -430,6 +430,40 @@ impl Gateway {
         id: String,
         received_at: u64,
     ) -> RequestVerdict {
+        self.handle_request_inner(req, id, received_at, None)
+    }
+
+    /// Like [`Self::handle_request`], but the agent can withdraw the request:
+    /// once `cancel` is set (its MCP client cancelled the call) or `deadline`
+    /// passes, a request still waiting for the human is withdrawn from the
+    /// popup and nothing is sent. A decision made before that stands.
+    pub fn handle_request_until(
+        &self,
+        req: IncomingRequest,
+        deadline: Option<Instant>,
+        cancel: &AtomicBool,
+    ) -> RequestVerdict {
+        let now = now_secs();
+        let id = format!(
+            "req-{now}-{}",
+            NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        // No deadline: wait as long as a human might (the agent's own tool
+        // timeout, set by the installer, is the real limit).
+        let deadline = deadline.unwrap_or_else(|| {
+            let far = Duration::from_secs(10 * 365 * 24 * 3600);
+            Instant::now().checked_add(far).unwrap_or_else(Instant::now)
+        });
+        self.handle_request_inner(req, id, now, Some((deadline, cancel)))
+    }
+
+    fn handle_request_inner(
+        &self,
+        req: IncomingRequest,
+        id: String,
+        received_at: u64,
+        withdraw: Option<(Instant, &AtomicBool)>,
+    ) -> RequestVerdict {
         if !self.slack.can_send() {
             return RequestVerdict::Error(
                 "SpeakEasy has no Slack connection of its own (hooks-only setup): send with \
@@ -457,7 +491,7 @@ impl Gateway {
 
         // 3. Ask the human (see `ask`), then 4. act on the decision.
         // Anything but an explicit approval sends nothing.
-        let (req, decision) = self.ask(req, id, received_at, None);
+        let (req, decision) = self.ask(req, id, received_at, withdraw);
         match decision {
             Ok(Decision::Approve) => self.send_approved(&req, hash),
             Ok(Decision::Deny) => RequestVerdict::Denied {
@@ -524,7 +558,7 @@ impl Gateway {
                 return verdict.clone();
             }
             if cancel.load(Ordering::Relaxed) {
-                return ApprovalVerdict::Error("the hook that asked stopped waiting".into());
+                return ApprovalVerdict::Error("the agent that asked stopped waiting".into());
             }
             let left = opts.deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {

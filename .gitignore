@@ -11,3 +11,6 @@
 
 # Tauri generated schemas
 /gen/
+
+# Python bytecode (scripts/test_agent_config.py imports agent_config)
+__pycache__/

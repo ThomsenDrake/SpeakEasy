@@ -1005,6 +1005,155 @@ fn every_argument_reaches_the_human_verbatim() {
     client.finish();
 }
 
+/// Records how long each request may wait, then either answers at once
+/// (feedback, so nothing is sent) or waits until the request is withdrawn.
+struct WithdrawableProvider {
+    wait: bool,
+    limits: Mutex<Vec<Duration>>,
+    withdrawn: std::sync::atomic::AtomicBool,
+}
+
+impl WithdrawableProvider {
+    fn new(wait: bool) -> Self {
+        Self {
+            wait,
+            limits: Mutex::new(Vec::new()),
+            withdrawn: Default::default(),
+        }
+    }
+
+    fn asked(&self) -> usize {
+        self.limits.lock().unwrap().len()
+    }
+}
+
+impl DecisionProvider for WithdrawableProvider {
+    fn request_decision(&self, _request: &MessageRequest) -> Result<Decision, ProviderError> {
+        unreachable!("tools/call asks with a deadline")
+    }
+
+    fn request_decision_until(
+        &self,
+        _request: &MessageRequest,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Decision, ProviderError> {
+        use std::sync::atomic::Ordering;
+        self.limits
+            .lock()
+            .unwrap()
+            .push(deadline.saturating_duration_since(Instant::now()));
+        if !self.wait {
+            return Ok(Decision::Feedback("noted".into()));
+        }
+        let start = Instant::now();
+        while !cancel.load(Ordering::Relaxed) {
+            if start.elapsed() > RESPONSE_TIMEOUT {
+                return Err(ProviderError("never cancelled".into()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.withdrawn.store(true, Ordering::SeqCst);
+        Err(ProviderError("withdrawn".into()))
+    }
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < RESPONSE_TIMEOUT, "timed out waiting: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_call_the_client_cancels_is_withdrawn_and_gets_no_response() {
+    let mock = mock_slack();
+    let provider = Arc::new(WithdrawableProvider::new(true));
+    let dir = StateDir::new("e2e-cancel");
+    let mut client = McpClient::start(gateway(&mock, provider.clone(), &dir));
+    client.initialize();
+
+    let id = client.send_request(
+        "tools/call",
+        json!({ "name": TOOL_NAME, "arguments": args("Cancel me.", "#general", None) }),
+    );
+    wait_until("the human is asked", || provider.asked() == 1);
+    // A cancel for an unknown request changes nothing.
+    client.send(&json!({
+        "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": { "requestId": 999, "reason": "unknown" },
+    }));
+    client.send(&json!({
+        "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": { "requestId": id, "reason": "request timeout" },
+    }));
+    wait_until("the request is withdrawn", || {
+        provider.withdrawn.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    // The next response is the ping's: the cancelled call gets none.
+    assert_eq!(client.result("ping", json!({})), json!({}));
+    assert_eq!(mock.send_count(), 0);
+    client.finish();
+}
+
+#[test]
+fn a_call_from_a_client_that_disconnects_is_withdrawn() {
+    let mock = mock_slack();
+    let provider = Arc::new(WithdrawableProvider::new(true));
+    let dir = StateDir::new("e2e-disconnect");
+    let mut client = McpClient::start(gateway(&mock, provider.clone(), &dir));
+    client.initialize();
+    client.send_request(
+        "tools/call",
+        json!({ "name": TOOL_NAME, "arguments": args("Left behind.", "#general", None) }),
+    );
+    wait_until("the human is asked", || provider.asked() == 1);
+    // The agent quits: its input ends with the call still waiting.
+    client.finish();
+    wait_until("the request is withdrawn", || {
+        provider.withdrawn.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    assert_eq!(mock.send_count(), 0);
+}
+
+#[test]
+fn calls_from_zed_are_withdrawn_before_zeds_own_limit() {
+    let mock = mock_slack();
+    let provider = Arc::new(WithdrawableProvider::new(false));
+    let dir = StateDir::new("e2e-zed-limit");
+    let gateway = gateway(&mock, provider.clone(), &dir);
+
+    let mut zed = McpClient::start(Arc::clone(&gateway));
+    zed.result(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "Zed", "version": "1.25.3" },
+        }),
+    );
+    zed.call_tool(args("From Zed.", "#general", None));
+    let mut other = McpClient::start(gateway);
+    other.initialize();
+    other.call_tool(args("From another agent.", "#general", None));
+
+    let limits = provider.limits.lock().unwrap().clone();
+    assert_eq!(limits.len(), 2);
+    assert!(
+        limits[0] <= Duration::from_secs(590) && limits[0] > Duration::from_secs(580),
+        "Zed's calls end before its 600 s limit: {:?}",
+        limits[0]
+    );
+    assert!(
+        limits[1] > Duration::from_secs(365 * 24 * 3600),
+        "other clients' calls wait for the human: {:?}",
+        limits[1]
+    );
+    zed.finish();
+    other.finish();
+}
+
 /// Panics instead of deciding, standing in for a bug in the gateway.
 struct PanickingProvider;
 

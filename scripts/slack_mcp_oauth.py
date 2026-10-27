@@ -311,9 +311,10 @@ def main():
     write_token_file(token_path, token)
     print()
     print(f"Wrote the Slack user token to {token_path} (chmod 600)")
-    print("The gateway uses it from there (or from SLACK_MCP_TOKEN); restart the")
-    print("gateway (launchctl kickstart -k gui/$(id -u)/com.speakeasy.slack-approval-gateway)")
-    print("to pick it up.")
+    print("Next, run scripts/install.sh again: it switches a hooks-only setup to the")
+    print("Slack MCP transport, registers request_slack_message, and restarts SpeakEasy.")
+    print("(If SpeakEasy already uses Slack MCP, restarting it is enough:")
+    print(" launchctl kickstart -k gui/$(id -u)/com.speakeasy.slack-approval-gateway)")
 
 
 if __name__ == "__main__":

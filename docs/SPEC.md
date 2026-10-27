@@ -89,7 +89,12 @@ Public API is fully declared in the stub. Implement:
      best-effort human-readable form of the destination for the popup
      (`None` when already readable or unresolvable; never used for sending).
      Call `provider.request_decision(&msg)` **without holding the state
-     lock** (it may block for a long time).
+     lock** (it may block for a long time). `Gateway::handle_request_until(req,
+     deadline, cancel)` (used by `tools/call`) is the same flow but calls
+     `provider.request_decision_until(&msg, deadline, cancel)`: when the
+     client cancels the call or the deadline passes before anyone decides,
+     the request is withdrawn from the popup and an `Error` is returned
+     (nothing sent).
   4. Match the decision:
      - `Ok(Decision::Approve)`: acquire `send_lock`. Re-check the sent records
        for `hash` under the lock (a concurrent identical request may have
@@ -456,6 +461,14 @@ with the Slack MCP transport in `src/slack_tools.rs`.
   stdio and for every socket connection from a bridge
   (`src/instance.rs`). Read lines from `input`; dispatch:
   - `initialize` → result `{protocolVersion: <client's requested version, or "2025-06-18">, capabilities: {tools: {listChanged: false}}, serverInfo: {name: "slack-approval-gateway", version: env!("CARGO_PKG_VERSION")}}`
+  - `notifications/cancelled` → set the cancel flag of the in-flight
+    `tools/call` with that `requestId` (if any): a request still waiting
+    for the human is withdrawn from the popup, nothing is sent, and the
+    call gets no response (MCP); a decision made before stands. When the
+    connection's input ends (the agent quit), every in-flight call of that
+    connection is cancelled the same way; the bridge forgets a cancelled
+    id, and all ids once the agent's input ends, so it never answers them
+    with its "instance exited" error
   - `notifications/initialized` and any other `notifications/*` → no response
   - `ping` → `{}`
   - `tools/list` → one tool:
@@ -472,8 +485,11 @@ with the Slack MCP transport in `src/slack_tools.rs`.
     `arguments` (required fields present and correctly typed;
     `thread_ts` optional string; `conversation` object with its three
     required string fields). Invalid → JSON-RPC error `-32602`.
-    Otherwise build `IncomingRequest`, call `gateway.handle_request(...)`,
-    and respond with `result.content = [{type: "text", text: <JSON string>}]`
+    Otherwise build `IncomingRequest`, call
+    `gateway.handle_request_until(req, deadline, cancel)` (cancel: the
+    call's flag above; deadline: none, except for clients that give up
+    without cancelling — `clientInfo.name` "Zed" from `initialize` gets
+    590 s, under Zed's fixed 600 s limit), and respond with `result.content = [{type: "text", text: <JSON string>}]`
     where the JSON string is one of:
     - `{"status":"sent","ts":...,"permalink":...,"duplicate":bool}`
     - `{"status":"denied","cooldown_remaining_secs":600}`
@@ -511,7 +527,9 @@ with the Slack MCP transport in `src/slack_tools.rs`.
   content get correctly matched decisions (no mixing); a NEW `Gateway` on
   the same state dir (simulated restart) still returns `cooldown_blocked`;
   a `U…` destination resolves to a display name in the request the provider
-  saw while the send still carries the raw ID.
+  saw while the send still carries the raw ID; a `notifications/cancelled`
+  withdraws a waiting call (no response, nothing sent); a Zed client's
+  calls carry the 590 s deadline and other clients' none.
 
 ### `src/instance.rs` — single-instance coordination and stdio bridges
 
@@ -769,9 +787,19 @@ sends real messages.
   `hooks-only`), `--mistral-api-key`, `--slack-bot-token`,
   `--slack-user-token`, `--workspace-domain`, `--take-over FILE[:NAME]`,
   `--no-take-over`, `--no-hooks`, `--hook-wait SECS` flags; see README
-  "Install"). With no credential flag, no `$SLACK_MCP_TOKEN`, no stored
-  credential, no `slack_transport` file and nothing taken over, it selects
-  `hooks-only`: `request_slack_message` is not registered (earlier
+  "Install"). Transport choice, in order: a taken-over server's transport;
+  `--transport`; an existing `slack_transport` file (kept, except that a
+  credential flag given now switches it to the flag's transport, and a
+  hooks-only file also switches for a `$SLACK_MCP_TOKEN` or a credential
+  stored after it, `credential_transport` in the installer; a flag
+  outranks `$SLACK_MCP_TOKEN`); the transport a credential flag implies (`--mistral-api-key` → `mistral-connector`,
+  `--slack-bot-token`/`--slack-user-token` → `korotovsky`); `slack-mcp`
+  when a Slack MCP token is given or stored. The choice is always written
+  to `slack_transport`. With no credential flag, no
+  `$SLACK_MCP_TOKEN`, no stored credential, no `slack_transport` file and
+  nothing taken over, it selects `hooks-only` (and `--no-hooks` is then
+  refused with exit 2 before anything changes, unless exactly one server
+  can be taken over): `request_slack_message` is not registered (earlier
   registrations are removed) and the instruction block becomes "use your
   own Slack tool; the user approves each call". Step 5b registers the
   approval hook in every detected agent with hooks
@@ -785,6 +813,33 @@ sends real messages.
   (integer timeout), and plugin files for OpenCode, pi, Hermes (enabled in
   `config.yaml`) and Amp. pi and pdev get `request_slack_message` in their
   `mcp.json` (`timeout: 86400`; their `settings.json` is not read for MCP).
+  Every registration carries a 24 h tool-call timeout in the agent's units,
+  as an integer (a call waits for a human; defaults are Claude Code 30 min
+  idle, Gemini 10 min, Hermes 5 min, Copilot 3 min, OpenCode 60 s): Claude
+  Code, Gemini, Copilot and OpenCode `timeout: 86400000` (ms; above
+  2^31 − 1 a JS timer fires at once), Hermes `timeout: 86400`, Codex and
+  Vibe `tool_timeout_sec`, goose `timeout`; Zed `timeout: 600` (its cap;
+  the gateway ends Zed calls at 590 s); Amp has no setting (a fixed
+  5 min, after which it cancels the call). OpenCode's entry needs
+  `"type": "local"` (it ignores one without), Copilot's gets
+  `"tools": ["*"]`, Zed's is flat (`{"command": PATH, "args": [],
+  "timeout": 600}`; the nested `{"command": {"path": …}}` form is not
+  loaded). Claude Code is registered with `claude mcp add-json` (`mcp add`
+  cannot set a timeout). On every run `agent_config.py upgrade-json STYLE
+  FILE BIN` / `upgrade-zed FILE BIN` bring an existing entry up to date
+  (the command, OpenCode's `type`, and a missing, shorter or out-of-range
+  timeout; optional fields and keys the user added are left alone); a
+  JSONC file is not rewritten (the fix is printed) and Verify reports that
+  agent OUTDATED, saying whether the entry won't load or only its timeout
+  is short. Zed's JSONC is edited by splicing, never re-serialized: members
+  are found by a comment- and string-aware scan, SpeakEasy's entry goes on
+  its own line (inline after `{` in inline-style objects) and removal takes
+  that line and the comma that separated it, so install then uninstall
+  restores the file byte for byte (line endings and BOM included) when it
+  already had `context_servers`; a file that does not parse is refused. The installer warns about Hermes before 0.21.6 (every stdio MCP
+  call fails) or 0.22.3 (calls cut off after 7 minutes), reading the
+  version from `hermes-agent/install-stamp.json` (`baseVersion`), else a
+  non-zero `pyproject.toml` version.
   The tool-hook command is a shell wrapper: `[ -x BIN ] || exit 2; BIN
   --hook A --wait W --state-dir S --ok-code 10; rc=$?; [ $rc -eq 10 ] &&
   exit 0; …; exit 2` (Cursor runs the binary directly, without
@@ -799,12 +854,28 @@ sends real messages.
   `[[hooks]]` named `speakeasy-slack-approval`. The Hermes
   `plugins.enabled` edit handles only block style (items at the key's
   indent or two deeper) and refuses anything else. JSON with comments is
-  refused, not rewritten; JSON is written with non-ASCII text as is.
-  Backups (`.bak-sag`) are taken only while a file holds nothing of
-  SpeakEasy's. `has` ignores lines that belong to a hook. A credential
-  given (or stored) after a hooks-only install switches `slack_transport`
-  to its transport; hooks-only with `--no-hooks` is refused; `--enforce` is
-  skipped in hooks-only mode. Instruction blocks: `gateway` when SpeakEasy
+  never rewritten: an entry or hook already present (found structurally)
+  counts as `unchanged`, a missing one is printed for the user to add by
+  hand, and a removal that finds nothing is `absent`. JSON is written with
+  non-ASCII text as is. Every write replaces the file atomically through
+  symlinks and keeps its mode. Backups (`.bak-sag`) are taken only while a
+  file holds nothing of SpeakEasy's and is not the empty skeleton an
+  uninstall leaves (`mcp_servers:` / `plugins:` / `enabled: []` YAML, JSON
+  of empty containers); uninstall deletes a `.bak-sag` that holds only
+  SpeakEasy's own instruction block. `has` is structural: a server entry
+  under a top-level MCP key (JSON), a `[mcp_servers.NAME]` table or
+  `[[mcp_servers]]` element (TOML), or a block under an MCP key (YAML),
+  never a mention elsewhere (a hook command names the binary too). Step 5
+  registrations are non-fatal: a failing agent prints `[failed]` and the
+  install continues; "Verify registrations" then marks an agent whose hook
+  failed as NOT GATED. Step 4 counts the service as up only when its socket
+  answers an MCP `initialize` (the socket is bound before the Slack client
+  is built, and a taken-over server can still fail); otherwise the warning
+  quotes the error lines of `gateway.log`. A credential given (or stored)
+  after a hooks-only install switches `slack_transport` to its transport;
+  hooks-only with `--no-hooks` is refused; `--enforce` is skipped in
+  hooks-only mode. `--uninstall` lists whatever it could not remove and
+  exits 1 (a leftover hook fails closed). Instruction blocks: `gateway` when SpeakEasy
   can send; hooks-only: `hooks` where the hook was registered, `confirm`
   ("ask the user in chat first") elsewhere. `CODEX_HOME`, `HERMES_HOME`
   and `VIBE_HOME` select those agents' hook files. Before choosing a transport it takes over the
@@ -818,7 +889,11 @@ sends real messages.
   several agents or project scopes share a hashed fingerprint and count
   once), `agent_config.py take-over` copies its command/env, token, or key
   and connector name into the state dir (chmod 600; replaced credential
-  files are moved to `*.pre-takeover`) and writes `slack_transport`.
+  files are moved to `*.pre-takeover`, then `.pre-takeover.1`, `.2`, … so
+  none is overwritten) and writes `slack_transport`. A remote server
+  reached through a stdio bridge (`mcp-remote URL --header "Authorization:
+  Bearer …"`) counts as that remote server; `${VAR}` in a header is filled
+  in from the entry's own env.
   `--take-over FILE[:NAME]` reads exactly FILE (any MCP config); same-name
   entries that differ are `NAME#2`, `NAME#3`. A taken-over
   `SLACK_MCP_ADD_MESSAGE_TOOL` is kept only when it is a channel-ID
@@ -836,13 +911,20 @@ sends real messages.
 - The installer's exclusivity audit (`agent_config.py audit`, run by
   `install.sh` step 7) categorizes what agents have installed: the official
   Slack MCP server (`mcp.slack.com`) and Mistral connector servers are
-  **expected** (agents read Slack context through them; the instruction
-  block routes all sending through the gateway); direct token-based Slack
-  servers (a `xox*` token in the entry, or an unclassifiable slack-named
-  server) are **violations**, as are Slack tokens and Mistral API keys
-  found in agent configs. `--enforce` removes only the direct token-based
-  servers from the JSON/TOML configs it can edit and keeps the expected
-  ones; `--dry-run` changes nothing, including under `--enforce`.
+  **expected** (agents read Slack context through them; their sends are
+  gated by the approval hook where the agent has one, and otherwise only
+  asked about by the instruction block); direct token-based Slack servers
+  (a `xox*` token in the entry, or an unclassifiable slack-named server)
+  are **violations** when SpeakEasy can send (in hooks-only they are how
+  agents send, and the hooks gate them), as are Slack tokens and Mistral
+  API keys found in agent configs. Slack servers in Claude Desktop and Zed
+  are reported as NOT gated (no hooks there; Zed gets only the
+  instruction block), with what to set by hand. Non-MCP Slack settings
+  (e.g. Hermes's `platform_toolsets.slack`) are listed separately and
+  never touched. `--enforce` removes only the direct token-based servers
+  from the JSON/TOML configs it can edit and keeps the expected ones, and
+  the installer suggests it only while such servers remain;
+  `--dry-run` changes nothing, including under `--enforce`.
 - First builds compile eframe/wgpu and take several minutes; that's
   expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.

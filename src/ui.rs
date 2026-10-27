@@ -315,7 +315,7 @@ impl DecisionProvider for GuiDecisionProvider {
     ) -> Result<Decision, ProviderError> {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return Err(ProviderError(
-                "the hook that asked stopped waiting before the request was shown".into(),
+                "the agent that asked stopped waiting before the request was shown".into(),
             ));
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -328,7 +328,7 @@ impl DecisionProvider for GuiDecisionProvider {
                 break "no one answered the approval request in time";
             }
             if cancel.load(Ordering::Relaxed) {
-                break "the hook that asked stopped waiting";
+                break "the agent that asked stopped waiting";
             }
             match rx.recv_timeout(left.min(POLL)) {
                 Ok(result) => return result,

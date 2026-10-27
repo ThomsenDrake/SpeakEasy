@@ -780,7 +780,7 @@ pub fn incoming_request(agent: Agent, call: &ToolCall, p: &Proposal) -> Incoming
             id_or_link: call
                 .session
                 .clone()
-                .unwrap_or_else(|| "(session not given)".to_string()),
+                .unwrap_or_else(|| "session not given".to_string()),
             summary: format!(
                 "The agent called `{}` directly; SpeakEasy's hook stopped the call until you \
                  decide.",
@@ -963,7 +963,8 @@ fn ask_instance(
 ) -> Result<Value, String> {
     let Some(stream) = instance::connect_existing(state_dir) else {
         return Err("SpeakEasy, the app that asks the user to approve Slack messages, is not \
-                    running (the user can start it by opening SpeakEasy)"
+                    running (the user can start it with: launchctl kickstart -k \
+                    gui/$(id -u)/com.speakeasy.slack-approval-gateway)"
             .into());
     };
     let mut params = serde_json::to_value(request).map_err(|e| e.to_string())?;

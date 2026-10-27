@@ -14,6 +14,7 @@ use crate::core::{
     RequestVerdict,
 };
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +56,23 @@ const CONVERSATION_FIELDS: [&str; 3] = ["title", "id_or_link", "summary"];
 /// when the call names no destination).
 pub const APPROVE_METHOD: &str = "speakeasy/approve";
 
+/// Clients that give up on a tool call after a fixed time without telling
+/// the server (no `notifications/cancelled`), by `clientInfo.name`: their
+/// `request_slack_message` calls are withdrawn from the popup just before,
+/// so the human never approves a message the agent was already told failed.
+/// Zed's built-in agent caps every MCP request at 600 s.
+const CLIENT_CALL_LIMITS: [(&str, Duration); 1] = [("Zed", Duration::from_secs(590))];
+
+/// One connection's `tools/call` requests that are still waiting.
+#[derive(Default)]
+struct Calls {
+    /// Cancel flags of in-flight calls, by JSON-encoded request id.
+    in_flight: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// How long a call may wait for the human (from the client's
+    /// `initialize`, see [`CLIENT_CALL_LIMITS`]); `None`: no limit.
+    limit: Mutex<Option<Duration>>,
+}
+
 /// Upper bound for `wait_secs`.
 pub const MAX_APPROVAL_WAIT_SECS: u64 = 24 * 3600;
 
@@ -73,9 +91,11 @@ pub fn run<W: Write + Send + 'static>(
 ) -> std::io::Result<()> {
     let output = Arc::new(Mutex::new(output));
     // Set when `input` ends: approval requests from this connection are then
-    // withdrawn (the hook that asked is gone).
+    // withdrawn (the hook that asked is gone), and so are its `tools/call`
+    // requests still waiting for the human (the agent can't get the result).
     let closed = Arc::new(AtomicBool::new(false));
-    let _mark_closed = CloseOnDrop(Arc::clone(&closed));
+    let calls = Arc::new(Calls::default());
+    let _mark_closed = CloseOnDrop(Arc::clone(&closed), Arc::clone(&calls));
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -100,12 +120,13 @@ pub fn run<W: Write + Send + 'static>(
                 continue;
             }
         };
-        if let Some(response) = dispatch(&gateway, &output, &closed, message) {
+        if let Some(response) = dispatch(&gateway, &output, &closed, &calls, message) {
             write_message(&output, &response)?;
         }
     }
-    // In-flight `tools/call` threads keep their clone of `output` and still
-    // answer if the peer is listening; they never hold up shutdown.
+    // In-flight `tools/call` threads are withdrawn (see `_mark_closed`); a
+    // call already approved still finishes sending and answers if the peer
+    // is listening. They never hold up shutdown.
     Ok(())
 }
 
@@ -116,6 +137,7 @@ fn dispatch<W: Write + Send + 'static>(
     gateway: &Arc<Gateway>,
     output: &Arc<Mutex<W>>,
     closed: &Arc<AtomicBool>,
+    calls: &Arc<Calls>,
     message: Value,
 ) -> Option<Value> {
     let Value::Object(mut message) = message else {
@@ -158,6 +180,22 @@ fn dispatch<W: Write + Send + 'static>(
             ))
         }
     };
+    if method == "notifications/cancelled" {
+        // The client gave up on a call (its own timeout, or the user
+        // interrupted the agent): withdraw it from the popup.
+        let request_id = message
+            .get("params")
+            .and_then(|p| p.get("requestId"))
+            .map(Value::to_string);
+        if let Some(request_id) = request_id {
+            let calls = calls.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(cancel) = calls.get(&request_id) {
+                log(format_args!("tools/call {request_id} cancelled by the client"));
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        return None;
+    }
     if method.starts_with("notifications/") {
         return None;
     }
@@ -185,7 +223,19 @@ fn dispatch<W: Write + Send + 'static>(
     }
 
     match method.as_str() {
-        "initialize" => Some(result_response(&id, initialize_result(&params))),
+        "initialize" => {
+            let client = params
+                .get("clientInfo")
+                .and_then(|c| c.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let limit = CLIENT_CALL_LIMITS
+                .iter()
+                .find(|(name, _)| client.eq_ignore_ascii_case(name))
+                .map(|(_, limit)| *limit);
+            *calls.limit.lock().unwrap_or_else(PoisonError::into_inner) = limit;
+            Some(result_response(&id, initialize_result(&params)))
+        }
         "ping" => Some(result_response(&id, json!({}))),
         "tools/list" => Some(result_response(
             &id,
@@ -213,7 +263,13 @@ fn dispatch<W: Write + Send + 'static>(
         },
         "tools/call" => match parse_tool_call(&params) {
             Ok(request) => {
-                spawn_tool_call(Arc::clone(gateway), Arc::clone(output), id, request);
+                spawn_tool_call(
+                    Arc::clone(gateway),
+                    Arc::clone(output),
+                    Arc::clone(calls),
+                    id,
+                    request,
+                );
                 None
             }
             Err(problem) => Some(error_response(
@@ -507,32 +563,65 @@ pub(crate) fn is_slack_ts(ts: &str) -> bool {
 }
 
 /// Handle a validated `tools/call` on its own thread so a request waiting
-/// for a human decision never blocks the read loop or other requests.
+/// for a human decision never blocks the read loop or other requests. A
+/// `notifications/cancelled` for it, or the client's call limit, withdraws
+/// it from the popup if no one has decided yet.
 fn spawn_tool_call<W: Write + Send + 'static>(
     gateway: Arc<Gateway>,
     output: Arc<Mutex<W>>,
+    calls: Arc<Calls>,
     id: Value,
     request: IncomingRequest,
 ) {
+    let key = id.to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    calls
+        .in_flight
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key.clone(), Arc::clone(&cancel));
+    let deadline = calls
+        .limit
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .map(|limit| Instant::now() + limit);
     let worker_output = Arc::clone(&output);
     let worker_id = id.clone();
+    let worker_calls = Arc::clone(&calls);
+    let worker_key = key.clone();
     let spawned = thread::Builder::new()
         .name("mcp-tools-call".into())
         .spawn(move || {
-            let verdict = panic::catch_unwind(AssertUnwindSafe(|| gateway.handle_request(request)))
-                .unwrap_or_else(|_| {
-                    RequestVerdict::Error(
-                        "internal gateway error while handling the request; check the \
-                         destination before retrying, as the message may have been sent"
-                            .into(),
-                    )
-                });
+            let verdict = panic::catch_unwind(AssertUnwindSafe(|| {
+                gateway.handle_request_until(request, deadline, &cancel)
+            }))
+            .unwrap_or_else(|_| {
+                RequestVerdict::Error(
+                    "internal gateway error while handling the request; check the \
+                     destination before retrying, as the message may have been sent"
+                        .into(),
+                )
+            });
+            worker_calls
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&worker_key);
+            // A cancelled request gets no response (MCP), unless it was sent.
+            if cancel.load(Ordering::Relaxed) && !matches!(verdict, RequestVerdict::Sent { .. }) {
+                return;
+            }
             let response = result_response(&worker_id, tool_result(verdict));
             if let Err(e) = write_message(&worker_output, &response) {
                 log(format_args!("cannot write tools/call response: {e}"));
             }
         });
     if let Err(e) = spawned {
+        calls
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
         // The closure (and the request) was dropped unrun: nothing was shown
         // to the human and nothing was sent.
         log(format_args!("cannot start a tools/call worker: {e}"));
@@ -594,13 +683,17 @@ fn spawn_approval<W: Write + Send + 'static>(
     }
 }
 
-/// Sets the flag when dropped (the connection's read loop ended, by EOF or
-/// error).
-struct CloseOnDrop(Arc<AtomicBool>);
+/// Sets the flag, and cancels the connection's in-flight `tools/call`
+/// requests, when dropped (the read loop ended, by EOF or error).
+struct CloseOnDrop(Arc<AtomicBool>, Arc<Calls>);
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
+        let calls = self.1.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+        for cancel in calls.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 

@@ -223,6 +223,17 @@ fn request_id(line: &str) -> Option<Value> {
     }
 }
 
+/// The `requestId` of a `notifications/cancelled` message, if the line is
+/// one: the agent gave up on that request, and gets no answer to it.
+fn cancelled_id(line: &str) -> Option<Value> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    if msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+        msg.get("params")?.get("requestId").cloned()
+    } else {
+        None
+    }
+}
+
 /// The `id` of a JSON-RPC response (a message with an id and a result or an
 /// error), if the line parses as one.
 fn response_id(line: &str) -> Option<Value> {
@@ -297,7 +308,14 @@ fn pump_jsonrpc<R: BufRead + Send + 'static, W: Write + Send + 'static>(
         loop {
             line.clear();
             match input.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    // The agent is gone: the instance withdraws its pending
+                    // calls without answering, and no one is left to tell.
+                    if let Ok(mut f) = tracked.lock() {
+                        f.ids.clear();
+                    }
+                    break;
+                }
                 Ok(_) => {
                     let late = match tracked.lock() {
                         Ok(mut f) => {
@@ -306,6 +324,9 @@ fn pump_jsonrpc<R: BufRead + Send + 'static, W: Write + Send + 'static>(
                             } else {
                                 if let Some(id) = request_id(&line) {
                                     f.ids.insert(id);
+                                } else if let Some(id) = cancelled_id(&line) {
+                                    // the instance won't answer it either
+                                    f.ids.remove(&id);
                                 }
                                 false
                             }
@@ -463,12 +484,18 @@ mod tests {
             assert!(line.contains("tools/call"));
             // Dropping the connection is the whole point: the instance is gone.
         });
-        let input = Cursor::new(
-            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{}}\n".to_vec(),
-        );
+        // The agent stays connected (its input open) while the instance dies.
+        let (mut agent, agent_side) = UnixStream::pair().unwrap();
+        writeln!(
+            agent,
+            "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{{}}}}"
+        )
+        .unwrap();
+        let input = BufReader::new(agent_side);
         let output = Arc::new(Mutex::new(Vec::new()));
         let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
         instance.join().unwrap();
+        drop(agent);
         assert_eq!(unanswered, vec![serde_json::json!(7)]);
         let bytes = std::mem::take(&mut *output.lock().unwrap());
         let text = String::from_utf8(bytes).unwrap();
@@ -512,6 +539,54 @@ mod tests {
     }
 
     #[test]
+    fn pump_does_not_answer_requests_of_an_agent_that_left() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // The instance reads the call, sees the agent's side close, withdraws
+        // the call without answering, and closes the connection.
+        let instance = thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            line.clear();
+            assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+        });
+        let input = Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{}}\n".to_vec(),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
+        instance.join().unwrap();
+        assert!(unanswered.is_empty(), "{unanswered:?}");
+        assert!(output.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pump_does_not_answer_requests_the_agent_cancelled() {
+        let (client, server) = UnixStream::pair().unwrap();
+        // A fake instance that reads the call and its cancellation, answers
+        // neither (as the real one does), and closes the connection.
+        let instance = thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            line.clear();
+            let _ = reader.read_line(&mut line);
+            assert!(line.contains("notifications/cancelled"), "{line}");
+        });
+        let input = Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{}}\n\
+              {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":9}}\n"
+                .to_vec(),
+        );
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
+        instance.join().unwrap();
+        assert!(unanswered.is_empty(), "{unanswered:?}");
+        let text = String::from_utf8(std::mem::take(&mut *output.lock().unwrap())).unwrap();
+        assert!(text.is_empty(), "{text}");
+    }
+
+    #[test]
     fn pump_fails_requests_arriving_after_the_instance_died() {
         let (client, server) = UnixStream::pair().unwrap();
         // A fake instance that reads one request, then dies without answering.
@@ -520,16 +595,24 @@ mod tests {
             let mut line = String::new();
             let _ = reader.read_line(&mut line);
         });
-        // The agent sends id 7 (never answered) and then id 8, which the
-        // bridge must fail fast instead of forwarding into the dead socket.
-        let input = Cursor::new(
-            b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{}}\n\
-              {\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{}}\n"
-                .to_vec(),
-        );
+        // The agent (still connected) sends id 7 (never answered) and then
+        // id 8, which the bridge must fail fast instead of forwarding into
+        // the dead socket.
+        let (mut agent, agent_side) = UnixStream::pair().unwrap();
+        agent
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{}}\n",
+            )
+            .unwrap();
+        let input = BufReader::new(agent_side);
         let output = Arc::new(Mutex::new(Vec::new()));
         let unanswered = pump_jsonrpc(input, Arc::clone(&output), client);
         instance.join().unwrap();
+        // id 8 may still be on its way through the write side: give it a
+        // moment before the agent leaves.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(agent);
         // Which side answers id 8 is timing-dependent (the read side's drain
         // or the write side's fail-fast); what matters is that both requests
         // are answered exactly once.

@@ -53,9 +53,17 @@ Subcommands:
                               give the entry a long tool-call timeout —
                               tool_timeout_sec in a [mcp_servers.NAME] table or
                               a [[mcp_servers]] element (codex/vibe TOML), the
-                              timeout: line in a goose YAML extensions block.
-                              A request_slack_message call blocks on a human
-                              approval for minutes
+                              timeout: line in a goose extensions or Hermes
+                              mcp_servers YAML block. A request_slack_message
+                              call blocks on a human approval for minutes
+  upgrade-json STYLE FILE GATEWAY_PATH
+                              bring the gateway's existing JSON entry up to
+                              date (OpenCode's "type", the tool-call timeout,
+                              Copilot's "tools"), keeping keys the user added
+  upgrade-zed FILE GATEWAY_PATH
+                              replace the gateway's Zed context_servers entry
+                              when it is in the old nested form or has no
+                              timeout
   enforce-remove PAIR_JSON    remove one direct Slack server found by the
                               audit. PAIR_JSON is the [file, name, key] entry
                               as reported by audit. Prints an accurate status
@@ -135,6 +143,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 
 SERVER = "slack-approval-gateway"
@@ -165,15 +174,25 @@ Before you send, post, schedule, or react to anything in Slack, show the user th
 # STYLE -> (parent key, entry builder). A parent key starting with "@" is a
 # single literal key (amp settings use the flat "amp.mcpServers" key, VS
 # Code-style); otherwise the key is a dotted path into nested objects.
+# A request_slack_message call waits for a human, often for minutes, so each
+# entry gets a 24 h tool-call timeout in the agent's own units (an integer:
+# 0, null or a string disables the server in several agents). Defaults
+# without it: Claude Code 30 min idle, Gemini 10 min, Copilot 3 min,
+# OpenCode 60 s. Amp has no setting (a fixed 5 min).
+TOOL_TIMEOUT_MS = 86400 * 1000
 JSON_STYLES = {
-    "claude": ("mcpServers", lambda cmd: {"type": "stdio", "command": cmd, "args": []}),
-    "gemini": ("mcpServers", lambda cmd: {"command": cmd, "args": []}),
+    "claude": ("mcpServers", lambda cmd: {"type": "stdio", "command": cmd, "args": [],
+                                          "timeout": TOOL_TIMEOUT_MS}),
+    "gemini": ("mcpServers", lambda cmd: {"command": cmd, "args": [], "timeout": TOOL_TIMEOUT_MS}),
     "pi": ("mcpServers", lambda cmd: {"command": cmd, "args": []}),
     # pi 1.4+ and pdev read MCP servers from mcp.json, where `timeout` is a
-    # per-request limit (default 60 s); a request waits for a human
+    # per-request limit in seconds (default 60)
     "pimcp": ("mcpServers", lambda cmd: {"command": cmd, "args": [], "timeout": 86400}),
-    "copilot": ("mcpServers", lambda cmd: {"type": "local", "command": cmd, "args": []}),
-    "opencode": ("mcp", lambda cmd: {"command": [cmd], "enabled": True}),
+    "copilot": ("mcpServers", lambda cmd: {"type": "local", "command": cmd, "args": [],
+                                           "tools": ["*"], "timeout": TOOL_TIMEOUT_MS}),
+    # OpenCode ignores an entry without "type"; its `command` is the argv
+    "opencode": ("mcp", lambda cmd: {"type": "local", "command": [cmd], "enabled": True,
+                                     "timeout": TOOL_TIMEOUT_MS}),
     "amp": ("@amp.mcpServers", lambda cmd: {"command": cmd, "args": []}),
 }
 
@@ -220,29 +239,117 @@ def read(path):
         return None
 
 
-def write(path, text):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+def _replace_atomically(path, writer):
+    """Write a file through a temp file and rename it over `path`. A symlink
+    is followed (the dotfile it points at is edited, the link stays), and an
+    existing file keeps its permissions — a config holding tokens at 600
+    must not become world-readable."""
+    path = os.path.realpath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        writer(f)
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
-def backup(path):
-    """Back up the original once; never overwrite an existing backup."""
-    if os.path.exists(path) and not os.path.exists(path + BAK):
-        shutil.copy2(path, path + BAK)
+def write(path, text):
+    _replace_atomically(path, lambda f: f.write(text))
+
+
+def _speakeasy_content(text):
+    """Whether a config already holds something SpeakEasy wrote (its MCP
+    entry, a hook, its plugin entry) — or is only the empty skeleton
+    SpeakEasy leaves after removing its entries. Neither is the user's
+    pre-install original."""
+    if (SERVER in text or "--hook " in text or "speakeasy-slack-approval" in text
+            or re.search(r"(?m)^\s+- ['\"]?speakeasy['\"]?\s*$", text)):
+        return True
+    stripped = text.strip()
+    yaml_lines = [l.split("#")[0].rstrip() for l in stripped.split("\n") if l.strip()]
+    if all(l in ("extensions:", "mcp_servers:", "plugins:", "  enabled: []") for l in yaml_lines):
+        # (empty, or only the empty parents SpeakEasy leaves after removal)
+        return True
+    try:
+        data = json.loads(stripped)
+    except ValueError:
+        try:
+            data = json.loads(strip_jsonc(stripped))
+        except ValueError:
+            return False
+
+    def empty(v):
+        return isinstance(v, (dict, list)) and all(empty(x) for x in (v.values() if isinstance(v, dict) else v))
+
+    return isinstance(data, dict) and all(empty(v) for k, v in data.items() if k != "version")
+
+
+def backup(path, force=False):
+    """Back up the pre-install original once; never overwrite an existing
+    backup. A file that already holds SpeakEasy's content (or only the
+    skeleton it leaves behind) is not the original, so it is not backed up
+    unless `force` (--enforce removals, which delete the user's own
+    entries)."""
+    if not os.path.exists(path) or os.path.exists(path + BAK):
+        return
+    if not force and _speakeasy_content(read(path) or ""):
+        return
+    shutil.copy2(path, path + BAK)
 
 
 def has_entry(path, name=SERVER):
-    """Whether `name` is registered as an MCP server in `path`. SpeakEasy's
-    approval hooks also mention its name (the binary path in a hook
-    command, a managed comment), so lines that belong to a hook don't
-    count."""
-    text = read(path) or ""
-    kept = [l for l in text.split("\n")
-            if "--hook " not in l and "slack-approval-gateway hook" not in l]
-    return name in "\n".join(kept)
+    """Whether `name` is registered as an MCP server in `path`: an entry in
+    an MCP servers container (JSON/JSONC), a [mcp_servers.NAME] table or a
+    [[mcp_servers]] element named NAME (TOML), or a NAME: block under an
+    MCP parent key (YAML). Other mentions — a hook command, a disabled-
+    servers list, a permission rule — don't count."""
+    text = read(path)
+    if text is None or name not in text:
+        return False
+    if path.endswith(".json"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            try:
+                data = json.loads(strip_jsonc(text))
+            except ValueError:
+                return False
+        if not isinstance(data, dict):
+            return False
+        # Top-level containers only: a per-project entry in ~/.claude.json
+        # (projects.<path>.mcpServers) is not the user-scope registration.
+        containers = [data.get(k) for k in MCP_PARENT_KEYS]
+        mcp = data.get("mcp")
+        if isinstance(mcp, dict):
+            containers.append(mcp.get("servers"))
+        return any(isinstance(c, dict) and name in c for c in containers)
+    if path.endswith(".toml"):
+        quoted = re.escape(name)
+        return any(_codex_server_header(name).match(l.strip()) for l in text.split("\n")) or any(
+            re.search(r'(?m)^\s*name\s*=\s*["\']%s["\']' % quoted, "\n".join(lines[s0 + 1:e0]))
+            for lines in [text.split("\n")]
+            for s0, e0, tname, arr in _toml_table_spans(lines) if arr and tname == "mcp_servers")
+    if path.endswith((".yaml", ".yml")):
+        parents = "|".join(sorted(YAML_MCP_PARENTS))
+        lines = text.split("\n")
+        in_parent = False
+        for line in lines:
+            if re.match(r"^(%s)\s*:\s*(#.*)?$" % parents, line):
+                in_parent = True
+                continue
+            if line.strip() and not line.startswith(" "):
+                in_parent = False
+            if in_parent and re.match(r"^  ['\"]?%s['\"]?\s*:" % re.escape(name), line):
+                return True
+        return False
+    return name in text
 
 
 def backup_original(path):
@@ -250,24 +357,33 @@ def backup_original(path):
     holds nothing of SpeakEasy's: a later run would otherwise back up
     SpeakEasy's own version (whose hook blocks every Slack call once the
     binary is gone)."""
-    text = read(path)
-    if text is not None and SERVER not in text and not os.path.exists(path + BAK):
-        shutil.copy2(path, path + BAK)
+    backup(path)
+
+
+class JsoncFile(SystemExit):
+    """A JSON config with comments or trailing commas: SpeakEasy does not
+    rewrite it (that would drop them)."""
 
 
 def load_json(path):
     text = read(path)
-    if text is None:
+    if text is None or not text.strip():
         return {}
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except ValueError:
+        try:
+            json.loads(strip_jsonc(text))
+        except ValueError:
+            raise SystemExit("%s is not valid JSON; fix it, then run the installer again" % path)
+        raise JsoncFile("%s has comments or trailing commas; SpeakEasy will not rewrite it" % path)
 
 
 def dump_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    def writer(f):
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    os.replace(tmp, path)
+    _replace_atomically(path, writer)
 
 
 def parent_of(data, keypath):
@@ -330,7 +446,11 @@ def strip_jsonc(text):
 
 def add_json(style, path, cmd):
     keypath, make = JSON_STYLES[style]
-    data = load_json(path)
+    try:
+        data = load_json(path)
+    except JsoncFile as e:
+        raise SystemExit("%s. Add this to its %s by hand:\n  %s" % (
+            e, keypath.lstrip("@"), json.dumps({SERVER: make(cmd)})))
     if not isinstance(data, dict):
         raise SystemExit(f"{path}: top level is not a JSON object")
     container, key = parent_of(data, keypath)
@@ -345,13 +465,90 @@ def add_json(style, path, cmd):
     return action
 
 
+def _upgrade_fields(style, entry, cmd):
+    """The fields of SpeakEasy's existing entry that keep it from loading or
+    cut approvals short, as {key: value}: the command, OpenCode's required
+    "type", and the tool-call timeout. Optional fields ("args", "enabled",
+    Copilot's "tools", Claude's "type") and keys the user added are left
+    alone; a longer timeout stays."""
+    want = JSON_STYLES[style][1](cmd)
+    fix = {}
+    if entry.get("command") != want["command"]:
+        fix["command"] = want["command"]
+    if style == "opencode" and entry.get("type") != "local":
+        fix["type"] = "local"
+    if "timeout" in want:
+        have = entry.get("timeout")
+        # past a JS timer's limit (2^31 - 1 ms) Gemini and OpenCode time
+        # out at once
+        if (not isinstance(have, int) or isinstance(have, bool) or have < want["timeout"]
+                or have > 2**31 - 1):
+            fix["timeout"] = want["timeout"]
+    return fix
+
+
+def upgrade_json(style, path, cmd):
+    """Bring SpeakEasy's existing entry up to date (a missing "type" makes
+    OpenCode ignore it; a missing timeout cuts approvals short)."""
+    keypath = JSON_STYLES[style][0]
+    text = read(path)
+    if text is None or SERVER not in text:
+        return "absent"
+    try:
+        data = load_json(path)
+        jsonc = False
+    except JsoncFile:
+        data = json.loads(strip_jsonc(text))
+        jsonc = True
+    if not isinstance(data, dict):
+        return "absent"
+    container, key = parent_of(data, keypath)
+    servers = container.get(key)
+    entry = servers.get(SERVER) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return "absent"
+    fix = _upgrade_fields(style, entry, cmd)
+    if not fix:
+        return "unchanged"
+    if jsonc:
+        raise SystemExit("%s has comments or trailing commas; SpeakEasy will not rewrite it. "
+                         "Set these in its %s entry by hand: %s"
+                         % (path, SERVER, json.dumps(fix)))
+    entry.update(fix)
+    dump_json(path, data)
+    return "updated (%s)" % ", ".join(sorted(fix))
+
+
 def remove_json(style, path):
     """Uninstall path: remove only the gateway's own entries — the top-level
     one and any nested ones (e.g. claude per-project projects.<path>.mcpServers).
     The .bak-sag backup (the pre-install original) is kept for a manual
     restore; the file is never overwritten with it, so changes made after
     the install survive."""
-    data = load_json(path)
+    # (any depth: uninstall also removes per-project entries)
+    if SERVER not in (read(path) or ""):
+        return "absent"
+    try:
+        data = load_json(path)
+    except JsoncFile as e:
+        # with comments: complain only when an MCP entry really is there
+        # (a hook command also mentions SpeakEasy's binary)
+        found = []
+
+        def deep(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in MCP_PARENT_KEYS and isinstance(v, dict) and SERVER in v:
+                        found.append(k)
+                    deep(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    deep(v)
+
+        deep(json.loads(strip_jsonc(read(path))))
+        if not found:
+            return "absent"
+        raise SystemExit("%s; remove the %s entry by hand" % (e, SERVER))
     if not isinstance(data, dict):
         return "absent"
     removed = False
@@ -382,7 +579,7 @@ def remove_entry(style, path, name, keys=None):
     JSON keys), the servers container is that nested path — e.g. claude's
     per-project projects.<path>.mcpServers — instead of the style's
     top-level parent key."""
-    backup(path)
+    backup(path, force=True)
     keypath, _ = JSON_STYLES[style]
     data = load_json(path)
     if not isinstance(data, dict):
@@ -409,8 +606,46 @@ def remove_entry(style, path, name, keys=None):
 # Zed (JSONC)
 # --------------------------------------------------------------------------- #
 
+# Zed caps every MCP request at 600 s (larger values are clamped); the
+# gateway withdraws a Zed call just before that. The nested
+# {"command": {"path": …}} form older installs wrote is not loaded by
+# current Zed.
+ZED_TIMEOUT_SEC = 600
+
+
 def zed_entry(cmd):
-    return '"%s": {"command": {"path": %s, "args": []}}' % (SERVER, json.dumps(cmd))
+    return '"%s": {"command": %s, "args": [], "timeout": %d}' % (SERVER, json.dumps(cmd), ZED_TIMEOUT_SEC)
+
+
+def upgrade_zed(path, cmd):
+    """Replace an entry in the old nested form, or one without the timeout,
+    with the current one (one write: the file is never left half-done)."""
+    text = _read_exact(path)
+    if text is None or SERVER not in text:
+        return "absent"
+    if not _jsonc_ok(text):
+        raise SystemExit("%s is not valid JSON (with comments); fix it, then SpeakEasy's %s "
+                         "entry, by hand: %s" % (path, SERVER, zed_entry(cmd)))
+    servers = json.loads(strip_jsonc(text.lstrip("\ufeff"))).get("context_servers")
+    entry = servers.get(SERVER) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return "absent"
+    timeout = entry.get("timeout")
+    fixed = []
+    if not isinstance(entry.get("command"), str):
+        fixed.append("flat form")
+    elif entry["command"] != cmd:
+        fixed.append("command")
+    if not (isinstance(timeout, int) and not isinstance(timeout, bool) and timeout >= ZED_TIMEOUT_SEC):
+        fixed.append("timeout")
+    if not fixed:
+        return "unchanged"
+    new = _zed_add_text(_zed_remove_text(text), cmd)
+    if not _jsonc_ok(new):
+        raise SystemExit("%s: SpeakEasy could not update its entry safely; replace it by hand "
+                         "with: %s" % (path, zed_entry(cmd)))
+    write(path, new)
+    return "updated (%s)" % ", ".join(fixed)
 
 
 def _scan_string(text, i):
@@ -441,7 +676,7 @@ def _skip_comment(text, i):
 
 
 def _skip_ws(text, i):
-    while i < len(text) and text[i] in " \t\r\n":
+    while i < len(text) and text[i] in " \t\r\n\ufeff":
         i += 1
     return i
 
@@ -483,79 +718,239 @@ def _scan_json(text, i):
         return n
     if i < n and text[i] == '"':
         return _scan_string(text, i)
-    while i < n and text[i] not in ",}]\n":
+    # a number, true, false or null: its own characters only (a comment
+    # after it may hold , } or ])
+    while i < n and (text[i].isalnum() or text[i] in "+-._"):
         i += 1
     return i
 
 
-def add_zed(path, cmd):
-    text = read(path)
-    if text is None:
-        text = "{}"
-    if SERVER in text:
-        return "already"
-    backup(path)
-    entry = zed_entry(cmd)
-    m = re.search(r'"context_servers"\s*:\s*\{', text)
-    if m:
-        after = re.sub(r"//[^\n]*|/\*.*?\*/", "", text[m.end():], flags=re.S)
-        if after.lstrip().startswith("}"):
-            close = text.index("}", m.end())
-            text = text[: m.end()] + " " + entry + " " + text[close:]
+def _top_object(text):
+    """Index of the "{" opening a JSONC document's top-level object, or None."""
+    i = _skip_ws_comments(text, 0)
+    return i if i < len(text) and text[i] == "{" else None
+
+
+def _members(text, obj_start):
+    """(key, key_start, value_start, value_end) for each member of the JSONC
+    object whose "{" is at obj_start. Comments (and a "}" or a quoted key
+    inside one) are skipped; scanning stops at anything unexpected."""
+    out = []
+    n = len(text)
+    i = obj_start + 1
+    while True:
+        i = _skip_ws_comments(text, i)
+        if i >= n or text[i] == "}":
+            return out
+        if text[i] == ",":
+            i += 1
+            continue
+        if text[i] != '"':
+            return out
+        key_end = _scan_string(text, i)
+        try:
+            key = json.loads(text[i:key_end])
+        except ValueError:
+            return out
+        colon = _skip_ws_comments(text, key_end)
+        if colon >= n or text[colon] != ":":
+            return out
+        value = _skip_ws_comments(text, colon + 1)
+        value_end = _scan_json(text, value)
+        out.append((key, i, value, value_end))
+        i = value_end
+
+
+def _zed_servers(text):
+    """(top, context_servers member or None) of a Zed settings file; of
+    duplicate keys the last counts, as in JSON."""
+    top = _top_object(text)
+    if top is None:
+        return None, None
+    found = [m for m in _members(text, top) if m[0] == "context_servers"]
+    return top, (found[-1] if found else None)
+
+
+def _read_exact(path):
+    """A file's text with its line endings and byte-order mark kept, so a
+    splice changes nothing but the spliced bytes."""
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            return f.read()
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        return None
+
+
+def _unterminated(text):
+    """Whether a string or /* comment runs to the end of the text."""
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == '"':
+            j = _scan_string(text, i)
+            if j >= n and not text.endswith('"'):
+                return True
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                return True
+            i = j + 2
+        elif text.startswith("//", i):
+            i = _line_end(text, i)
         else:
-            text = text[: m.end()] + "\n    " + entry + "," + text[m.end():]
+            i += 1
+    return False
+
+
+def _jsonc_ok(text):
+    """Whether a JSONC file parses (Zed's settings allow comments and
+    trailing commas)."""
+    if _unterminated(text):
+        return False
+    try:
+        json.loads(strip_jsonc(text.lstrip("\ufeff")) or "{}")
+        return True
+    except ValueError:
+        return False
+
+
+def _line_end(text, i):
+    j = text.find("\n", i)
+    return len(text) if j < 0 else j
+
+
+class _ZedEdit(Exception):
+    """A Zed settings file SpeakEasy will not edit; the message says why."""
+
+
+def _zed_add_text(text, cmd):
+    """`text` with SpeakEasy's entry spliced into context_servers (created if
+    missing); every other byte is kept."""
+    if not text.strip():
+        text = "{}"
+    entry = zed_entry(cmd)
+    top, servers = _zed_servers(text)
+    if top is None:
+        raise _ZedEdit("the top level is not a JSON object")
+    if servers and text[servers[2]] != "{":
+        raise _ZedEdit("context_servers is not an object")
+    if servers:
+        o, close = servers[2], servers[3] - 1  # its "{" and "}"
+        if not text[o + 1:close].strip() and "\n" not in text[o + 1:close]:
+            # {} / { }: inline, after the spaces (removal cuts just the entry)
+            at = o + 1
+            while text[at] in " \t":
+                at += 1
+            return text[:at] + entry + text[at:]
+        comma = "," if _members(text, o) else ""
+        line_end = _line_end(text, o + 1)
+        rest = text[o + 1:line_end].strip()
+        if not rest or rest.startswith("//"):
+            # on a line of its own after the "{" line (and a comment on it),
+            # with that line's own line ending
+            at = line_end - 1 if text[line_end - 1:line_end] == "\r" else line_end
+            nl = text[at:line_end + 1] or "\n"
+            return text[:at] + nl + "    " + entry + comma + text[at:]
+        # inline style: right after the "{" (and the spaces after it)
+        at = o + 1
+        while text[at] in " \t":
+            at += 1
+        return text[:at] + entry + (comma + " " if comma else "") + text[at:]
+    nl = "\r\n" if "\r\n" in text else "\n"
+    comma = "," if _members(text, top) else ""
+    return (text[: top + 1] + nl + '  "context_servers": {' + nl + "    " + entry + nl
+            + "  }" + comma + text[top + 1:])
+
+
+def _zed_remove_text(text):
+    """`text` without SpeakEasy's context_servers entry — its line when it
+    is alone on one, otherwise the key and value — and the comma that
+    separated it from a neighbour; comments and every other byte are kept.
+    None when there is no entry."""
+    _, servers = _zed_servers(text)
+    if not servers or text[servers[2]] != "{":
+        return None
+    obj_start, obj_end = servers[2], servers[3] - 1  # its "{" and "}"
+    members = _members(text, obj_start)
+    k = next((i for i, m in enumerate(members) if m[0] == SERVER), None)
+    if k is None:
+        return None
+    key_start, value_end = members[k][1], members[k][3]
+    after = _skip_ws_comments(text, value_end)
+    own_comma = after < obj_end and text[after] == ","
+    line_start = text.rfind("\n", 0, key_start) + 1
+    line_end = _line_end(text, value_end)
+    tail = text[value_end:line_end]
+    if own_comma and after < line_end:
+        tail = tail.replace(",", "", 1)
+    cuts = []
+    if not text[line_start:key_start].strip() and not tail.strip():
+        # alone on its line: the whole line goes (with its comma)
+        cuts.append((line_start, min(line_end + 1, len(text))))
+        if own_comma and after > line_end:
+            # a comma-first line: its comma and the spaces after it
+            end = after + 1
+            while end < len(text) and text[end] in " \t":
+                end += 1
+            cuts.append((after, end))
     else:
-        i = text.index("{")
-        text = (
-            text[: i + 1]
-            + '\n  "context_servers": {\n    '
-            + entry
-            + "\n  },"
-            + text[i + 1 :]
-        )
-    write(path, text)
+        cuts.append((key_start, value_end))
+        if own_comma:
+            # its comma and the spaces after it; comments before it stay
+            end = after + 1
+            while end < len(text) and text[end] in " \t":
+                end += 1
+            cuts.append((after, end))
+    if not own_comma and k > 0:
+        # the last entry: the comma after the one before goes
+        c = _skip_ws_comments(text, members[k - 1][3])
+        if text[c] == ",":
+            cuts.append((c, c + 1))
+    for a, b in sorted(cuts, reverse=True):
+        text = text[:a] + text[b:]
+    return text
+
+
+def add_zed(path, cmd):
+    text = _read_exact(path)
+    if text is None or not text.strip():
+        text = "{}"
+    by_hand = "add this to its context_servers by hand: %s" % zed_entry(cmd)
+    if not _jsonc_ok(text):
+        raise SystemExit("%s is not valid JSON (with comments); SpeakEasy will not edit it. "
+                         "Fix it, or %s" % (path, by_hand))
+    _, servers = _zed_servers(text)
+    if servers and text[servers[2]] == "{" and any(m[0] == SERVER for m in _members(text, servers[2])):
+        return "already"
+    try:
+        new = _zed_add_text(text, cmd)
+    except _ZedEdit as e:
+        raise SystemExit("%s: %s; %s" % (path, e, by_hand))
+    if not _jsonc_ok(new):
+        raise SystemExit("%s: SpeakEasy could not add its entry safely; %s" % (path, by_hand))
+    # (a mention in a comment is not SpeakEasy's content: back up the original)
+    backup(path, force=True)
+    write(path, new)
     return "added"
 
 
 def remove_zed(path):
-    """Text splice, the inverse of add_zed: remove only the gateway's
-    context_servers entry — key, value, and one adjoining comma. Every
-    other byte of the JSONC file (comments, other entries, formatting)
-    is kept."""
-    text = read(path)
+    """Text splice, the inverse of add_zed (see _zed_remove_text). A file
+    that does not parse is not edited."""
+    text = _read_exact(path)
     if text is None or SERVER not in text:
         return "absent"
-    m = re.search(r'"context_servers"\s*:\s*\{', text)
-    if not m:
+    if not _jsonc_ok(text):
+        raise SystemExit("%s is not valid JSON (with comments); SpeakEasy will not edit it. "
+                         "Remove its %s entry by hand" % (path, SERVER))
+    new = _zed_remove_text(text)
+    if new is None:
         return "absent"
-    obj_start = m.end() - 1
-    obj_end = _scan_json(text, obj_start) - 1  # the matching "}"
-    km = re.compile(r'"%s"\s*:' % re.escape(SERVER)).search(text, obj_start + 1, obj_end)
-    if not km:
-        return "absent"
-    key_start = km.start()
-    value_end = _scan_json(text, km.end())
-    after = _skip_ws_comments(text, value_end)
-    if (
-        after < obj_end
-        and text[after] == ","
-        and _skip_ws(text, after + 1) < obj_end
-    ):
-        # another entry follows ours: drop our comma and the whitespace up
-        # to that entry with it (comments in between are kept)
-        cut = (key_start, _skip_ws(text, after + 1))
-    else:
-        # our entry is the last one: drop the comma in front of it, if any
-        before = key_start
-        while before > obj_start + 1 and text[before - 1] in " \t\r\n":
-            before -= 1
-        if before > obj_start + 1 and text[before - 1] == ",":
-            cut = (before - 1, value_end)
-        else:
-            # the only entry in the object: drop the whitespace around it
-            cut = (before, _skip_ws_comments(text, value_end))
+    if not _jsonc_ok(new):
+        raise SystemExit("%s: SpeakEasy could not remove its %s entry safely; remove it by hand"
+                         % (path, SERVER))
     backup(path)
-    write(path, text[: cut[0]] + text[cut[1]:])
+    write(path, new)
     return "removed"
 
 
@@ -579,28 +974,30 @@ def add_goose(path, cmd):
         "    cmd: %s\n"
         "    args: []\n"
         "    envs: {}\n"
-        "    timeout: 86400" % (SERVER, json.dumps(cmd))
+        "    timeout: 86400\n" % (SERVER, json.dumps(cmd))
     )
-    m = re.search(r"^extensions:\s*$", text, re.M)
+    m = re.search(r"^extensions:[ \t]*$", text, re.M)
     if m:
-        text = text[: m.end()] + "\n" + block + text[m.end():]
+        # (`[ \t]*`, not `\s*`: the match must stop before the newline)
+        rest = text[m.end():]
+        text = text[: m.end()] + "\n" + block + (rest[1:] if rest.startswith("\n") else rest)
     else:
         if text and not text.endswith("\n"):
             text += "\n"
-        text += "extensions:\n" + block + "\n"
+        text += "extensions:\n" + block
     write(path, text)
     return "added"
 
 
 def set_goose_timeout(path, name, seconds):
-    """Set the timeout: line in the gateway's goose YAML block (the
-    `  name:` entry under extensions:), adding it after the block's last
-    key if it is missing. Only that line changes; the rest of the file —
-    comments, other extensions — is kept byte-for-byte."""
+    """Set the timeout: line in the gateway's YAML block (the `  name:`
+    entry under goose's extensions: or Hermes's mcp_servers:), adding it
+    after the block's last key if it is missing. Only that line changes;
+    the rest of the file — comments, other entries — is kept byte-for-byte."""
     text = read(path)
     if text is None:
         return "absent"
-    m = re.search(r"^  %s:[^\n]*\n((?:    .*\n|\n)*)" % re.escape(name), text, re.M)
+    m = re.search(r"^  %s:[^\n]*\n((?:    [^\n]*(?:\n|\Z)|\n)*)" % re.escape(name), text, re.M)
     if not m:
         return "absent"
     # the block must live under extensions: (goose's MCP servers key)
@@ -609,13 +1006,15 @@ def set_goose_timeout(path, name, seconds):
         pm = re.match(r"^([A-Za-z0-9_.-]+)\s*:", line)
         if pm:
             parent = pm.group(1)
-    if parent != "extensions":
+    if parent not in ("extensions", "mcp_servers"):
         return "absent"
     block = m.group(1)
     tm = re.search(r"^([ \t]+)timeout:[^\n]*\n?", block, re.M)
     if tm:
         had_nl = block[tm.end() - 1] == "\n"
         repl = "%stimeout: %d" % (tm.group(1), seconds) + ("\n" if had_nl else "")
+        if block[tm.start():tm.end()] == repl:
+            return "unchanged"
         block = block[: tm.start()] + repl + block[tm.end():]
         result = "updated"
     else:
@@ -625,6 +1024,8 @@ def set_goose_timeout(path, name, seconds):
             if block_lines[i].strip():
                 insert_at = i + 1
                 break
+        if insert_at and not block_lines[insert_at - 1].endswith("\n"):
+            block_lines[insert_at - 1] += "\n"
         block_lines.insert(insert_at, "    timeout: %d\n" % seconds)
         block = "".join(block_lines)
         result = "added"
@@ -640,19 +1041,22 @@ def add_hermes(path, cmd):
     if SERVER in text:
         return "already"
     backup(path)
+    # timeout: seconds, for tool calls (default 300); an integer
     entry = (
         "  %s:\n"
         "    command: %s\n"
         "    args: []\n"
-        "    env: {}" % (SERVER, json.dumps(cmd))
+        "    env: {}\n"
+        "    timeout: %d\n" % (SERVER, json.dumps(cmd), TOOL_TIMEOUT_SEC)
     )
-    m = re.search(r"^mcp_servers:\s*$", text, re.M)
+    m = re.search(r"^mcp_servers:[ \t]*$", text, re.M)
     if m:
-        text = text[: m.end()] + "\n" + entry + text[m.end():]
+        rest = text[m.end():]
+        text = text[: m.end()] + "\n" + entry + (rest[1:] if rest.startswith("\n") else rest)
     else:
         if text and not text.endswith("\n"):
             text += "\n"
-        text += "mcp_servers:\n" + entry + "\n"
+        text += "mcp_servers:\n" + entry
     write(path, text)
     return "added"
 
@@ -663,7 +1067,7 @@ def _remove_yaml_block(path, header_re, name):
         return "absent"
     # Remove the `  name:` entry (2-space indent) and its deeper-indented
     # children, plus a now-empty parent header if it was the only entry.
-    m = re.search(r"^  %s:\n(?:    .*\n|\n)*" % re.escape(name), text, re.M)
+    m = re.search(r"^  %s:[^\n]*(?:\n|\Z)(?:    [^\n]*(?:\n|\Z)|\n)*" % re.escape(name), text, re.M)
     if not m:
         return "absent"
     text = text[: m.start()] + text[m.end():]
@@ -688,7 +1092,7 @@ def add_codex(path, cmd):
     text = read(path)
     if text is None:
         text = ""
-    if "[mcp_servers.%s]" % SERVER in text:
+    if any(_codex_server_header(SERVER).match(l) for l in text.splitlines()):
         return "already"
     backup(path)
     if text and not text.endswith("\n"):
@@ -707,6 +1111,12 @@ def remove_codex(path):
     return remove_codex_entry(path, SERVER)
 
 
+def _codex_server_header(name):
+    """A [mcp_servers.NAME] table header, NAME bare or quoted."""
+    n = re.escape(name)
+    return re.compile(r"""^\[\s*mcp_servers\s*\.\s*(?:%s|"%s"|'%s')\s*\][ \t]*(#.*)?$""" % (n, n, n))
+
+
 def _cut_lines(lines, start, end):
     """Remove lines[start:end], keeping comment/blank lines that follow the
     region's last key line: our writers append at EOF, so a comment after
@@ -720,9 +1130,11 @@ def _cut_lines(lines, start, end):
     head = "".join(lines[:start])
     kept = "".join(region[last:])
     tail = "".join(lines[end:])
-    new = head + kept + tail
-    # the removal can leave runs of blank lines where the entry was
-    new = re.sub(r"\n{3,}", "\n\n", new)
+    # the removal can leave a run of blank lines where the entry was:
+    # collapse it at the seam only (the rest of the file stays as it is)
+    seam = head[len(head.rstrip("\n")):] + kept + tail[:len(tail) - len(tail.lstrip("\n"))]
+    middle = re.sub(r"\n{3,}", "\n\n", seam)
+    new = head.rstrip("\n") + middle + tail.lstrip("\n")
     if not (kept + tail).strip():
         new = new.rstrip("\n") + "\n" if new.strip() else ""
     return new
@@ -739,7 +1151,7 @@ def remove_codex_entry(path, name):
     tables = _toml_tables(text)
     # the [mcp_servers.NAME] table plus its [mcp_servers.NAME.*] subtables,
     # which directly follow it
-    header_re = re.compile(r"^\[mcp_servers\.%s\][ \t]*$" % re.escape(name))
+    header_re = _codex_server_header(name)
     sub_re = re.compile(r"^\[mcp_servers\.%s\.[^\]\n]+\][ \t]*$" % re.escape(name))
     start = None
     end = None
@@ -752,7 +1164,7 @@ def remove_codex_entry(path, name):
             break
     if start is None:
         return "absent"
-    backup(path)
+    backup(path, force=(name != SERVER))
     write(path, _cut_lines(lines, tables[start]["start"], tables[end - 1]["end"]))
     return "removed"
 
@@ -823,6 +1235,7 @@ def add_vibe(path, cmd):
     text += (
         "[[mcp_servers]]\n"
         'name = "%s"\n'
+        'transport = "stdio"\n'
         'command = %s\n'
         "args = []\n"
         "tool_timeout_sec = %d\n" % (SERVER, json.dumps(cmd), TOOL_TIMEOUT_SEC)
@@ -857,7 +1270,7 @@ def remove_vibe_entry(path, name):
             end = j
             break
     region_end = tables[end]["start"] if end < len(tables) else len(lines)
-    backup(path)
+    backup(path, force=(name != SERVER))
     write(path, _cut_lines(lines, tables[target]["start"], region_end))
     return "removed"
 
@@ -893,23 +1306,33 @@ def set_toml_timeout(path, name, seconds):
     value = str(seconds)
     # codex style: a [mcp_servers.NAME] table (its body runs to the next
     # column-0 header, so subtables are not touched)
-    pat = re.compile(r"^\[mcp_servers\.%s\][ \t]*$" % re.escape(name))
+    pat = _codex_server_header(name)
     for i, line in enumerate(lines):
         if pat.match(line):
             j = i + 1
             while j < len(lines) and not lines[j].startswith("["):
                 j += 1
             body, existed = _set_toml_key(lines[i + 1 : j], "tool_timeout_sec", value)
+            new = "".join(lines[: i + 1] + body + lines[j:])
+            if new == text:
+                return "unchanged"
             backup(path)
-            write(path, "".join(lines[: i + 1] + body + lines[j:]))
+            write(path, new)
             return "updated" if existed else "added"
     # vibe style: a [[mcp_servers]] element with name = "NAME"
     for t in _toml_tables(text):
         if _VIBE_ARRAY_RE.match(t["header"]) and _vibe_element_name(t) == name:
             body_lines = t["body"].splitlines(keepends=True)
             body, existed = _set_toml_key(body_lines, "tool_timeout_sec", value)
+            if name == SERVER and not any(re.match(r"\s*transport\s*=", l) for l in body):
+                # an element written by an older installer: Vibe rejects the
+                # whole config without a transport
+                body = [body[0]] + ['transport = "stdio"\n'] + body[1:] if body else ['transport = "stdio"\n']
+            new = "".join(lines[: t["start"] + 1] + body + lines[t["end"] :])
+            if new == text:
+                return "unchanged"
             backup(path)
-            write(path, "".join(lines[: t["start"] + 1] + body + lines[t["end"] :]))
+            write(path, new)
             return "updated" if existed else "added"
     return "absent"
 
@@ -929,20 +1352,39 @@ def set_timeout(path, name, seconds):
 # instruction blocks
 # --------------------------------------------------------------------------- #
 
+def _block_span(text):
+    """(start, end) of SpeakEasy's instruction block, or None when there is
+    none; an unmatched begin marker (end marker missing, or only before it)
+    is an error, never a guess at where the block ends."""
+    if MARK_BEGIN not in text:
+        return None
+    start = text.index(MARK_BEGIN)
+    end = text.find(MARK_END, start)
+    if end < 0:
+        raise SystemExit("SpeakEasy's instruction block has a begin marker but no end marker "
+                         "after it (%s); fix or delete the block by hand" % MARK_END)
+    return start, end + len(MARK_END)
+
+
 def instruction_add(path, variant="gateway"):
     text = read(path)
     created = text is None
     if text is None:
         text = ""
-    backup(path)
     body = {"hooks": INSTRUCTION_HOOKS, "confirm": INSTRUCTION_CONFIRM}.get(variant, INSTRUCTION)
     block = MARK_BEGIN + "\n\n" + body + "\n\n" + MARK_END + "\n"
-    if MARK_BEGIN in text:
-        start = text.index(MARK_BEGIN)
-        end = text.index(MARK_END) + len(MARK_END)
-        text = text[:start] + block.rstrip("\n") + text[end:]
-        write(path, text)
+    try:
+        span = _block_span(text)
+    except SystemExit as e:
+        raise SystemExit("%s: %s" % (path, e))
+    if span:
+        start, end = span
+        new = text[:start] + block.rstrip("\n") + text[end:]
+        if new == text:
+            return "unchanged"
+        write(path, new)
         return "updated"
+    backup(path)
     if text and not text.endswith("\n"):
         text += "\n"
     if text.strip():
@@ -951,12 +1393,28 @@ def instruction_add(path, variant="gateway"):
     return "added" if not created else "created"
 
 
+def _only_our_block(text):
+    """Whether an instruction file holds nothing but SpeakEasy's block."""
+    try:
+        span = _block_span(text)
+    except SystemExit:
+        return False
+    return bool(span) and not (text[:span[0]] + text[span[1]:]).strip()
+
+
 def instruction_remove(path):
+    # An older installer could back up a file that held only SpeakEasy's
+    # block; that "backup" is not the user's original (dropped even when the
+    # file itself is gone or no longer has the block).
+    if _only_our_block(read(path + BAK) or ""):
+        os.remove(path + BAK)
     text = read(path)
     if text is None or MARK_BEGIN not in text:
         return "absent"
-    start = text.index(MARK_BEGIN)
-    end = text.index(MARK_END) + len(MARK_END)
+    try:
+        start, end = _block_span(text)
+    except SystemExit as e:
+        raise SystemExit("%s: %s" % (path, e))
     text = text[:start] + text[end:]
     text = re.sub(r"\n{3,}", "\n\n", text).strip("\n")
     if text:
@@ -1088,6 +1546,9 @@ def audit_file(path):
         "slack_mcp_servers": [],
         "mistral_connector_servers": [],
         "direct_slack_servers": [],
+        # Slack integrations that are not MCP servers (Hermes's
+        # platform_toolsets.slack): reported, never removed by --enforce
+        "other_slack_paths": [],
         "slack_tokens": [],
         "mistral_keys": [],
     }
@@ -1142,13 +1603,14 @@ def audit_file(path):
             elif "slack" in name.lower():
                 # A slack-named key that is not an MCP server entry (e.g.
                 # hermes platform_toolsets.slack): still an agent-side Slack
-                # path the gateway does not control.
+                # path SpeakEasy does not control, but not a server --enforce
+                # could remove.
                 key = [parent] if parent else []
                 if not any(
                     e["name"] == name and e["key"] == key
-                    for e in finding["direct_slack_servers"]
+                    for e in finding["other_slack_paths"]
                 ):
-                    finding["direct_slack_servers"].append({"name": name, "key": key})
+                    finding["other_slack_paths"].append({"name": name, "key": key})
     # TOML, both styles: codex [mcp_servers.<name>] tables and vibe
     # [[mcp_servers]] elements (a .env subtable is part of its server, not
     # a server of its own).
@@ -1257,15 +1719,54 @@ def _normalize_entry(name, v, key=None):
     token_env = bool(v.get("bearer_token_env_var")) or (
         isinstance(env_headers, dict) and any(str(h).lower() == "authorization" for h in env_headers)
     )
+    env = {str(k): str(x) for k, x in env.items()} if isinstance(env, dict) else {}
+    headers = headers if isinstance(headers, dict) else {}
+    if not url:
+        # A remote server reached through a local bridge (mcp-remote,
+        # mcp-proxy, …): `npx mcp-remote https://mcp.slack.com/mcp --header
+        # "Authorization: Bearer ${SLACK_TOKEN}"`, with the variable in env.
+        url, bridged = _bridged_remote(argv, env)
+        if url:
+            headers = dict(bridged, **headers)
+            token_env = token_env or any(
+                "$" in str(v) and _literal(str(v)) is None for v in bridged.values())
     return {
         "name": str(name),
         "key": list(key or []),
         "token_env": token_env,
         "argv": argv,
-        "env": {str(k): str(x) for k, x in env.items()} if isinstance(env, dict) else {},
+        "env": env,
         "url": str(url),
-        "headers": headers if isinstance(headers, dict) else {},
+        "headers": headers,
     }
+
+
+def _bridged_remote(argv, env):
+    """(url, headers) of a remote MCP server reached through a stdio bridge
+    command, or ("", {}). `${VAR}` / `$VAR` in a header value are filled in
+    from the entry's own literal env; a value that still has a variable is
+    left as is (it comes from the environment)."""
+    url = next((a for a in argv if re.match(r"^https?://", a)), "")
+    if not url:
+        return "", {}
+    headers = {}
+    for i, a in enumerate(argv):
+        value = None
+        if a == "--header" and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif a.startswith("--header="):
+            value = a[len("--header="):]
+        if not value or ":" not in value:
+            continue
+        hname, hval = value.split(":", 1)
+
+        def fill(m):
+            lit = _literal(env.get(m.group(1) or m.group(2), "")) if (m.group(1) or m.group(2)) in env else None
+            return lit if lit is not None else m.group(0)
+
+        headers[hname.strip()] = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                                        fill, hval.strip())
+    return url, headers
 
 
 def _yaml_scalar(text):
@@ -1425,6 +1926,26 @@ def _korotovsky_tokens(env):
     return kinds
 
 
+def _korotovsky_no_token_reason(env):
+    """Why a korotovsky server's env holds no usable login."""
+    keys = ("SLACK_MCP_XOXP_TOKEN", "SLACK_MCP_XOXB_TOKEN", "SLACK_MCP_XOXC_TOKEN", "SLACK_MCP_XOXD_TOKEN")
+    present = [k for k in keys if str(env.get(k) or "").strip()]
+    refs = [k for k in present if _literal(env[k]) is None]
+    if refs:
+        return ("its token comes from an environment variable (%s), not a literal "
+                "value in the config, so SpeakEasy can't copy it" % ", ".join(refs))
+    lit = {k: _literal(env[k]) for k in present}
+    if "SLACK_MCP_XOXC_TOKEN" in lit and "SLACK_MCP_XOXD_TOKEN" not in lit:
+        return "it has the browser-session token SLACK_MCP_XOXC_TOKEN but not its SLACK_MCP_XOXD_TOKEN cookie"
+    if "SLACK_MCP_XOXD_TOKEN" in lit and "SLACK_MCP_XOXC_TOKEN" not in lit:
+        return "it has the SLACK_MCP_XOXD_TOKEN cookie but not the browser-session token SLACK_MCP_XOXC_TOKEN"
+    wrong = [k for k in lit if not lit[k].startswith(k[len("SLACK_MCP_"):].split("_")[0].lower() + "-")]
+    if wrong:
+        return "%s does not hold a token of that kind (wrong prefix)" % ", ".join(wrong)
+    return ("no literal Slack token in its env (SLACK_MCP_XOXP_TOKEN, "
+            "SLACK_MCP_XOXB_TOKEN, or SLACK_MCP_XOXC_TOKEN + SLACK_MCP_XOXD_TOKEN)")
+
+
 def _fingerprint(e, transport):
     """A hash of what take-over would copy: two entries with the same
     fingerprint are the same server (the same config pasted into several
@@ -1484,7 +2005,7 @@ def _candidate(path, e):
         elif ("slack-mcp-server" in argv_text or "korotovsky" in argv_text
                 or any(k.startswith("SLACK_MCP_XOX") for k in e["env"])):
             kinds = _korotovsky_tokens(e["env"])
-            summary = "korotovsky slack-mcp-server (%s)" % (", ".join(kinds) or "no token")
+            summary = "korotovsky slack-mcp-server (%s)" % (", ".join(kinds) or "no usable login")
             if not e["argv"]:
                 reason = "it runs as a remote (HTTP/SSE) server; SpeakEasy needs its stdio command"
             elif any(re.search(r"\s", a) for a in e["argv"]):
@@ -1492,8 +2013,7 @@ def _candidate(path, e):
             elif os.path.basename(e["argv"][0]) in _PACKAGE_RUNNERS and len(e["argv"]) == 1:
                 reason = "its command is only %s, with no package to run" % e["argv"][0]
             elif not kinds:
-                reason = ("no literal Slack token in its env (SLACK_MCP_XOXP_TOKEN, "
-                          "SLACK_MCP_XOXB_TOKEN, or SLACK_MCP_XOXC_TOKEN + SLACK_MCP_XOXD_TOKEN)")
+                reason = _korotovsky_no_token_reason(e["env"])
             else:
                 reason = ""
             c = dict(base, transport="korotovsky", importable=not reason, reason=reason,
@@ -1585,27 +2105,50 @@ def _write_private(path, text):
 
 def _set_aside(path):
     """Clear a credential file the take-over replaces: a placeholder is
-    deleted, a real credential is moved to <file>.pre-takeover."""
+    deleted, a real credential is moved to <file>.pre-takeover (or
+    .pre-takeover.1, .2, … — an earlier set-aside credential is never
+    overwritten)."""
     if not os.path.exists(path):
         return None
     content = (read(path) or "").strip()
     if content in PLACEHOLDERS:
         os.remove(path)
         return "removed placeholder %s" % path
-    os.replace(path, path + ".pre-takeover")
-    os.chmod(path + ".pre-takeover", 0o600)
-    return "moved %s to %s.pre-takeover" % (path, path)
+    dest = path + ".pre-takeover"
+    n = 0
+    while os.path.exists(dest):
+        n += 1
+        dest = "%s.pre-takeover.%d" % (path, n)
+    os.replace(path, dest)
+    os.chmod(dest, 0o600)
+    return "moved %s to %s" % (path, dest)
 
 
 def _installed_server_argv(argv):
     """The command to run, with its program as an absolute path. A package
-    runner line (npx/bunx/pnpx … slack-mcp-server[@version] ARGS) becomes the
-    installed `slack-mcp-server ARGS` when one is on PATH, so SpeakEasy runs
-    the server already installed instead of downloading it."""
+    runner line (npx/bunx/pnpx … slack-mcp-server[@version] ARGS, or
+    go run …/cmd/slack-mcp-server[@version] ARGS) becomes the installed
+    `slack-mcp-server ARGS` when one is on PATH, so SpeakEasy runs the server
+    already installed instead of fetching and building it on every start."""
     runner = os.path.basename(argv[0])
     if runner in _PACKAGE_RUNNERS:
+        package = r"^slack-mcp-server(@\S*)?$"
+    elif runner == "go" and argv[1:2] == ["run"]:
+        package = r"^github\.com/korotovsky/slack-mcp-server/cmd/slack-mcp-server(@\S*)?$"
+    else:
+        package = None
+    if package:
+        skip = False
         for i, a in enumerate(argv[1:], 1):
-            if re.match(r"^slack-mcp-server(@[^\s]*)?$", a):
+            # the value of the runner's own package option is not the command
+            # (npx --package/-p X CMD, uvx --from X CMD)
+            if skip:
+                skip = False
+                continue
+            if a in ("--package", "-p", "--from"):
+                skip = True
+                continue
+            if re.match(package, a):
                 installed = shutil.which("slack-mcp-server")
                 if installed:
                     return [installed] + argv[i + 1:]
@@ -1899,8 +2442,25 @@ def _json_hooks_edit(path, add):
         data = json.loads(text) if text and text.strip() else {}
     except ValueError:
         # JSONC (comments, trailing commas): rewriting it would drop them.
+        try:
+            existing = json.loads(strip_jsonc(text)).get("hooks") or {}
+        except (ValueError, AttributeError):
+            existing = {}
+        has_ours = "--hook " in json.dumps(existing) and SERVER in json.dumps(existing)
+        if add is None:
+            if not has_ours:
+                return "absent"
+            raise SystemExit("%s has comments or is not plain JSON; SpeakEasy will not rewrite "
+                             "it. Remove SpeakEasy's hook (the entries running --hook) by hand" % path)
+        entry = {}
+        add(entry)
+        wanted = [h for groups in entry.values() for g in groups for h in (g.get("hooks") or [g])]
+        present = json.dumps(existing)
+        if wanted and all(json.dumps(h.get("command"))[1:-1] in present for h in wanted):
+            return "unchanged"  # added by hand, as asked
         raise SystemExit("%s has comments or is not plain JSON; SpeakEasy will not rewrite it. "
-                         "Add or remove its hook by hand (see README.md, \"Approval hooks\")" % path)
+                         "Add this to its \"hooks\" object by hand (merge into existing lists):\n%s"
+                         % (path, json.dumps(entry, indent=2)))
     if not isinstance(data, dict):
         raise SystemExit("%s is not a JSON object" % path)
     hooks = data.get("hooks")
@@ -1918,7 +2478,7 @@ def _json_hooks_edit(path, add):
         return "absent"
     if add is not None:
         _warn_hooks_off(path, data)
-    backup_original(path)
+        backup_original(path)
     _write_json(path, data)
     return "registered" if add is not None else "removed"
 
@@ -2371,7 +2931,8 @@ def _hermes_enabled_edit(config_path, enable):
     if not _hermes_enabled(new) == enable:
         raise SystemExit("%s: could not %s speakeasy in plugins.enabled safely; edit it by hand"
                          % (config_path, "enable" if enable else "disable"))
-    backup_original(config_path)
+    if enable:
+        backup_original(config_path)
     write(config_path, new)
     return True
 
@@ -2847,9 +3408,15 @@ def main(argv):
     if cmd == "add-json":
         style, path, gateway = args
         print("%s: %s" % (path, add_json(style, path, gateway)))
+    elif cmd == "upgrade-json":
+        style, path, gateway = args
+        print("%s: %s" % (path, upgrade_json(style, path, gateway)))
     elif cmd == "add-zed":
         path, gateway = args
         print("%s: %s" % (path, add_zed(path, gateway)))
+    elif cmd == "upgrade-zed":
+        path, gateway = args
+        print("%s: %s" % (path, upgrade_zed(path, gateway)))
     elif cmd == "add-goose":
         path, gateway = args
         print("%s: %s" % (path, add_goose(path, gateway)))
@@ -2891,6 +3458,9 @@ def main(argv):
     elif cmd == "enforce-remove":
         path, name, key = json.loads(args[0])
         enforce_remove(path, name, key)
+    elif cmd == "backup":
+        (path,) = args
+        backup(path)
     elif cmd == "hook-add":
         agent, path, bin_path, wait, state_dir = args
         print("%s: %s" % (path, hook_add(agent, path, bin_path, wait, state_dir)))

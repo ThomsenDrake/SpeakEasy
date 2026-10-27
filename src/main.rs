@@ -45,9 +45,10 @@ struct CliDecisionProvider;
 static CLI_PROMPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl DecisionProvider for CliDecisionProvider {
-    /// A terminal prompt cannot be withdrawn, so a hook's request is asked
-    /// as usual and its answer is discarded when the deadline passed or the
-    /// hook went away meanwhile (the agent was already told no).
+    /// A terminal prompt cannot be withdrawn, so the request is asked as
+    /// usual and its answer is discarded when the deadline passed or the
+    /// agent stopped waiting meanwhile (a hook that went away, or a
+    /// cancelled `tools/call`).
     fn request_decision_until(
         &self,
         request: &MessageRequest,
@@ -56,16 +57,22 @@ impl DecisionProvider for CliDecisionProvider {
     ) -> Result<Decision, ProviderError> {
         use std::sync::atomic::Ordering;
         let gone = || cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline;
+        // Wait for the terminal first: a request withdrawn while an earlier
+        // prompt held it is never shown.
+        let _guard = CLI_PROMPT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if gone() {
-            return Err(ProviderError("the hook that asked stopped waiting".into()));
+            return Err(ProviderError("the agent that asked stopped waiting".into()));
         }
-        let decision = self.request_decision(request)?;
+        let decision = self.prompt(request)?;
         if gone() {
             if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
                 let _ = writeln!(
                     tty,
-                    "That request expired before you answered; your answer was not used \
-                     (the agent was told the call was blocked)."
+                    "That request was withdrawn before you answered (the agent stopped \
+                     waiting, or no one answered in time); your answer was not used and \
+                     nothing was sent."
                 );
             }
             return Err(ProviderError("no one answered the approval request in time".into()));
@@ -77,6 +84,14 @@ impl DecisionProvider for CliDecisionProvider {
         let _guard = CLI_PROMPT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prompt(request)
+    }
+}
+
+impl CliDecisionProvider {
+    /// Show one request on the terminal and read the answer (the caller
+    /// holds `CLI_PROMPT_LOCK`).
+    fn prompt(&self, request: &MessageRequest) -> Result<Decision, ProviderError> {
         let r = &request.incoming;
         let mut tty_w = std::fs::OpenOptions::new()
             .write(true)
@@ -133,28 +148,75 @@ impl DecisionProvider for CliDecisionProvider {
     }
 }
 
-fn build_gateway(provider: Arc<dyn DecisionProvider>, dir: &PathBuf) -> Gateway {
+/// The first line of a credential file in the state dir, if it has one.
+fn fs_token(dir: &std::path::Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    let line = text.lines().next()?.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// Build the gateway, or print why it cannot start and return `None`. The
+/// caller exits after dropping its `InstanceGuard`, so a failed start
+/// leaves no stale socket or lock behind (a stale socket would look like a
+/// running SpeakEasy to the installer and to the agents' hooks).
+fn build_gateway(provider: Arc<dyn DecisionProvider>, dir: &PathBuf) -> Option<Gateway> {
     let slack = match slack::build_client(dir) {
         Ok(c) => c,
         Err(e) => {
+            // Help for the transport in use, then the error itself last, so
+            // the end of gateway.log (which the installer shows) names it.
+            use slack::SlackTransport as T;
+            let d = dir.display();
+            match slack::resolve_transport(dir) {
+                Ok(T::MistralConnector) => {
+                    eprintln!("Mistral Slack Connector transport: set MISTRAL_API_KEY, or create {d}/mistral_api_key");
+                    eprintln!("(chmod 600), and connect the Slack workspace to the Slack connector in the");
+                    eprintln!("Mistral console.");
+                }
+                // A login is there (the "no Slack token" error comes before
+                // the server is even looked up): the server itself failed.
+                Ok(T::Korotovsky) if !e.0.starts_with("no Slack token") => {
+                    eprintln!("Korotovsky Slack MCP transport: the Slack MCP server did not start (see below).");
+                    eprintln!("Check that it is installed ({d}/slack_stdio_command, or slack-mcp-server on");
+                    eprintln!("PATH) and that its login works: the token file, or {d}/slack_stdio_env");
+                    eprintln!("(a browser-session login expires; if you took it over, sign in again there");
+                    eprintln!("and re-run scripts/install.sh --take-over FILE:NAME).");
+                }
+                Ok(T::Korotovsky) => {
+                    eprintln!("Korotovsky Slack MCP transport: set SLACK_BOT_TOKEN (xoxb-…) or SLACK_USER_TOKEN");
+                    eprintln!("(xoxp-…), or create {d}/slack_bot_token / slack_user_token (chmod 600),");
+                    eprintln!("or take over an agent's server with scripts/install.sh --take-over — see README.md.");
+                    if dir.join("slack_stdio_env").exists() {
+                        eprintln!("({d}/slack_stdio_env holds no usable login: it needs SLACK_MCP_XOXP_TOKEN or");
+                        eprintln!("SLACK_MCP_XOXB_TOKEN, or both SLACK_MCP_XOXC_TOKEN and SLACK_MCP_XOXD_TOKEN.)");
+                    }
+                }
+                Ok(T::HooksOnly) => {}
+                Ok(T::SlackMcp)
+                    if fs_token(dir, "slack_mcp_token")
+                        .is_some_and(|t| !t.starts_with("xoxp-placeholder-")) =>
+                {
+                    eprintln!("Slack MCP transport: SpeakEasy has a token ({d}/slack_mcp_token), but the");
+                    eprintln!("connection failed (see below): a revoked or expired token, or no network.");
+                    eprintln!("If you took it over from an agent, sign in again there and re-run");
+                    eprintln!("scripts/install.sh --take-over FILE:NAME; or run scripts/slack_mcp_oauth.py.");
+                }
+                Ok(T::SlackMcp) | Err(_) => {
+                    eprintln!("Slack MCP transport: set SLACK_MCP_TOKEN, or create {d}/slack_mcp_token (chmod 600)");
+                    eprintln!("with a Slack user OAuth token (run scripts/slack_mcp_oauth.py to get one; it needs");
+                    eprintln!("the chat:write, users:read and channels:read scopes). With no Slack login at all,");
+                    eprintln!("run scripts/install.sh --transport hooks-only.");
+                }
+            }
             eprintln!("slack-approval-gateway: cannot initialize Slack client: {}", e.0);
-            eprintln!("Slack MCP transport (default): set SLACK_MCP_TOKEN, or create {}/slack_mcp_token (chmod 600)", dir.display());
-            eprintln!("with a Slack user OAuth token (run scripts/slack_mcp_oauth.py to get one;");
-            eprintln!("it needs the chat:write, users:read and channels:read scopes).");
-            eprintln!("Mistral Slack Connector transport (SLACK_TRANSPORT=mistral-connector): set MISTRAL_API_KEY,");
-            eprintln!("or create {}/mistral_api_key (chmod 600), and connect the Slack workspace to the", dir.display());
-            eprintln!("Slack connector in the Mistral console.");
-            eprintln!("Korotovsky Slack MCP transport (SLACK_TRANSPORT=korotovsky): set SLACK_BOT_TOKEN (xoxb-…)");
-            eprintln!("or SLACK_USER_TOKEN (xoxp-…), or create {}/slack_bot_token / slack_user_token", dir.display());
-            eprintln!("(chmod 600) — see README.md.");
-            std::process::exit(1);
+            return None;
         }
     };
     match Gateway::new(slack, provider, dir.clone()) {
-        Ok(g) => g,
+        Ok(g) => Some(g),
         Err(e) => {
             eprintln!("slack-approval-gateway: cannot initialize state in {}: {e}", dir.display());
-            std::process::exit(1);
+            None
         }
     }
 }
@@ -364,8 +426,12 @@ fn main() {
     if cli_mode {
         // Headless: be the instance, answer decisions on the terminal, and
         // still serve the socket so bridged agents reach this instance.
-        let (_guard, listener) = become_instance(&dir);
-        let gateway = Arc::new(build_gateway(Arc::new(CliDecisionProvider), &dir));
+        let (guard, listener) = become_instance(&dir);
+        let Some(gateway) = build_gateway(Arc::new(CliDecisionProvider), &dir) else {
+            drop(guard);
+            std::process::exit(1);
+        };
+        let gateway = Arc::new(gateway);
         instance::serve_connections(Arc::clone(&gateway), listener);
         serve_mcp(Arc::clone(&gateway));
         // stdin reached EOF; let any approved send finish and be recorded
@@ -390,7 +456,7 @@ fn main() {
 
     // Become the single instance (a service manager passes --serve and
     // starts us with no agent on stdio).
-    let (_guard, listener) = match instance::acquire(&dir) {
+    let (guard, listener) = match instance::acquire(&dir) {
         Ok(x) => x,
         Err(instance::AcquireError::AlreadyRunning) => {
             // Lost the startup race: another process just became the
@@ -417,7 +483,11 @@ fn main() {
     // every other agent's bridge.
     let ui_state = Arc::new(ui::UiState::new());
     let provider = Arc::new(ui::GuiDecisionProvider::new(Arc::clone(&ui_state)));
-    let gateway = Arc::new(build_gateway(provider, &dir));
+    let Some(gateway) = build_gateway(provider, &dir) else {
+        drop(guard);
+        std::process::exit(1);
+    };
+    let gateway = Arc::new(gateway);
     ui_state.set_gateway(Arc::clone(&gateway));
     instance::serve_connections(Arc::clone(&gateway), listener);
     if !serve_mode {
