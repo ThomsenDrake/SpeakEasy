@@ -76,14 +76,34 @@ hooks](#approval-hooks) for the agents this works with.
 
 ## Install
 
-SpeakEasy builds from source and installs as a login service. Its binary,
-MCP server, and state folder keep an older name, `slack-approval-gateway`.
+SpeakEasy installs as a login service, from a release download or from
+source. Its binary, MCP server, and state folder keep an older name,
+`slack-approval-gateway`.
 
-**Requirements:** macOS with the Xcode Command Line Tools
-(`xcode-select --install`), Rust (stable, via [rustup](https://rustup.rs)),
-and Python 3.
+**Requirements:** macOS 11 or later and Python 3 (macOS offers to install
+the Xcode Command Line Tools, which include it, the first time you run
+`python3`). To build from source you also need the Command Line Tools
+(`xcode-select --install`) and Rust (stable, via
+[rustup](https://rustup.rs)).
 
-### 1. Get the code
+### 1. Get SpeakEasy
+
+Download the latest release, a universal binary for Apple silicon and Intel
+Macs, with the installer:
+
+```sh
+curl -fsSL https://github.com/ThomsenDrake/SpeakEasy/releases/latest/download/speakeasy-macos-universal.tar.gz | tar -xz
+cd speakeasy-macos-universal
+```
+
+The installer then installs the binary in `bin/` and never builds. The
+binary is not notarized by Apple: if you download the archive with a
+browser instead of `curl`, the installer clears the quarantine flag on the
+copy it installs, so Gatekeeper doesn't stop the login service. Each
+release also has a `.sha256` file to check the download with
+`shasum -a 256 -c`.
+
+Or build from source:
 
 ```sh
 git clone https://github.com/ThomsenDrake/SpeakEasy.git
@@ -209,7 +229,7 @@ block their own Slack writes, since there is no SpeakEasy to ask. Use
 | `--hook-wait SECS` | How long a hooked Slack call waits for you before it's blocked. Default 600 (10 minutes), from 60 to 86400. |
 | `--enforce` | Also remove token-based Slack MCP servers from agent configs. See [Security](#what-the-installers-audit-reports). |
 | `--dry-run` | Show what would change, and change nothing. It doesn't build, so it needs an existing `target/release` binary: run `cargo build --release` first. |
-| `--skip-build` | Use the existing `target/release` binary. |
+| `--skip-build` | Use the existing `target/release` binary. (A release download always uses its prebuilt `bin/` binary.) |
 | `--uninstall [--purge]` | See [Uninstall](#uninstall). |
 
 #### If there's nothing to take over
@@ -977,6 +997,28 @@ SLACK_GATEWAY_DEMO_SEED=single ./target/debug/slack-approval-gateway --demo
 | `scripts/install.sh`, `scripts/agent_config.py` | The installer and its agent-config editor |
 | `scripts/slack_mcp_oauth.py` | The OAuth helper for the Slack MCP token |
 | `tests/`, `scripts/smoke_test.py`, `scripts/mock_korotovsky.py` | Tests and mocks |
+| `.github/workflows/release.yml`, `scripts/third_party_licenses.py` | The release build (see below) and the license file it ships |
 
 [`docs/SPEC.md`](docs/SPEC.md) is the original design spec and module
 contract.
+
+### Making a release
+
+Set the new version in `Cargo.toml` (and run `cargo build` so `Cargo.lock`
+follows), commit, then tag that commit and push the tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The Release workflow (`.github/workflows/release.yml`) checks that the tag
+matches `Cargo.toml`, runs the tests, builds a universal binary
+(`lipo` of the arm64 and x86_64 builds, ad-hoc signed), and publishes
+`speakeasy-macos-universal.tar.gz` and its `.sha256` as a GitHub release
+with generated notes; a version with a `-` (`0.2.0-rc.1`) is a
+prerelease. The archive holds the binary in `bin/`, the installer scripts,
+README, NOTICE, and `THIRD_PARTY_LICENSES.md`
+(`scripts/third_party_licenses.py`: the licenses of the crates compiled
+into the binary). Running the workflow by hand (Actions → Release → Run
+workflow) does the same build without publishing and keeps the archive as
+a workflow artifact.

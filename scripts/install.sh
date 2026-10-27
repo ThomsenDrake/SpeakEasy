@@ -68,7 +68,8 @@
 #                 dir kept); exits 1 and lists what it could not remove
 #   --purge       with --uninstall: also delete the state dir (cooldowns,
 #                 sent records, token file)
-#   --skip-build  reuse the existing target/release binary
+#   --skip-build  reuse the existing target/release binary (a release
+#                 download installs its prebuilt bin/ binary and never builds)
 #   --slack-mcp-token  Slack user OAuth token (xoxp-...) for the official
 #                 Slack MCP server. Stored only in
 #                 <state-dir>/slack_mcp_token (chmod 600). With --transport
@@ -633,16 +634,26 @@ fi
 hr
 say "1. Build"
 hr
+# A release download carries the prebuilt binary in bin/ and no sources:
+# it is installed as is, never built.
+PREBUILT="$ROOT/bin/$BIN_NAME"
+RELEASE=0
+if [ -x "$PREBUILT" ] && [ ! -f "$ROOT/Cargo.toml" ]; then
+  RELEASE=1
+fi
 # cargo is only required when a build actually runs: not for --uninstall
-# (which exits above), not for --skip-build, not for --dry-run.
-if [ "$SKIP_BUILD" = 0 ] && [ "$DRY_RUN" = 0 ]; then
+# (which exits above), not for --skip-build or a release download, not for
+# --dry-run.
+if [ "$RELEASE" = 0 ] && [ "$SKIP_BUILD" = 0 ] && [ "$DRY_RUN" = 0 ]; then
   if ! command -v cargo >/dev/null 2>&1; then
     say "missing required tool: cargo (needed to build; or pass --skip-build" >&2
     say "to reuse the existing release binary)" >&2
     exit 1
   fi
 fi
-if [ "$SKIP_BUILD" = 1 ]; then
+if [ "$RELEASE" = 1 ]; then
+  say "  using this release's prebuilt binary: $PREBUILT"
+elif [ "$SKIP_BUILD" = 1 ]; then
   say "  skipping build (--skip-build)"
 else
   if [ "$DRY_RUN" = 0 ]; then
@@ -653,6 +664,7 @@ else
   fi
 fi
 BINARY="$ROOT/target/release/$BIN_NAME"
+if [ "$RELEASE" = 1 ]; then BINARY="$PREBUILT"; fi
 if [ ! -x "$BINARY" ]; then
   say "release binary missing: $BINARY (run without --skip-build)" >&2
   exit 1
@@ -666,6 +678,12 @@ say "2. Install binary"
 hr
 run mkdir -p "$HOME_DIR/.local/bin"
 run install -m 0755 "$BINARY" "$INSTALL_BIN"
+# A browser download is quarantined, and Gatekeeper would stop the login
+# service (and every hook) from running this unsigned binary: you chose to
+# install it, so the installed copy is not quarantined.
+if [ "$DRY_RUN" = 0 ]; then
+  xattr -d com.apple.quarantine "$INSTALL_BIN" 2>/dev/null || true
+fi
 say "  installed: $INSTALL_BIN"
 
 # --------------------------------------------------------------------------- #

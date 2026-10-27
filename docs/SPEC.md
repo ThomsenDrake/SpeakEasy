@@ -925,6 +925,22 @@ sends real messages.
   from the JSON/TOML configs it can edit and keeps the expected ones, and
   the installer suggests it only while such servers remain;
   `--dry-run` changes nothing, including under `--enforce`.
+- Releases: pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`
+  (macOS runner): the tag must equal `Cargo.toml`'s version; `cargo test`,
+  `scripts/test_agent_config.py`, `scripts/smoke_test.py` and `bash -n
+  scripts/install.sh` must pass; the aarch64 and x86_64 release builds
+  (`MACOSX_DEPLOYMENT_TARGET=11.0`) are combined with `lipo`, ad-hoc
+  signed, and checked (a non-Slack `--hook claude` call answers the OK
+  code). `speakeasy-macos-universal.tar.gz` holds
+  `speakeasy-macos-universal/{bin/slack-approval-gateway, scripts/
+  {install.sh, agent_config.py, slack_mcp_oauth.py}, README.md, NOTICE.md,
+  THIRD_PARTY_LICENSES.md, VERSION}`; it and its `.sha256` are published
+  with `gh release create --generate-notes` (`--prerelease` for a version
+  with a `-`; a re-run replaces the assets). A manual run (workflow_dispatch)
+  builds the same archive as a workflow artifact and publishes nothing.
+  `install.sh` run from such an archive (a `bin/` binary and no
+  `Cargo.toml` next to `scripts/`) installs that binary and never builds,
+  and clears `com.apple.quarantine` on the installed copy.
 - First builds compile eframe/wgpu and take several minutes; that's
   expected.
 - `cargo build` / `cargo build --release` must succeed with zero errors.

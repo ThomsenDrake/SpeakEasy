@@ -938,6 +938,15 @@ unguarded = [l.strip() for l in sh.splitlines()
              and "|| " not in l and "SERVICE_PATH_XML" not in l]
 check("install.sh: no piped command substitution that set -e/pipefail could end silently",
       not unguarded, unguarded)
+check("install.sh: a release download installs its prebuilt bin/ binary and never builds",
+      'PREBUILT="$ROOT/bin/$BIN_NAME"' in sh and '[ ! -f "$ROOT/Cargo.toml" ]' in sh
+      and 'if [ "$RELEASE" = 1 ]; then BINARY="$PREBUILT"; fi' in sh)
+check("install.sh: the installed binary is not quarantined",
+      'xattr -d com.apple.quarantine "$INSTALL_BIN"' in sh)
+wf = open(os.path.join(ROOT, ".github", "workflows", "release.yml")).read()
+check("release workflow: ships what a release install needs",
+      all(x in wf for x in ('"$pkg/bin/"', "scripts/install.sh scripts/agent_config.py scripts/slack_mcp_oauth.py",
+                             "THIRD_PARTY_LICENSES.md", "NOTICE.md")))
 check("install.sh: enforce reports removed/absent/failed via enforce-remove",
       'ac enforce-remove "$line"' in sh and "[removed] {path}" not in sh)
 
