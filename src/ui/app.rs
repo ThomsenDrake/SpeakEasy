@@ -617,7 +617,7 @@ impl ApprovalApp {
         // first responder in a native (non-webview) window.
         let about = AboutMetadataBuilder::new()
             .name(Some(APP_TITLE))
-            .version(Some("0.1.0"))
+            .version(Some(env!("CARGO_PKG_VERSION")))
             .build();
         let app_menu = match Submenu::with_items(
             APP_TITLE,
