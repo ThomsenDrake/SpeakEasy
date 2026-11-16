@@ -167,10 +167,16 @@ highlighted: Enter still approves and Space scrolls. If a request is
 withdrawn while you are typing feedback for it or have one of its buttons
 selected, Enter and Escape do nothing on the request that replaces it until
 you press Escape or Tab, or click in the window. That key or click does
-nothing else, and the keys work again one second later. A click on Approve,
-Deny or Submit feedback does nothing in the first half second after a
-request appears, the window comes up, a new request brings it to the front,
-or such a key or click gives the keys back.
+nothing else, and the keys work again one second later. If you type in the
+window while no text field is selected, SpeakEasy takes it that you were
+typing in another app: Enter and Escape do nothing until you press Tab,
+click in the window, or switch away and back. A click on Approve, Deny or
+Submit feedback does nothing in the first half second after a request
+appears, the window comes up, a new request brings it to the front, or such
+a key or click gives the keys back. After a request is withdrawn, your first
+click in the window does nothing either, since the next request's buttons
+may be where you meant to click. A click that does nothing leaves the
+highlighted button or the feedback field as it was.
 
 All your agents share one SpeakEasy. Requests from every agent queue in the
 same window, and the header shows how many are waiting.

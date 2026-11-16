@@ -355,6 +355,9 @@ impl ApprovalApp {
         // the context freely.
         let mut events = std::mem::take(&mut self.events);
         let mut focus = std::mem::take(&mut self.focus);
+        // The focus before this pass's click: a click that is ignored gives
+        // it back.
+        let focus_before = focus.state();
         // The tab order is the DOM order of the controls painted (and enabled)
         // this frame — e.g. the feedback textarea and submit button only exist
         // while the feedback panel is open, and the disabled submit button is
@@ -482,6 +485,7 @@ impl ApprovalApp {
         };
 
         // ---- Events -------------------------------------------------------
+        let mut click_ignored = false;
         for ev in events.drain(..) {
             let (decision, button) = match ev {
                 AppEvent::Approve => (Decision::Approve, FocusId::Approve),
@@ -495,10 +499,13 @@ impl ApprovalApp {
                     continue;
                 }
             };
-            // An ignored click (aimed at what was there before) leaves no
-            // focus behind on the button it landed on.
+            // An ignored click (aimed at what was there before) changes no
+            // focus: it leaves none behind on the button it landed on, and
+            // takes none away (a button focused with the keyboard keeps its
+            // ring and its Enter; the textarea keeps the keys).
             if !self.decide_click(&ctx, decision) && focus.focused == Some(button) {
-                focus.blur();
+                focus.restore(focus_before);
+                click_ignored = true;
             }
         }
 
@@ -542,6 +549,13 @@ impl ApprovalApp {
         self.focus = focus;
         self.feedback_text = fb_text;
         self.hover_repaint_until = hover_until;
+        if click_ignored {
+            // egui's too (the click took it off the button, or off the
+            // textarea it was pressed outside of).
+            self.sync_egui_focus(&ctx);
+        }
+        // Where this pass leaves egui's focus (`adopt_egui_focus`).
+        self.egui_focus_after_pass = ctx.memory(|m| m.focused());
     }
 
     /// Lay out the title segments for painting, building the per-segment

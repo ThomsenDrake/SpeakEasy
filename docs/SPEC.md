@@ -628,15 +628,16 @@ transport with typed Rust calls):
   input or key press other than Enter/Escape/Tab (typing re-arms), new
   requests brought the window forward (`sync_queue` → `reveal`, stamped as
   `revealed_at`; the user's own Dock or menu-bar reveal is not), and the
-  user re-established an orphaned focus (below). Only a fresh press acts: a
-  key-repeat (a key seen down already, or one the OS flags as a repeat,
-  recorded by an `NSEvent` local key-down monitor because egui-winit drops
-  the flag: `sys::monitor_shortcut_key_downs`), a key that went down before
-  arming, and a key the OS reports down when the window gets the focus
-  (`sys::shortcut_keys_down`) do nothing. A press is known only to have
-  gone down after the previous input batch was taken, so it counts as
-  armed only when that batch was taken at or after arming; the app asks
-  for a frame at each arming time (`schedule_arming`,
+  user re-established the focus (`refocused_at`: after an orphaned focus,
+  stray typing, or a withdrawal of the front card; below). Only a fresh
+  press acts: a key-repeat (a key seen down already, or one the OS flags
+  as a repeat, recorded by an `NSEvent` local key-down monitor because
+  egui-winit drops the flag: `sys::monitor_shortcut_key_downs`), a key
+  that went down before arming, and a key the OS reports down when the
+  window gets the focus (`sys::shortcut_keys_down`) do nothing. A press is
+  known only to have gone down after the previous input batch was taken,
+  so it counts as armed only when that batch was taken at or after arming;
+  the app asks for a frame at each arming time (`schedule_arming`,
   `request_repaint_after`) so that such a batch exists. Neither key decides
   with an empty queue, a hidden window, or a decision being submitted. In
   the feedback textarea Enter types a newline and Escape only leaves the
@@ -647,7 +648,12 @@ transport with typed Rust calls):
   on the control egui's focus is on, which VoiceOver and Full Keyboard
   Access move (AccessKit focus requests, also read in event order within a
   batch); with egui's focus on any other widget, Enter and Escape do
-  nothing. `track_current` clears egui's focus with the tracker's, since
+  nothing. egui's own arrow-key focus navigation (a plain arrow in the
+  textarea before the TextEdit locks the arrows: in the batch that gave it
+  the focus, or the one after a click in it) is not followed: a move of
+  egui's focus after the app's pass (`egui_focus_after_pass`) to anything
+  but the tracker's control is undone (`adopt_egui_focus`).
+  `track_current` clears egui's focus with the tracker's, since
   the controls keep their ids from card to card. `ApprovalApp::extract_keys`
   reads the keys in event order, so a Tab earlier in the same input batch
   moves the focus that later keys are judged against. A card that takes the
@@ -660,7 +666,17 @@ transport with typed Rust calls):
   window, or a fresh plain Escape. That key or press decides nothing itself
   (a click on a decision button is ignored) and restarts both arming delays
   (`refocused_at`). This outlives a window focus loss and ends when the
-  queue empties; a decision by the user never orphans the focus. In one
+  queue empties; a decision by the user never orphans the focus. Text
+  typed while no text field has the focus (text, paste or IME input that
+  is not only whitespace, or a letter, digit, punctuation, Backspace or
+  Delete key without Cmd/Ctrl: `shortcuts::is_text`,
+  `shortcuts::is_typing_key`) was meant for another app, and so may the
+  keys after it be (`stray_typing`): they are held back the same way until
+  Tab/Shift+Tab or a primary press in the window (not an Escape, which may
+  be meant for the other app too), which decides nothing itself and
+  restarts both arming delays. This ends when the window loses the focus
+  or the queue empties. Typing while the focus is orphaned counts as meant
+  for the field that vanished, not as stray. In one
   input batch, every Enter/Escape/Space press after a queued decision or
   button activation, or after a primary pointer press or release, is judged
   as not armed (it can still type in or leave the textarea); Enter or Space
@@ -670,12 +686,20 @@ transport with typed Rust calls):
 - Clicks on Approve, Deny and Submit feedback decide only when pressed
   `CLICK_ARM` (0.5 s) after the latest of: the request became the front
   card, the window came on screen, focused or not, new requests brought the
-  window forward, and the user re-established an orphaned focus
+  window forward, and the user re-established the focus (an orphaned focus,
+  stray typing, or the first press after a withdrawal, below)
   (`shortcuts::click_armed`). As for keys, the press counts from the
-  previous input batch. A click aimed at a card that was just withdrawn, at
-  the app the window appeared over or came in front of, or at a control that
-  vanished with its card, decides nothing, and leaves no focus on the button
-  it landed on.
+  previous input batch. After the front card is withdrawn (not decided by
+  the user), the next primary press in the window decides nothing and
+  restarts both arming delays (`orphaned_clicks`), however late it comes:
+  the next card's controls lie where the withdrawn card's were, and the
+  user may not have seen the swap. This outlives a window focus loss and
+  an empty queue. A click aimed at a card that was just withdrawn, at the
+  app the window appeared over or came in front of, or at a control that
+  vanished with its card, decides nothing and changes no focus: it leaves
+  none on the button it landed on, and a control focused before it (a
+  button focused with the keyboard, the textarea) keeps the focus, egui's
+  too.
 - Closing the window only **hides** it (egui `CloseRequested` → hide); the
   gateway process keeps serving MCP for every agent. Quitting happens only
   via **Quit SpeakEasy** in the tray menu or the app menu (⌘Q)
@@ -695,7 +719,7 @@ transport with typed Rust calls):
 |---|---|
 | `app.rs` | eframe app: window lifecycle (720×780 default, min 520×560, centered, initially hidden), tray menu, keyboard/focus model, decision dispatch, reduced-motion handling |
 | `app/paint.rs` | frame layout + painting (fixed header / scrolling main / fixed footer), scrollbar |
-| `app/shortcuts.rs` | the keyboard decision gate (Enter/Escape shortcuts, Enter/Space on a button focused with the keyboard): arming delay (and its restarts), typing re-arm, key-repeat and pre-arm presses, focused textarea/buttons, orphaned focus; the click arming delay |
+| `app/shortcuts.rs` | the keyboard decision gate (Enter/Escape shortcuts, Enter/Space on a button focused with the keyboard): arming delay (and its restarts), typing re-arm, key-repeat and pre-arm presses, focused textarea/buttons, orphaned focus, stray typing; the click arming delay |
 | `components.rs` | Once UI-style controls: `Tag`, `Button`, `Textarea`, section labels, selectable text |
 | `theme.rs` | light/dark palettes + responsive metrics (rem root 15px ≤768px viewport, else 16px) |
 | `text.rs` | SF Pro / SF Mono installation + CSS-exact `TextSpec`s (size, weight, line-height, letter-spacing) |

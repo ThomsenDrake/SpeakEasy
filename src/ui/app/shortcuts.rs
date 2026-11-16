@@ -10,26 +10,32 @@
 //! can therefore decide (or activate a button) only [`ARM_DELAY`] after the
 //! latest of: the request became the front card, the window got the focus,
 //! the user last typed, a new request brought the window forward, and the
-//! user re-established an orphaned focus (see below). Only a fresh press
-//! acts: the key went down after arming, so not a key-repeat (the OS flag,
-//! or a key seen down already) and not a key that was already down when
-//! the window got the focus. A press is known only to have gone down after
-//! the previous input batch was taken, so it counts as armed only when
-//! that batch was taken after arming; the app asks for a frame at the
-//! arming time so that such a batch exists. The gate itself is the pure
+//! user re-established the focus after it was lost (see below). Only a
+//! fresh press acts: the key went down after arming, so not a key-repeat
+//! (the OS flag, or a key seen down already) and not a key that was already
+//! down when the window got the focus. A press is known only to have gone
+//! down after the previous input batch was taken, so it counts as armed
+//! only when that batch was taken after arming; the app asks for a frame at
+//! the arming time so that such a batch exists. The gate itself is the pure
 //! [`key_action`]; `ApprovalApp::extract_keys` feeds it every raw key event
 //! in order, with the focus as moved by the Tab presses before it.
 //!
-//! Three more rules keep a key on the card and control it was meant for:
+//! More rules keep a key on the card and control it was meant for:
 //! - Enter and Space act on a button only when it was focused with the
 //!   keyboard (its focus ring is visible). A button focused by a click
-//!   counts as no focus: Enter approves and Space scrolls.
+//!   counts as no focus: Enter approves and Space scrolls. egui's own
+//!   arrow-key focus navigation is undone, never followed.
 //! - When the front card is withdrawn while one of its controls has the
 //!   focus, the keys the user is pressing were meant for that control.
 //!   Until the user moves the focus again (Tab, a click, or a plain Escape,
 //!   which only does that), nothing decides or activates
 //!   ([`while_orphaned`]); the key or click that moves it decides nothing
 //!   itself and restarts both arming delays.
+//! - Text typed while no text field has the focus ([`is_text`],
+//!   [`is_typing_key`]) was meant for another app, and so may the Enter or
+//!   Escape after it be. The keys are held back the same way until Tab or
+//!   a click (an Escape may be meant for the other app too), or until the
+//!   window loses the focus.
 //! - In one input batch, a key after a queued decision or button
 //!   activation, or after a click, is judged as not armed: the focus and
 //!   the controls it would act on change only in the logic and paint
@@ -38,7 +44,10 @@
 //! Clicks on the decision buttons have their own, shorter delay
 //! ([`click_armed`]): a click that was aimed at the card before this one,
 //! or at another app the window just appeared over or came in front of,
-//! decides nothing.
+//! decides nothing. After the front card is withdrawn, the first press in
+//! the window decides nothing, however late it comes: the next card's
+//! controls lie where the withdrawn card's were. A click that decides
+//! nothing changes no focus.
 
 use std::collections::HashMap;
 
@@ -86,9 +95,9 @@ pub(crate) enum KeyAction {
 /// Enter, Escape and Tab: an Enter or Escape meant for the feedback field
 /// of a card that was replaced must not decide the new one) and
 /// `restarted_at` (a new request brought the window forward, or the user
-/// re-established an orphaned focus). `None` (never) with no card, while
-/// the window is hidden or unfocused, or while a decision is being
-/// submitted.
+/// re-established the focus: `ApprovalApp::refocus`). `None` (never) with
+/// no card, while the window is hidden or unfocused, or while a decision is
+/// being submitted.
 pub(crate) fn armed_at(
     front_since: Option<f64>,
     focused_since: Option<f64>,
@@ -153,9 +162,10 @@ pub(crate) fn key_action(
     }
 }
 
-/// What a key does while the focus is orphaned: the front card was
+/// What a key does while the focus is orphaned (the front card was
 /// withdrawn while one of its controls had the focus, and the user has not
-/// moved the focus since. Nothing decides and no button activates; Enter in
+/// moved the focus since), or after stray typing (text typed while no text
+/// field had the focus). Nothing decides and no button activates; Enter in
 /// a textarea, Escape leaving it, and Space scrolling are left as they are.
 pub(crate) fn while_orphaned(action: KeyAction) -> KeyAction {
     match action {
@@ -167,13 +177,43 @@ pub(crate) fn while_orphaned(action: KeyAction) -> KeyAction {
     }
 }
 
+/// Whether typed (pasted, or IME) `text` is text: anything but whitespace.
+/// A space alone is no sign of typing meant for another app: Space scrolls
+/// the card and presses a button focused with the keyboard.
+pub(crate) fn is_text(text: &str) -> bool {
+    !text.chars().all(char::is_whitespace)
+}
+
+/// Whether `key` types or deletes text: a letter, digit or punctuation
+/// key, Backspace or Delete, without Cmd or Ctrl (with them it is a
+/// shortcut: Cmd+C copies the selected message text).
+pub(crate) fn is_typing_key(key: Key, modifiers: Modifiers) -> bool {
+    use Key::*;
+    if modifiers.command || modifiers.mac_cmd || modifiers.ctrl {
+        return false;
+    }
+    matches!(
+        key,
+        Backspace | Delete
+            // Punctuation.
+            | Colon | Comma | Backslash | Slash | Pipe | Questionmark | Exclamationmark
+            | OpenBracket | CloseBracket | OpenCurlyBracket | CloseCurlyBracket | Backtick
+            | Minus | Period | Plus | Equals | Semicolon | Quote
+            // Digits.
+            | Num0 | Num1 | Num2 | Num3 | Num4 | Num5 | Num6 | Num7 | Num8 | Num9
+            // Letters.
+            | A | B | C | D | E | F | G | H | I | J | K | L | M
+            | N | O | P | Q | R | S | T | U | V | W | X | Y | Z
+    )
+}
+
 /// Seconds after the card became the front card, after the window came on
 /// screen, and after a new request brought the window forward or the user
-/// re-established an orphaned focus, before a click on Approve, Deny or
-/// Submit feedback decides it. A click pressed sooner was aimed at what was
-/// there before: the card that was just withdrawn or decided, the app the
-/// window appeared over, or the control that vanished with the card. No one
-/// reads a request and clicks in this time.
+/// re-established the focus (`ApprovalApp::refocus`), before a click on
+/// Approve, Deny or Submit feedback decides it. A click pressed sooner was
+/// aimed at what was there before: the card that was just withdrawn or
+/// decided, the app the window appeared over, or the control that vanished
+/// with the card. No one reads a request and clicks in this time.
 pub(crate) const CLICK_ARM: f64 = 0.5;
 
 /// When clicks arm for the front card: [`CLICK_ARM`] after the latest of
@@ -948,20 +988,26 @@ mod tests {
         let ctx = Context::default();
         // Armed at t=2...
         pass(&ctx, &mut app, 1.0, true, vec![]);
-        // ...but text typed at t=3 re-arms the keys at t=4.
+        open_feedback(&ctx, &mut app, 1.1, "");
+        focus_textarea(&ctx, &mut app);
+        // ...but text typed in the feedback field at t=3, and IME input at
+        // t=3.1, re-arm the keys at t=4.1. Escape leaves the field; the
+        // Enter and Escape after it do nothing yet.
         pass(&ctx, &mut app, 3.0, true, vec![typed("x")]);
-        pass(&ctx, &mut app, 3.5, true, tap(Key::Enter));
-        pass(&ctx, &mut app, 3.6, true, tap(Key::Escape));
-        assert!(undecided(&rx));
-        // So do IME input and any other key press (an arrow key here):
-        // armed again at t=4.9.
         pass(
             &ctx,
             &mut app,
-            3.8,
+            3.1,
             true,
             vec![Event::Ime(ImeEvent::Commit("é".to_string()))],
         );
+        pass(&ctx, &mut app, 3.2, true, tap(Key::Escape));
+        assert_eq!(app.focus.focused, None);
+        pass(&ctx, &mut app, 3.5, true, tap(Key::Enter));
+        pass(&ctx, &mut app, 3.6, true, tap(Key::Escape));
+        assert!(undecided(&rx));
+        // So does any other key press (an arrow key here, scrolling):
+        // armed again at t=4.9.
         pass(&ctx, &mut app, 3.9, true, tap(Key::ArrowDown));
         pass(&ctx, &mut app, 4.5, true, tap(Key::Enter));
         assert!(undecided(&rx));
@@ -1974,14 +2020,26 @@ mod tests {
     // egui's focus (assistive technologies).
     // -----------------------------------------------------------------------
 
+    /// VoiceOver (or Full Keyboard Access) moves the focus to the widget
+    /// `id`: an AccessKit focus request.
+    fn focus_request(id: egui::Id) -> Event {
+        Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::Focus,
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node: id.accesskit_id(),
+            data: None,
+        })
+    }
+
     #[test]
     fn enter_acts_on_the_button_an_assistive_technology_focused() {
-        // VoiceOver puts egui's focus on Deny (the app's tracker had none):
-        // Enter presses Deny, it does not approve.
+        // VoiceOver puts egui's focus on Deny (the app's tracker had none);
+        // a later Enter presses Deny, it does not approve.
         let (mut app, rx) = app_with_request();
         let ctx = Context::default();
         pass(&ctx, &mut app, 1.0, true, vec![]);
-        ctx.memory_mut(|m| m.request_focus(button_id(FocusId::Deny)));
+        pass(&ctx, &mut app, 1.5, true, vec![focus_request(button_id(FocusId::Deny))]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(button_id(FocusId::Deny)));
         pass(&ctx, &mut app, 2.5, true, tap(Key::Enter));
         assert!(denied(&rx), "Enter on the Deny VoiceOver focused must not approve");
 
@@ -1990,33 +2048,39 @@ mod tests {
         let (mut app, rx) = app_with_request();
         let ctx = Context::default();
         pass(&ctx, &mut app, 1.0, true, vec![]);
-        let focus_deny = Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-            action: egui::accesskit::Action::Focus,
-            target_tree: egui::accesskit::TreeId::ROOT,
-            target_node: button_id(FocusId::Deny).accesskit_id(),
-            data: None,
-        });
         pass(
             &ctx,
             &mut app,
             2.5,
             true,
-            [vec![focus_deny], tap(Key::Enter)].concat(),
+            [vec![focus_request(button_id(FocusId::Deny))], tap(Key::Enter)].concat(),
         );
         assert!(denied(&rx), "Enter on the Deny VoiceOver focused must not approve");
     }
 
     #[test]
     fn enter_and_escape_do_nothing_with_egui_focus_on_another_widget() {
-        // egui's focus is on a widget that is none of the controls (here
-        // the feedback well's click area).
-        for k in [Key::Enter, Key::Escape] {
+        // An assistive technology puts egui's focus on a widget that is
+        // none of the controls (here the feedback well's click area), in
+        // the batch of the key or in one before it.
+        for (k, same_batch) in [
+            (Key::Enter, true),
+            (Key::Escape, true),
+            (Key::Enter, false),
+            (Key::Escape, false),
+        ] {
             let (mut app, rx) = app_with_request();
             let ctx = Context::default();
             pass(&ctx, &mut app, 1.0, true, vec![]);
             open_feedback(&ctx, &mut app, 1.1, "");
-            ctx.memory_mut(|m| m.request_focus(app.ta_id.with("click")));
-            pass(&ctx, &mut app, 2.5, true, tap(k));
+            let focus_well = focus_request(app.ta_id.with("click"));
+            if same_batch {
+                pass(&ctx, &mut app, 2.5, true, [vec![focus_well], tap(k)].concat());
+            } else {
+                pass(&ctx, &mut app, 1.5, true, vec![focus_well]);
+                assert_eq!(ctx.memory(|m| m.focused()), Some(app.ta_id.with("click")));
+                pass(&ctx, &mut app, 2.5, true, tap(k));
+            }
             assert!(undecided(&rx), "{k:?} must do nothing there");
             assert_eq!(app.focus.focused, None);
             // Tab takes the focus back to the card's controls.
@@ -2104,5 +2168,346 @@ mod tests {
         let input = frame_input(&ctx, &mut app, 2.0, true, vec![], &[], &[]);
         run(&ctx, &mut app, input);
         assert_eq!(app.wake_at, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Typing with no text field focused was meant for another app.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn text_and_typing_keys() {
+        assert!(is_text("ll take a look"));
+        assert!(is_text("é"));
+        assert!(!is_text(" "));
+        assert!(!is_text("\u{a0}"));
+        assert!(!is_text(""));
+        for key in [Key::A, Key::Z, Key::Num5, Key::Period, Key::Quote, Key::Backspace, Key::Delete] {
+            assert!(is_typing_key(key, PLAIN), "{key:?}");
+            assert!(is_typing_key(key, Modifiers::SHIFT), "Shift+{key:?}");
+            assert!(is_typing_key(key, Modifiers::ALT), "Option+{key:?}");
+            assert!(!is_typing_key(key, Modifiers::MAC_CMD | Modifiers::COMMAND), "Cmd+{key:?}");
+            assert!(!is_typing_key(key, Modifiers::CTRL), "Ctrl+{key:?}");
+        }
+        for key in [
+            Key::Enter,
+            Key::Escape,
+            Key::Tab,
+            Key::Space,
+            Key::ArrowDown,
+            Key::Home,
+            Key::PageDown,
+            Key::F5,
+        ] {
+            assert!(!is_typing_key(key, PLAIN), "{key:?}");
+        }
+    }
+
+    /// The user is typing a reply in another app when request "b" arrives
+    /// and the window takes the focus at t=5 (in front of "a"): the rest of
+    /// the sentence lands in the window, where no field has the focus.
+    fn typing_meant_for_another_app() -> (Context, ApprovalApp, Reply) {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, false, vec![]);
+        idle_until(&ctx, &mut app, 5.0);
+        let _rx_b = enqueue(&app.state, "b");
+        pass(&ctx, &mut app, 5.0, true, vec![Event::WindowFocused(true)]);
+        for (t, text) in [(5.1, "ll"), (5.2, " take"), (5.3, " a"), (5.4, " look")] {
+            pass(&ctx, &mut app, t, true, [vec![press(Key::L)], vec![typed(text)]].concat());
+        }
+        assert!(app.stray_typing);
+        (ctx, app, rx)
+    }
+
+    #[test]
+    fn enter_or_escape_after_typing_meant_for_another_app_never_decides() {
+        let (ctx, mut app, rx) = typing_meant_for_another_app();
+        // The user re-reads the reply and presses Enter to send it, well
+        // after the keys would have armed (t=6.4); then Escape (to close a
+        // popup there), and Enter again.
+        pass(&ctx, &mut app, 6.6, true, tap(Key::Enter));
+        assert!(undecided(&rx), "Enter meant for the other app must not approve");
+        pass(&ctx, &mut app, 7.0, true, tap(Key::Escape));
+        assert!(undecided(&rx), "Escape meant for the other app must not deny");
+        assert!(app.stray_typing, "an Escape may be meant for the other app too");
+        pass(&ctx, &mut app, 8.5, true, tap(Key::Enter));
+        assert!(undecided(&rx));
+        assert_eq!(app.queue.len(), 2);
+    }
+
+    #[test]
+    fn a_click_or_tab_gives_the_keys_back_after_typing_meant_for_another_app() {
+        // A click in the window (on the card's text): the keys arm again a
+        // second later.
+        let (ctx, mut app, rx) = typing_meant_for_another_app();
+        let body = app.main_rect.left_top() + vec2(30.0, 30.0);
+        pass(&ctx, &mut app, 6.6, true, click_at(body));
+        assert!(!app.stray_typing);
+        pass(&ctx, &mut app, 7.0, true, tap(Key::Enter));
+        assert!(undecided(&rx), "the keys arm again only a second later");
+        pass(&ctx, &mut app, 7.7, true, tap(Key::Enter));
+        assert!(approved(&rx));
+
+        // Tab (to Give feedback) and Shift+Tab (back to nothing focused):
+        // Enter approves a second after the Tab.
+        let (ctx, mut app, rx) = typing_meant_for_another_app();
+        pass(&ctx, &mut app, 6.6, true, vec![tab()]);
+        assert!(!app.stray_typing);
+        pass(&ctx, &mut app, 6.7, true, vec![shift_tab()]);
+        assert_eq!(app.focus.focused, None);
+        pass(&ctx, &mut app, 7.2, true, tap(Key::Enter));
+        assert!(undecided(&rx), "the keys arm again only a second later");
+        pass(&ctx, &mut app, 7.7, true, tap(Key::Enter));
+        assert!(approved(&rx));
+    }
+
+    #[test]
+    fn a_click_that_ends_typing_meant_for_another_app_decides_nothing() {
+        let (ctx, mut app, rx) = typing_meant_for_another_app();
+        let approve = button_center(&ctx, FocusId::Approve);
+        pass(&ctx, &mut app, 6.6, true, click_at(approve));
+        assert!(undecided(&rx), "the click that gives the keys back must not approve");
+        pass(&ctx, &mut app, 7.2, true, click_at(approve));
+        assert!(approved(&rx));
+    }
+
+    #[test]
+    fn leaving_the_window_ends_typing_meant_for_another_app() {
+        // The user goes back to the other app, then comes back on purpose:
+        // the keys arm a second after the window gets the focus again.
+        let (ctx, mut app, rx) = typing_meant_for_another_app();
+        pass(&ctx, &mut app, 6.0, false, vec![Event::WindowFocused(false)]);
+        assert!(!app.stray_typing);
+        pass(&ctx, &mut app, 9.0, true, vec![Event::WindowFocused(true)]);
+        pass(&ctx, &mut app, 9.5, true, tap(Key::Enter));
+        assert!(undecided(&rx));
+        pass(&ctx, &mut app, 10.1, true, tap(Key::Enter));
+        assert!(approved(&rx));
+    }
+
+    #[test]
+    fn deleting_with_no_field_focused_holds_the_keys_back_too() {
+        // Backspace and Delete (no text event) meant for the other app.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 3.0, true, tap(Key::Backspace));
+        assert!(app.stray_typing);
+        pass(&ctx, &mut app, 4.5, true, tap(Key::Enter));
+        assert!(undecided(&rx));
+        // Cmd+C (copy the selected message text) is no typing.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(
+            &ctx,
+            &mut app,
+            3.0,
+            true,
+            vec![key(Key::C, true, Modifiers::MAC_CMD | Modifiers::COMMAND)],
+        );
+        assert!(!app.stray_typing);
+        pass(&ctx, &mut app, 4.1, true, tap(Key::Enter));
+        assert!(approved(&rx));
+    }
+
+    #[test]
+    fn a_button_focused_with_tab_activates_nothing_after_typing_meant_for_another_app() {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab(), tab()]);
+        assert_eq!(app.focus.key_target(), Some(FocusId::Deny));
+        pass(&ctx, &mut app, 2.0, true, vec![typed("ok")]);
+        pass(&ctx, &mut app, 3.5, true, space());
+        pass(&ctx, &mut app, 3.7, true, tap(Key::Enter));
+        assert!(undecided(&rx), "a key after stray typing must not press Deny");
+    }
+
+    // -----------------------------------------------------------------------
+    // The first press after the front card is withdrawn decides nothing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_click_back_into_a_withdrawn_cards_field_never_decides_the_next() {
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        // A's feedback field has text; the user leaves the field (nothing
+        // focused) and switches to another app.
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        open_feedback(&ctx, &mut app, 1.1, "");
+        focus_textarea(&ctx, &mut app);
+        pass(&ctx, &mut app, 1.5, true, vec![typed("Too long")]);
+        pass(&ctx, &mut app, 2.0, true, tap(Key::Escape));
+        assert_eq!(app.focus.focused, None);
+        let well = ctx.read_response(app.ta_id.with("click")).unwrap().rect;
+        pass(&ctx, &mut app, 3.0, false, vec![Event::WindowFocused(false)]);
+        // A is withdrawn at t=10; B, with no panel, takes the front: its
+        // Approve lies in the field's place.
+        idle_until(&ctx, &mut app, 10.0);
+        assert!(app.state.withdraw("a"));
+        pass(&ctx, &mut app, 10.0, false, vec![]);
+        assert!(!app.orphaned_focus);
+        // (Where B's Approve is painted, as of the frame after.)
+        pass(&ctx, &mut app, 10.1, false, vec![]);
+        let approve = ctx.read_response(button_id(FocusId::Approve)).unwrap().rect;
+        let target = approve.intersect(well).center();
+        assert!(well.contains(target) && approve.contains(target));
+        // At t=30 the user clicks into "the field" (the window is still
+        // inactive: macOS passes the click on).
+        pass(&ctx, &mut app, 30.0, false, click_at(target));
+        assert!(undecided(&rx[1]), "a click aimed at A's field must not approve B");
+        assert_eq!(app.focus.focused, None);
+        // Then a deliberate click approves B.
+        pass(&ctx, &mut app, 30.6, true, click_at(approve.center()));
+        assert!(approved(&rx[1]));
+    }
+
+    #[test]
+    fn the_first_press_after_a_withdrawal_decides_nothing_however_late() {
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        let deny = button_center(&ctx, FocusId::Deny);
+        idle_until(&ctx, &mut app, 2.0);
+        assert!(app.state.withdraw("a"));
+        pass(&ctx, &mut app, 2.0, true, vec![]);
+        // Tab and Escape give no click back.
+        pass(&ctx, &mut app, 3.0, true, vec![tab(), shift_tab()]);
+        pass(&ctx, &mut app, 20.0, true, click_at(deny));
+        assert!(undecided(&rx[1]), "the first click after a withdrawal must not deny B");
+        pass(&ctx, &mut app, 20.6, true, click_at(deny));
+        assert!(denied(&rx[1]));
+    }
+
+    #[test]
+    fn a_decision_by_the_user_holds_no_click_back() {
+        // A decided by a key: B's first click (once armed) decides.
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        let approve = button_center(&ctx, FocusId::Approve);
+        pass(&ctx, &mut app, 2.5, true, tap(Key::Escape));
+        assert!(denied(&rx[0]));
+        assert!(!app.orphaned_clicks);
+        pass(&ctx, &mut app, 3.1, true, click_at(approve));
+        assert!(approved(&rx[1]));
+    }
+
+    // -----------------------------------------------------------------------
+    // An ignored click changes no focus.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_ignored_click_on_a_button_focused_with_the_keyboard_keeps_its_focus() {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab(), tab()]);
+        assert_eq!(app.focus.key_target(), Some(FocusId::Deny));
+        let deny = button_center(&ctx, FocusId::Deny);
+        // Request "c" arrives behind A at t=5 (clicks held until t=5.5);
+        // the user clicks the highlighted Deny at t=5.2: ignored.
+        idle_until(&ctx, &mut app, 5.0);
+        let _rx_c = enqueue(&app.state, "c");
+        pass(&ctx, &mut app, 5.0, true, vec![]);
+        pass(&ctx, &mut app, 5.2, true, click_at(deny));
+        assert!(undecided(&rx));
+        // Deny keeps the keyboard focus (and its ring), egui's too.
+        assert_eq!(app.focus.key_target(), Some(FocusId::Deny));
+        assert!(app.focus.ring_visible(FocusId::Deny));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(button_id(FocusId::Deny)));
+        // Enter presses that Deny: it never approves.
+        pass(&ctx, &mut app, 6.3, true, tap(Key::Enter));
+        assert!(denied(&rx), "Enter on the focused Deny must not approve");
+    }
+
+    #[test]
+    fn an_ignored_click_leaves_a_button_focused_by_a_click_as_no_focus_for_the_keys() {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        // A click on Give feedback (no ring: no focus for the keys).
+        let give = button_center(&ctx, FocusId::GiveFeedback);
+        pass(&ctx, &mut app, 2.6, true, click_at(give));
+        pass(&ctx, &mut app, 2.7, true, vec![]);
+        assert!(app.feedback_open);
+        assert_eq!(app.focus.state(), (Some(FocusId::GiveFeedback), false));
+        // (Where Approve is with the panel open.)
+        pass(&ctx, &mut app, 2.8, true, vec![]);
+        let approve = button_center(&ctx, FocusId::Approve);
+        // An ignored click on Approve gives that focus back, no more.
+        idle_until(&ctx, &mut app, 5.0);
+        let _rx_c = enqueue(&app.state, "c");
+        pass(&ctx, &mut app, 5.0, true, vec![]);
+        pass(&ctx, &mut app, 5.2, true, click_at(approve));
+        assert!(undecided(&rx));
+        pass(&ctx, &mut app, 5.3, true, vec![]);
+        assert_eq!(app.focus.state(), (Some(FocusId::GiveFeedback), false));
+        assert_eq!(app.focus.key_target(), None);
+        assert_eq!(ctx.memory(|m| m.focused()), None);
+    }
+
+    #[test]
+    fn an_ignored_click_leaves_the_textarea_focused() {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        open_feedback(&ctx, &mut app, 1.1, "");
+        focus_textarea(&ctx, &mut app);
+        pass(&ctx, &mut app, 1.2, true, vec![typed("Shorter")]);
+        let approve = button_center(&ctx, FocusId::Approve);
+        idle_until(&ctx, &mut app, 5.0);
+        let _rx_c = enqueue(&app.state, "c");
+        pass(&ctx, &mut app, 5.0, true, vec![]);
+        pass(&ctx, &mut app, 5.2, true, click_at(approve));
+        assert!(undecided(&rx));
+        assert_eq!(app.focus.focused, Some(FocusId::Textarea));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(app.ta_id));
+        // Enter still types a new line in the field.
+        pass(&ctx, &mut app, 6.3, true, tap(Key::Enter));
+        assert!(undecided(&rx));
+        assert_eq!(app.feedback_text, "Shorter\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // egui's arrow-key focus navigation.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_arrow_in_the_batch_that_tabs_into_the_textarea_keeps_the_keys_there() {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        // With text, Submit feedback lies below the field.
+        open_feedback(&ctx, &mut app, 1.1, "Hello");
+        pass(&ctx, &mut app, 2.5, true, [vec![tab()], tap(Key::ArrowDown)].concat());
+        pass(&ctx, &mut app, 2.6, true, vec![]);
+        assert_eq!(app.focus.focused, Some(FocusId::Textarea));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(app.ta_id));
+        // Enter types a new line: it does not submit the feedback.
+        pass(&ctx, &mut app, 4.0, true, tap(Key::Enter));
+        assert!(undecided(&rx), "Enter in the field must not submit");
+        assert!(app.feedback_text.contains('\n'));
+    }
+
+    #[test]
+    fn an_arrow_right_after_a_click_in_the_textarea_keeps_the_keys_there() {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        let field = panel_open_nothing_focused(&ctx, &mut app);
+        pass(&ctx, &mut app, 2.5, true, click_at(field));
+        pass(&ctx, &mut app, 2.51, true, tap(Key::ArrowDown));
+        // Held down: more arrows, each in its own batch.
+        for t in [2.52, 2.53] {
+            pass(&ctx, &mut app, t, true, tap(Key::ArrowDown));
+        }
+        pass(&ctx, &mut app, 2.6, true, vec![]);
+        assert_eq!(app.focus.focused, Some(FocusId::Textarea));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(app.ta_id));
+        // Enter types a new line: it does not approve.
+        pass(&ctx, &mut app, 4.0, true, tap(Key::Enter));
+        assert!(undecided(&rx), "Enter in the field must not approve");
+        assert_eq!(app.feedback_text, "\n");
     }
 }

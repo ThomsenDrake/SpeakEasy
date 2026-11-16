@@ -310,6 +310,21 @@ impl FocusTracker {
         self.space_down = None;
     }
 
+    /// The focused control and whether the keyboard focused it (to give
+    /// back with [`FocusTracker::restore`]).
+    pub fn state(&self) -> (Option<FocusId>, bool) {
+        (self.focused, self.keyboard)
+    }
+
+    /// Give back a focus saved with [`FocusTracker::state`].
+    pub fn restore(&mut self, (focused, keyboard): (Option<FocusId>, bool)) {
+        match focused {
+            Some(id) => self.focus(id, keyboard),
+            None => self.blur(),
+        }
+        self.keyboard = keyboard;
+    }
+
     /// Move focus to the next/previous control (Tab / Shift+Tab), following
     /// the browser's sequential focus navigation: disabled controls are not
     /// in `order` (they are skipped), and tabbing past either boundary moves
@@ -400,7 +415,8 @@ impl<'a> Ctx<'a> {
             // A click focuses without the ring, and the keys do not act on
             // a button focused that way (`FocusTracker::key_target`). The
             // keys follow egui's focus, which only the keyboard (or an
-            // assistive technology) puts on a button: take it off.
+            // assistive technology) puts on a button: take it off. (The app
+            // undoes egui's own arrow-key navigation: `adopt_egui_focus`.)
             self.focus.focus(id, false);
             response.surrender_focus();
         }
