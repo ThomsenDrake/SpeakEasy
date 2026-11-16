@@ -678,7 +678,7 @@ payload on stdin. The mode:
    the program `path(input)`; each string of a call's input is checked on
    its own. Programs are checked after undoing `\u`/`\x` escapes that spell
    a name and joins of same-quote literals (`'a' + 'b'`), and names are read
-   with the text of strings, regular expressions and comments set aside; a
+   with the text of strings, regular expressions (and their flags) and comments set aside; a
    quote or regular expression still open at the end of its line (not a
    string continued with `\`) was misread and counts as code. A quoted key made of name characters
    (`tools.notion["notion-search"]`, Executor's spelling of hyphenated
@@ -692,7 +692,17 @@ payload on stdin. The mode:
    its tool's name: one that writes gates, one that reads passes, and one
    that says neither (`tools.mistral.slack`) gates unless it is declared
    (its uses are judged instead) or only looked at (`Object.keys(…)`,
-   `!…`, `typeof …`). Also gating: a computed tool name (`tools…[name]`,
+   `!…`, `typeof …`). A computed key that is a variable only ever holding
+   constant names stands for each of them (`async function g(tool) {
+   …tools.granola[tool](…)… }` called only as `g("get_meetings")` is
+   `tools.granola.get_meetings`): every place in the program that gives a
+   variable of that name a value — a declaration or assignment, `for (… of
+   ["a", "b"])`, an element callback (`["a", "b"].map((t) => …)`), or the
+   calls of the named function it is a parameter of, which is only ever
+   called directly — gives a constant name or another such variable; a
+   pattern, `catch`, a changed value (`t += x`), a function passed on,
+   `arguments`, `with` or a global property of that name leaves it
+   computed. Also gating: any other computed tool name (`tools…[name]`,
    `globalThis[…]`, `window[…]`, `this[…]`; not `[0]`); a call or value of `eval` or a `Function`
    constructor, or a constructor taken (not `.constructor.name` or a
    comparison); a function named for a Slack write that the program calls
