@@ -156,9 +156,12 @@ menu-bar icon.
 
 On the keyboard, Enter approves and Escape denies, the same as clicking.
 They work only after the request has been in the focused window for one
-second, so a key you were pressing in another app when the window came up
-does nothing; in the feedback field, Enter adds a line and Escape leaves the
-field.
+second, and one second after you last typed. So a key you were pressing in
+another app when the window came up does nothing, and neither does a key you
+meant for a request that was just replaced. In the feedback field, Enter
+adds a line and Escape leaves the field. Press Tab to move between the
+buttons; Enter or Space then presses the highlighted button, with the same
+waiting time.
 
 All your agents share one SpeakEasy. Requests from every agent queue in the
 same window, and the header shows how many are waiting.

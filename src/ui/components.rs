@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use epaint::{text::Galley, ColorMode, PathShape, PathStroke};
 use egui::{
-    pos2, vec2, Color32, Context, Frame, Id, Key, Label, Painter, Pos2, Rect, Response, Role,
-    Sense, Shape, StrokeKind, Ui, Vec2, WidgetInfo, WidgetText,
+    pos2, vec2, Color32, Context, Frame, Id, Label, Painter, Pos2, Rect, Response, Role, Sense,
+    Shape, StrokeKind, Ui, Vec2, WidgetInfo, WidgetText,
 };
 
 use crate::ui::anim::CubicBezier;
@@ -253,7 +253,8 @@ pub enum FocusId {
 
 /// Focus tracker implementing the browser's focus model: Tab/Shift+Tab move
 /// focus (and show the ring), clicking focuses without the ring, Enter/Space
-/// activate.
+/// activate (the app reads those keys in order and gates them; see
+/// `ApprovalApp::extract_keys`).
 #[derive(Default)]
 pub struct FocusTracker {
     /// Controls in DOM order, rebuilt each frame.
@@ -261,7 +262,8 @@ pub struct FocusTracker {
     pub focused: Option<FocusId>,
     /// True when the focus came from the keyboard (`:focus-visible`).
     pub keyboard: bool,
-    /// A button on which Space is currently held.
+    /// A button on which Space went down (gated); it activates when Space
+    /// is released while it still has the focus. Any focus change drops it.
     pub space_down: Option<FocusId>,
 }
 
@@ -282,6 +284,9 @@ impl FocusTracker {
     }
 
     pub fn focus(&mut self, id: FocusId, keyboard: bool) {
+        if self.focused != Some(id) {
+            self.space_down = None;
+        }
         self.focused = Some(id);
         self.keyboard = keyboard;
     }
@@ -289,6 +294,7 @@ impl FocusTracker {
     pub fn blur(&mut self) {
         self.focused = None;
         self.keyboard = false;
+        self.space_down = None;
     }
 
     /// Move focus to the next/previous control (Tab / Shift+Tab), following
@@ -337,6 +343,7 @@ impl FocusTracker {
             None => {
                 self.focused = None;
                 self.keyboard = true;
+                self.space_down = None;
             }
         }
     }
@@ -696,7 +703,10 @@ pub enum ButtonVariant {
 /// A Once UI Button (size s): height space-32 (30px at root 15), padding-x
 /// space-8 (7.5), gap space-4 (3.75), radius-s (18.75), icon icon-xs (15)
 /// + gap + label (`font-label font-s font-strong`, 12.375/600/15).
-/// Returns true when activated (click, or Enter/Space while focused).
+///
+/// Returns true when clicked. Enter/Space on the focused button are the
+/// app's: it reads them in event order and gates them like the decision
+/// shortcuts (`ApprovalApp::extract_keys`), so they never reach the button.
 pub fn button(
     c: &mut Ctx,
     id: Id,
@@ -797,29 +807,10 @@ pub fn button(
         stroke_focus_ring(&painter, rect, c.m.radius_s, pal.focus_ring, c.ppp());
     }
 
-    // Activate on click / Enter / Space (Space activates on release, like a
-    // native button). `clicked_by(Primary)` excludes egui's synthetic
-    // keyboard "click", which we handle explicitly below.
-    let mut activated = response.clicked_by(egui::PointerButton::Primary);
-    if c.focus.is_focused(focus_id) && !disabled {
-        let input = c.ctx().input(|i| {
-            (
-                i.key_pressed(Key::Enter),
-                i.key_pressed(Key::Space),
-                i.key_released(Key::Space),
-            )
-        });
-        if input.0 {
-            activated = true;
-        }
-        if input.1 {
-            c.focus.space_down = Some(focus_id);
-        }
-        if input.2 && c.focus.space_down == Some(focus_id) {
-            activated = true;
-            c.focus.space_down = None;
-        }
-    }
+    // Activate on click. `clicked_by(Primary)` excludes egui's synthetic
+    // keyboard "click": the keyboard activation (Enter, or Space released on
+    // the button) is the app's (see the doc comment).
+    let activated = response.clicked_by(egui::PointerButton::Primary);
 
     // Accessibility: expose the button.
     response.widget_info(|| WidgetInfo::labeled(Role::Button, !disabled, label));

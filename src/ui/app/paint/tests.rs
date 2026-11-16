@@ -519,6 +519,7 @@ fn a_click_pressed_on_a_withdrawn_card_does_not_decide_the_next() {
         };
         let mut out = ctx.run_ui(input, |ui| {
             app.track_press(ui.ctx());
+            app.track_current(ui.ctx());
             if decide {
                 app.decide(ui.ctx(), Decision::Approve);
             }

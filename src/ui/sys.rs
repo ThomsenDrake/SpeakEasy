@@ -7,7 +7,8 @@
 //!   reference's `toLocaleTimeString()` renders for the "received" line;
 //! - the "reduce motion" accessibility preference (CFPreferences), plus an
 //!   env override for testing;
-//! - the Dock-reopen observer (NSNotificationCenter).
+//! - the Dock-reopen observer (NSNotificationCenter);
+//! - which of the keyboard shortcut keys are down (CGEventSourceKeyState).
 //!
 //! Non-macOS builds get stubs; the tray icon and the clipboard bridge are
 //! macOS-only in this app.
@@ -209,6 +210,36 @@ mod imp {
         })
     }
 
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+    }
+
+    /// The keyboard shortcut keys (Enter, Escape, Space) that are down right
+    /// now, in the combined state of all hardware keyboards
+    /// (`kCGEventSourceStateHIDSystemState`). A key the OS does not report as
+    /// down is not listed.
+    pub fn shortcut_keys_down() -> Vec<egui::Key> {
+        const HID_SYSTEM_STATE: i32 = 1;
+        // Virtual key codes (HIToolbox `Events.h`): kVK_Return,
+        // kVK_ANSI_KeypadEnter, kVK_Escape, kVK_Space.
+        const KEYS: [(u16, egui::Key); 4] = [
+            (36, egui::Key::Enter),
+            (76, egui::Key::Enter),
+            (53, egui::Key::Escape),
+            (49, egui::Key::Space),
+        ];
+        let mut down = Vec::new();
+        for (code, key) in KEYS {
+            // SAFETY: a pure query of the keyboard state; any key code is
+            // valid input.
+            if unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, code) } && !down.contains(&key) {
+                down.push(key);
+            }
+        }
+        down
+    }
+
     /// Fallback (only if CFDateFormatter fails, which should not happen).
     fn fallback_time_medium(unix_secs: u64) -> String {
         let secs = unix_secs % 86_400;
@@ -256,6 +287,12 @@ mod imp {
     /// the app's own visibility flag.
     pub fn window_on_screen() -> bool {
         true
+    }
+
+    /// Non-macOS: the keyboard state is not queried (no key is reported
+    /// down).
+    pub fn shortcut_keys_down() -> Vec<egui::Key> {
+        Vec::new()
     }
 
     pub struct DockReopenObserver;

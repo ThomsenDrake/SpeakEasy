@@ -623,12 +623,20 @@ transport with typed Rust calls):
   fail and the agent is told nothing was sent."
 - Keyboard (`app/shortcuts.rs`): plain Enter approves and plain Escape
   denies the front request through the same `decide` path as the buttons.
-  They arm only after the request has been the front card, with the window
-  on screen and focused, for `ARM_DELAY` (1 s); a key-repeat, or a key that
-  went down before arming, does nothing. Neither key decides with an empty
+  They arm only `ARM_DELAY` (1 s) after the latest of: the request became
+  the front card, the window (on screen) got the focus, and the last text
+  input or key press other than Enter/Escape/Tab (typing re-arms). Only a
+  fresh press acts: a key-repeat, a key that went down before arming, and a
+  key the OS reports down when the window gets the focus
+  (`sys::shortcut_keys_down`) do nothing. Neither key decides with an empty
   queue, a hidden window, or a decision being submitted. In the feedback
-  textarea Enter types a newline and Escape only leaves the field; a button
-  focused with Tab keeps Enter (Escape still denies).
+  textarea Enter types a newline and Escape only leaves the field. A button
+  focused with Tab is activated by Enter, or by Space on release, gated the
+  same way (Escape still denies). `ApprovalApp::extract_keys` reads the keys
+  in event order, so a Tab earlier in the same input batch moves the focus
+  that later keys are judged against. A card that takes the front in a pass
+  (a key decided the one before it) is tracked before anything can decide
+  it, and a click pressed no later than that pass is ignored.
 - Closing the window only **hides** it (egui `CloseRequested` → hide); the
   gateway process keeps serving MCP for every agent. Quitting happens only
   via **Quit SpeakEasy** in the tray menu or the app menu (⌘Q)
@@ -648,14 +656,14 @@ transport with typed Rust calls):
 |---|---|
 | `app.rs` | eframe app: window lifecycle (720×780 default, min 520×560, centered, initially hidden), tray menu, keyboard/focus model, decision dispatch, reduced-motion handling |
 | `app/paint.rs` | frame layout + painting (fixed header / scrolling main / fixed footer), scrollbar |
-| `app/shortcuts.rs` | the Enter/Escape shortcut gate: arming delay, key-repeat and pre-arm presses, focused textarea/buttons |
+| `app/shortcuts.rs` | the keyboard decision gate (Enter/Escape shortcuts, Enter/Space on a focused button): arming delay, typing re-arm, key-repeat and pre-arm presses, focused textarea/buttons |
 | `components.rs` | Once UI-style controls: `Tag`, `Button`, `Textarea`, section labels, selectable text |
 | `theme.rs` | light/dark palettes + responsive metrics (rem root 15px ≤768px viewport, else 16px) |
 | `text.rs` | SF Pro / SF Mono installation + CSS-exact `TextSpec`s (size, weight, line-height, letter-spacing) |
 | `anim.rs` | Motion-matched animation: spring physics (stiffness 100 / damping 10 / mass 1), cubic-bezier tweens, `TextEffect` fade-in-blur, `AnimatedNumber` |
 | `icons.rs` | Lucide SVG path parser + flattener/renderer (Slack, inbox, hash, person, chat, …) |
 | `shaders.rs` | the title reveal's gaussian blur + premultiplied text draw as small wgpu paint callbacks |
-| `sys.rs` | macOS integration: NSPasteboard copy, dock/reveal, reduced-motion + on-screen queries |
+| `sys.rs` | macOS integration: NSPasteboard copy, dock/reveal, reduced-motion, on-screen and keys-down queries |
 | `demo.rs` | `--demo` synthetic fixtures (isolated state dir, mock Slack — never sends) |
 
 ### `src/hook.rs` — pre-tool hook mode (`--hook <agent> [--wait SECS]`)
