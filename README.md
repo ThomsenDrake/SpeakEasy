@@ -542,9 +542,13 @@ agents. It honors `CODEX_HOME`,
   reason and your feedback don't reach it.
 - goose doesn't hook the tools a Code Mode program calls, and Executor's
   `execute` runs a whole program, so for those the hook reads the program.
-  It asks when the program names a Slack tool that writes, or reaches tools
-  by a computed name. A program can still hide a Slack call well enough to
-  get past it.
+  It asks when the program calls a Slack tool that writes, uses a Slack
+  app's tools in a way it can't follow, or reaches tools by a computed
+  name, and, in a program that mentions Slack, when it passes `tools`
+  around or runs a tool, an automation or an HTTP request by name. A
+  search, comment, URL or variable that only mentions Slack doesn't count
+  on its own. A program can still hide a Slack call well enough to get
+  past it.
 - Zed's built-in agent and Claude Desktop have no hooks. Zed asks before
   each MCP tool call unless you chose **Always allow** for it; in Claude
   Desktop, set the Slack connector's send tools to **Needs approval**.
@@ -680,9 +684,10 @@ and Mistral connectors, as far as each agent's hook system holds:
   `~/.slack-approval-gateway/`. An agent that can run commands as you could
   stop SpeakEasy and answer in its place.
 - The hooks gate MCP tools. Posting with `curl` and a token, a webhook, or a
-  browser isn't a Slack tool call. Claude Code's Slack plugin keeps its
-  login in Claude Code's credential store, which an agent can't read
-  through its tools without your permission.
+  browser isn't a Slack tool call, and an automation that posts later,
+  such as a Mistral workflow, may start without asking. Claude Code's
+  Slack plugin keeps its login in Claude Code's credential store, which an
+  agent can't read through its tools without your permission.
 
 Two more gaps come from agents running as your macOS user:
 

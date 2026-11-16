@@ -674,9 +674,46 @@ payload on stdin. The mode:
    Executor, recognized by its server or by "executor" in the full name
    (`executor-call`, `mcp_executor_call`), is gated through its `call`
    (by `path`) and `execute` (the program); goose's `execute_typescript`
-   likewise. Programs are checked after undoing `\u`/`\x` escapes and
-   `'a' + 'b'` joins: a Slack tool that writes, a computed tool name
-   (`tools…[…]`, `globalThis[…]`), `eval(` or `Function(` gates.
+   likewise; a `call` whose path names no Slack tool is also checked as
+   the program `path(input)`; each string of a call's input is checked on
+   its own. Programs are checked after undoing `\u`/`\x` escapes that spell
+   a name and joins of same-quote literals (`'a' + 'b'`), and names are read
+   with the text of strings, regular expressions and comments set aside; a
+   quote or regular expression still open at the end of its line (not a
+   string continued with `\`) was misread and counts as code. A quoted key made of name characters
+   (`tools.notion["notion-search"]`, Executor's spelling of hyphenated
+   tools) is a name, not a computed one. Every member chain from `tools`
+   (in goose, from a namespace such as `Slack` or `slack`), and from a
+   name declared from one, which stands for the chain it was declared from
+   (`const s = tools.mistral.slack; s.post(…)` is
+   `tools.mistral.slack.post(…)`; also destructured, annotated, `as`-cast
+   and `?? other` declarations; a name declared twice stands for Slack's
+   tools if either declaration does), is judged when it reaches a Slack app, by
+   its tool's name: one that writes gates, one that reads passes, and one
+   that says neither (`tools.mistral.slack`) gates unless it is declared
+   (its uses are judged instead) or only looked at (`Object.keys(…)`,
+   `!…`, `typeof …`). Also gating: a computed tool name (`tools…[name]`,
+   `globalThis[…]`, `window[…]`, `this[…]`; not `[0]`); a call or value of `eval` or a `Function`
+   constructor, or a constructor taken (not `.constructor.name` or a
+   comparison); a function named for a Slack write that the program calls
+   but does not declare (`slackSendMessage(`); goose's `server__tool` names
+   that do not read; korotovsky's tool names that write, anywhere; a Slack
+   Web API write method or webhook URL as a whole string
+   (`"/chat.postMessage"`, `"https://slack.com/api/chat.postMessage"`,
+   `"https://hooks.slack.com/…"`, also followed by `?`, `#` or `${`) in a
+   program that does more than read (calls a tool that does not read, or
+   `fetch`);
+   and, in a program that mentions Slack other than through a read,
+   `tools` passed on as a value (`reduce((o, k) => o[k], tools)`,
+   `{ ...tools }`), a global object taken as a value (`const root =
+   globalThis`), a declaration the check cannot read, or a dispatcher or
+   raw HTTP tool (`tools.executor.tools.call`, `call_tool`,
+   `execute_workflow`, `runNow`, `workflows.start`, `tools.http.request`,
+   goose's `invoke`; not a query such as `run_query` or `execute({ sql:
+   "…" })`, nor a raw request tool without a write verb in a program whose
+   requests are all `"GET"`). Slack in a query, a comment, a
+   URL, a variable or a helper's name (`slackResults`, `searchSlack(q)`)
+   does not gate.
 3. Builds the popup request: destination from `channel_id`/`channel`/
    `user_id`/… , the exact text from `message`/`text`/`payload`/…, a Slack
    `thread_ts`; other arguments are listed in the reason. The text is shown
