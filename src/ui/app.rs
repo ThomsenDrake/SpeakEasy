@@ -6,6 +6,7 @@
 //! integration (`eframe::App`), and the macOS desktop integration.
 
 pub mod paint;
+mod shortcuts;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,7 @@ use epaint::text::Galley;
 
 use crate::core::{Decision, MessageRequest};
 use crate::ui::anim::{AnimatedNumber, SegmentState, TextEffect};
+use crate::ui::app::shortcuts::{HeldKeys, KeyAction};
 use crate::ui::components::{self, FocusId, FocusTracker, TitleSegment};
 use crate::ui::shaders::Effects;
 use crate::ui::sys;
@@ -104,10 +106,14 @@ pub struct DemoFlags {
 }
 
 /// A key event extracted in `raw_input_hook` (so egui's own focus navigation
-/// never sees it) and processed in `App::logic`.
+/// never sees it) and processed in `App::logic` (see the Keyboard section).
 enum PendingKey {
     Tab { shift: bool },
-    Escape,
+    /// Escape in the feedback textarea: leave it (text and panel stay).
+    BlurTextarea,
+    /// Enter/Escape decided `request`, the front card when it was pressed
+    /// (applied only while that card is still in front).
+    Decide { decision: Decision, request: String },
     /// Scroll the main area by this many points (arrow keys).
     Scroll(f32),
     /// Scroll by ±one page (Space / Shift+Space, like the browser).
@@ -186,6 +192,12 @@ pub struct ApprovalApp {
     front_since: f64,
     /// Input time of the latest primary pointer press.
     pressed_at: f64,
+    /// Input time since when the window has been on screen with the
+    /// keyboard focus (`None`: hidden or unfocused). With `front_since`, it
+    /// arms the Enter/Escape shortcuts (see `shortcuts`).
+    focused_since: Option<f64>,
+    /// When Enter/Escape went down (key-repeat and pre-arm press detection).
+    held_keys: HeldKeys,
     ta_id: Id,
 
     // Animation clock. The clock only advances while the window is actually
@@ -269,6 +281,8 @@ impl ApprovalApp {
             current_id: None,
             front_since: 0.0,
             pressed_at: f64::NEG_INFINITY,
+            focused_since: None,
+            held_keys: HeldKeys::default(),
             ta_id: Id::unique("feedback"),
             clock: Instant::now(),
             frozen_now: 0.0,
@@ -898,38 +912,8 @@ impl eframe::App for ApprovalApp {
         // Per-request state reset (feedback, focus, submission state).
         self.track_current(ctx);
 
-        // Keyboard (extracted in raw_input_hook so egui's own focus
-        // navigation never sees Tab/Escape/arrows/page keys). Arrow, page and
-        // space keys scroll the main area whenever the textarea is not
-        // focused — like the browser, where buttons do not consume them.
-        let pending_keys = std::mem::take(&mut self.pending_keys);
-        for key in pending_keys {
-            match key {
-                PendingKey::Tab { shift } => {
-                    self.focus.move_focus(!shift);
-                    self.sync_egui_focus(ctx);
-                    ctx.request_repaint();
-                }
-                PendingKey::Escape => {}
-                PendingKey::Scroll(dy) => {
-                    if dy != 0.0 {
-                        self.scroll_by(ctx, dy, now);
-                    }
-                }
-                PendingKey::Page(sign) => {
-                    let page = (self.main_rect.height() - PAGE_OVERLAP).max(0.0);
-                    self.scroll_by(ctx, sign * page, now);
-                }
-                PendingKey::ScrollTo(target) => {
-                    let to = if target == f32::MAX {
-                        self.max_scroll
-                    } else {
-                        target
-                    };
-                    self.scroll_by(ctx, to - self.scroll_offset, now);
-                }
-            }
-        }
+        // Keyboard (extracted in raw_input_hook).
+        self.handle_keys(ctx, now);
 
         // The close button only hides the window (never quits the gateway,
         // never approves anything).
@@ -1029,13 +1013,62 @@ impl eframe::App for ApprovalApp {
                 }
             }
         }
-        // Extract the keys egui's own focus navigation would mishandle, and
-        // the scrolling keys the browser would deliver to the scroll
-        // container. Tab/Shift+Tab move focus; Escape is swallowed; arrows,
-        // Home/End, PageUp/PageDown and Space scroll the main area whenever
-        // the textarea is not focused (buttons do not consume them, and with
-        // nothing focused the document scrolls — exactly like the browser).
+        self.extract_keys(ctx, raw_input, sys::window_on_screen());
+    }
+
+    fn clear_color(&self, _visuals: &Visuals) -> [f32; 4] {
+        self.pal.page.to_normalized_gamma_f32()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
+
+impl ApprovalApp {
+    /// Extract the keys egui's own focus navigation would mishandle, the
+    /// scrolling keys the browser would deliver to the scroll container,
+    /// and the Enter/Escape shortcuts. Tab/Shift+Tab move focus; arrows,
+    /// Home/End, PageUp/PageDown and Space scroll the main area whenever
+    /// the textarea is not focused (buttons do not consume them, and with
+    /// nothing focused the document scrolls — exactly like the browser).
+    /// Enter and Escape go through `shortcuts::key_action`; plain Escape
+    /// never reaches egui. `on_screen`: the window is actually shown.
+    fn extract_keys(&mut self, ctx: &Context, raw_input: &mut egui::RawInput, on_screen: bool) {
+        let now = raw_input.time.unwrap_or_else(|| ctx.input(|i| i.time));
+        // The shortcuts arm from when the window (on screen) got the focus.
+        // Key-ups after a focus loss go to the other app, so held keys are
+        // forgotten then (egui does the same with its own key state).
+        let lost_focus = raw_input
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::WindowFocused(false)));
+        let window_focused = raw_input.focused && on_screen;
+        if lost_focus || !window_focused {
+            self.focused_since = None;
+            self.held_keys.clear();
+        }
+        if window_focused && self.focused_since.is_none() {
+            self.focused_since = Some(now);
+        }
+        // The front card as of the last pass; a new one is stamped
+        // (`track_current`) and arms from the next pass.
+        let front = self
+            .queue
+            .front()
+            .filter(|r| self.current_id.as_ref() == Some(&r.id))
+            .map(|r| r.id.clone());
+        let armed_at = shortcuts::armed_at(
+            front.as_ref().map(|_| self.front_since),
+            self.focused_since,
+            self.deciding,
+        );
         let ta_focused = ctx.memory(|m| m.focused()) == Some(self.ta_id);
+        let focused = if ta_focused {
+            Some(FocusId::Textarea)
+        } else {
+            self.focus.focused
+        };
         let nothing_focused = self.focus.focused.is_none();
         // Shift is allowed (Shift+Arrow / Shift+Space scroll like the plain
         // keys); Cmd/Ctrl/Alt combinations are left alone.
@@ -1044,6 +1077,46 @@ impl eframe::App for ApprovalApp {
         };
         let mut i = 0;
         while i < raw_input.events.len() {
+            if let Event::Key {
+                key: key @ (Key::Enter | Key::Escape),
+                pressed,
+                repeat,
+                modifiers,
+                ..
+            } = &raw_input.events[i]
+            {
+                let key = *key;
+                if !*pressed {
+                    self.held_keys.release(key);
+                    i += 1;
+                    continue;
+                }
+                let (held, down_at) = self.held_keys.press(key, now);
+                let action = shortcuts::key_action(
+                    key,
+                    *modifiers,
+                    *repeat || held,
+                    down_at,
+                    armed_at,
+                    focused,
+                );
+                let decide = |decision| {
+                    front.clone().map(|request| PendingKey::Decide { decision, request })
+                };
+                let pending = match action {
+                    KeyAction::PassThrough => {
+                        i += 1;
+                        continue;
+                    }
+                    KeyAction::Swallow => None,
+                    KeyAction::BlurTextarea => Some(PendingKey::BlurTextarea),
+                    KeyAction::Approve => decide(Decision::Approve),
+                    KeyAction::Deny => decide(Decision::Deny),
+                };
+                raw_input.events.remove(i);
+                self.pending_keys.extend(pending);
+                continue;
+            }
             let extract = match &raw_input.events[i] {
                 Event::Key {
                     key: Key::Tab,
@@ -1051,12 +1124,6 @@ impl eframe::App for ApprovalApp {
                     modifiers,
                     ..
                 } => !modifiers.any() || modifiers.shift_only(),
-                Event::Key {
-                    key: Key::Escape,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => !modifiers.any(),
                 Event::Key {
                     key,
                     pressed: true,
@@ -1092,7 +1159,6 @@ impl eframe::App for ApprovalApp {
                 let page = (self.main_rect.height() - PAGE_OVERLAP).max(0.0);
                 match key {
                     Key::Tab => self.pending_keys.push(PendingKey::Tab { shift: modifiers.shift }),
-                    Key::Escape => self.pending_keys.push(PendingKey::Escape),
                     Key::ArrowUp => self.pending_keys.push(PendingKey::Scroll(-LINE_STEP)),
                     Key::ArrowDown => self.pending_keys.push(PendingKey::Scroll(LINE_STEP)),
                     Key::ArrowLeft | Key::ArrowRight => {
@@ -1115,7 +1181,49 @@ impl eframe::App for ApprovalApp {
         }
     }
 
-    fn clear_color(&self, _visuals: &Visuals) -> [f32; 4] {
-        self.pal.page.to_normalized_gamma_f32()
+    /// Apply the keys `extract_keys` took out of the raw input (so egui's
+    /// own focus navigation never sees Tab/Escape/arrows/page keys). Arrow,
+    /// page and space keys scroll the main area whenever the textarea is not
+    /// focused — like the browser, where buttons do not consume them.
+    fn handle_keys(&mut self, ctx: &Context, now: f64) {
+        let pending_keys = std::mem::take(&mut self.pending_keys);
+        for key in pending_keys {
+            match key {
+                PendingKey::Tab { shift } => {
+                    self.focus.move_focus(!shift);
+                    self.sync_egui_focus(ctx);
+                    ctx.request_repaint();
+                }
+                PendingKey::BlurTextarea => {
+                    self.focus.blur();
+                    self.sync_egui_focus(ctx);
+                    ctx.request_repaint();
+                }
+                PendingKey::Decide { decision, request } => {
+                    // Never let the key decide a card that replaced the
+                    // one it was pressed on (withdrawn or decided since).
+                    if self.queue.front().is_some_and(|r| r.id == request) {
+                        self.decide(ctx, decision);
+                    }
+                }
+                PendingKey::Scroll(dy) => {
+                    if dy != 0.0 {
+                        self.scroll_by(ctx, dy, now);
+                    }
+                }
+                PendingKey::Page(sign) => {
+                    let page = (self.main_rect.height() - PAGE_OVERLAP).max(0.0);
+                    self.scroll_by(ctx, sign * page, now);
+                }
+                PendingKey::ScrollTo(target) => {
+                    let to = if target == f32::MAX {
+                        self.max_scroll
+                    } else {
+                        target
+                    };
+                    self.scroll_by(ctx, to - self.scroll_offset, now);
+                }
+            }
+        }
     }
 }

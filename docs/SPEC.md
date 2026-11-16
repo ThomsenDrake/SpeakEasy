@@ -621,6 +621,14 @@ transport with typed Rust calls):
   window hides it and never approves a message; SpeakEasy keeps running
   (menu-bar icon to reopen or quit). If SpeakEasy quits, pending requests
   fail and the agent is told nothing was sent."
+- Keyboard (`app/shortcuts.rs`): plain Enter approves and plain Escape
+  denies the front request through the same `decide` path as the buttons.
+  They arm only after the request has been the front card, with the window
+  on screen and focused, for `ARM_DELAY` (1 s); a key-repeat, or a key that
+  went down before arming, does nothing. Neither key decides with an empty
+  queue, a hidden window, or a decision being submitted. In the feedback
+  textarea Enter types a newline and Escape only leaves the field; a button
+  focused with Tab keeps Enter (Escape still denies).
 - Closing the window only **hides** it (egui `CloseRequested` → hide); the
   gateway process keeps serving MCP for every agent. Quitting happens only
   via **Quit SpeakEasy** in the tray menu or the app menu (⌘Q)
@@ -640,6 +648,7 @@ transport with typed Rust calls):
 |---|---|
 | `app.rs` | eframe app: window lifecycle (720×780 default, min 520×560, centered, initially hidden), tray menu, keyboard/focus model, decision dispatch, reduced-motion handling |
 | `app/paint.rs` | frame layout + painting (fixed header / scrolling main / fixed footer), scrollbar |
+| `app/shortcuts.rs` | the Enter/Escape shortcut gate: arming delay, key-repeat and pre-arm presses, focused textarea/buttons |
 | `components.rs` | Once UI-style controls: `Tag`, `Button`, `Textarea`, section labels, selectable text |
 | `theme.rs` | light/dark palettes + responsive metrics (rem root 15px ≤768px viewport, else 16px) |
 | `text.rs` | SF Pro / SF Mono installation + CSS-exact `TextSpec`s (size, weight, line-height, letter-spacing) |

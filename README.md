@@ -154,6 +154,12 @@ Closing the window doesn't approve or deny anything. It only hides the
 window, and the request keeps waiting. To bring it back, click SpeakEasy's
 menu-bar icon.
 
+On the keyboard, Enter approves and Escape denies, the same as clicking.
+They work only after the request has been in the focused window for one
+second, so a key you were pressing in another app when the window came up
+does nothing; in the feedback field, Enter adds a line and Escape leaves the
+field.
+
 All your agents share one SpeakEasy. Requests from every agent queue in the
 same window, and the header shows how many are waiting.
 
