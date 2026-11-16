@@ -742,10 +742,14 @@ payload on stdin. The mode:
    an element callback with at most the element and index parameters
    (`names.map((t) => …)`, `names.map(g)`) over such an array, or the calls
    of the named function it is a parameter of, which is only ever called
-   directly. A pattern, `catch`, a changed value (`t += x`), a function
-   passed on or a method, `arguments`, `with`, a global property of that
-   name, prototypes or symbols named in code or as a name in a string (for
-   arrays and objects), or a program that needs more work than a fixed
+   directly or handed to such an array's element callback. A pattern,
+   `catch`, a changed value (`t += x`), a function passed on otherwise, a
+   name no declaration reaches (a global), `arguments`, `with`, `import()`,
+   a global property of that name, prototypes, symbols or reflection named
+   in code or in a string's value (for arrays and objects), text that
+   JavaScript may read differently (a `/` after `}` or a statement's `)`, a
+   quote or regular expression left open, names or spaces outside ASCII,
+   HTML-like comments), or a program that needs more work than a fixed
    budget to read leaves the key computed. Also gating: any other computed tool name (`tools…[name]`,
    `globalThis[…]`, `window[…]`, `this[…]`; not `[0]`); a call or value of `eval` or a `Function`
    constructor, or a constructor taken (not `.constructor.name` or a
