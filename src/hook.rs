@@ -502,7 +502,7 @@ fn executor_classification(tool: &str, input: &Value) -> Classification {
                 .iter()
                 .filter_map(|c| {
                     // `tools.ws["conversations_add_message"]` names its tool too.
-                    let path = dot_constant_keys(c.get("path")?.as_str()?);
+                    let path = dot_constant_keys(c.get("path")?.as_str()?, false);
                     let last = path.rsplit('.').next().unwrap_or(&path);
                     let write = is_slack_name(&path) && is_write_tool(last);
                     write.then(|| (path, c.get("input").unwrap_or(&Value::Null)))
@@ -698,17 +698,16 @@ fn leading_name(s: &str) -> &str {
 
 /// Whether `s` ends with the word `word` (`return`, not `xreturn`).
 fn ends_with_word(s: &str, word: &str) -> bool {
-    // Not a member or private name spelled like it (`x.return`, `#of`,
-    // `flags.use-const`), but after a spread (`...typeof x`).
+    // Not a member or private name spelled like it (`x.return`, `#of`), but
+    // after a spread (`...typeof x`) or an integer's dot (`1. in x`).
     s.strip_suffix(word).is_some_and(|rest| {
         let code = rest.trim_end();
-        // `1. in x`: a number's dot.
-        let number = code.strip_suffix('.').is_some_and(|n| {
-            let digits = n.len() - n.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_').len();
-            digits > 0 && n[n.len() - digits..].starts_with(|c: char| c.is_ascii_digit())
-        });
-        !rest.ends_with(is_ident_char)
-            && (number || !(code.ends_with(['.', '#', '-']) && !code.ends_with("...") && !code.ends_with("--")))
+        let number = rest.len() > code.len()
+            && code.strip_suffix('.').is_some_and(|n| {
+                let digits = n.len() - n.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+                digits > 0 && !n[..n.len() - digits].ends_with(|c: char| is_ident_char(c) || c == '.')
+            });
+        !rest.ends_with(is_ident_char) && (number || !(code.ends_with(['.', '#']) && !code.ends_with("...")))
     })
 }
 
@@ -778,7 +777,9 @@ fn lex(code: &str) -> (String, bool) {
                         let postfix = operator && {
                             let operand = &before[..before.len() - 2];
                             let line = !operand[operand.trim_end().len()..].contains(['\n', '\r']);
-                            line && operand.trim_end().ends_with(|c: char| is_ident_char(c) || matches!(c, ')' | ']'))
+                            let after_word = VALUE_KEYWORDS.iter().any(|k| ends_with_word(operand.trim_end(), k));
+                            line && !after_word
+                                && operand.trim_end().ends_with(|c: char| is_ident_char(c) || matches!(c, ')' | ']'))
                         };
                         let value = before.is_empty()
                             || before.ends_with("...")
@@ -913,8 +914,10 @@ fn lex(code: &str) -> (String, bool) {
 /// (`tools.notion["notion-search"]` → `tools.notion.notion-search`):
 /// Executor writes hyphenated tool names this way, so such a key is a
 /// static name, not a computed one. Array literals (`= ["a"]`, `return
-/// ["a"]`) and keys with other characters (`["get post"]`) stay.
-fn dot_constant_keys(code: &str) -> String {
+/// ["a"]`) and keys with other characters (`["get post"]`) stay. With
+/// `underscores`, a key's `-` becomes `_`, so that a program's dotted names
+/// stay names.
+fn dot_constant_keys(code: &str, underscores: bool) -> String {
     // Only brackets of code: not one in a string, comment or regular expression.
     let bare = code_only(code);
     let mut out = String::with_capacity(code.len());
@@ -947,7 +950,13 @@ fn dot_constant_keys(code: &str) -> String {
                 if !out.ends_with('.') {
                     out.push('.');
                 }
-                out.push_str(name);
+                // In a program, `-` as `_` (same length): a dotted
+                // `flags.use-const` must not read as `- const`.
+                if underscores {
+                    out.push_str(&name.replace('-', "_"));
+                } else {
+                    out.push_str(name);
+                }
                 rest = after;
             }
             _ => out.push('['),
@@ -1334,7 +1343,7 @@ fn slack_write_in_code(code: &str, namespaces: bool) -> bool {
     if ["globalThis", "global", "window", "this", "self"].into_iter().any(indexes_global) {
         return true;
     }
-    let code = dot_constant_keys(&code);
+    let code = dot_constant_keys(&code, true);
     // Names are read in the code, Slack's name also in its strings.
     let (bare, misread) = lex(&code);
     let lower = code.to_ascii_lowercase();
@@ -1365,7 +1374,7 @@ fn slack_write_in_code(code: &str, namespaces: bool) -> bool {
         !after.starts_with(['.', '[']) && !(after.starts_with('=') && !after.starts_with("=="))
     };
     let mut dynamic = (namespaces && word("invoke", &called))
-        || ["globalThis", "window", "self"].iter().any(|g| word(g, &taken));
+        || ["globalThis", "window", "self"].iter().any(|g| word(g, &taken) && !binds(&bare, g));
     let mut constants = Constants::new(&code, &bare, &idents, misread);
     while let Some((at, len)) = heads.pop() {
         // A name bound from one of its own uses (`const a = b` … `const b =
@@ -1514,6 +1523,23 @@ fn inspected(code: &str, chain: &Range<usize>) -> bool {
             || ends_with_word(before, "typeof"))
 }
 
+/// Whether a program binds `name` itself: declares it, or takes it as a
+/// parameter (`(v, i, self) => …`, `function f(window) {`).
+fn binds(code: &str, name: &str) -> bool {
+    declares(code, name)
+        || code.match_indices(name).any(|(i, m)| {
+            let after = code[i + m.len()..].trim_start();
+            if code[..i].ends_with(is_ident_char) || after.starts_with(is_ident_char) {
+                return false;
+            }
+            let before = code[..i].trim_end();
+            let listed = before.ends_with(['(', ',']) && after.starts_with([',', ')']);
+            let params_end = after.find(')').map(|k| after[k + 1..].trim_start());
+            after.starts_with("=>")
+                || (listed && params_end.is_some_and(|rest| rest.starts_with("=>") || rest.starts_with('{')))
+        })
+}
+
 /// Whether a program declares `name` itself (`function postToSlack(`,
 /// `const postToSlack =`).
 fn declares(code: &str, name: &str) -> bool {
@@ -1552,7 +1578,10 @@ fn spelled_chain(
         }
         let rest = bare[end..].trim_start();
         let key = rest.strip_prefix("?.").unwrap_or(rest).trim_start();
-        let (values, close) = constants.key(bare.len() - key.len())?;
+        let (mut values, close) = constants.key(bare.len() - key.len())?;
+        // No tool is named `undefined`, `null` or by an index: such a call
+        // fails, so it spells nothing.
+        values.retain(|v| !matches!(v.as_str(), "undefined" | "null") && !v.bytes().all(|b| b.is_ascii_digit()));
         if spellings.len() * values.len() > 64 {
             return None;
         }
@@ -1851,20 +1880,61 @@ impl<'a> Constants<'a> {
                     !assigns(rest) && !COMPOUND_ASSIGNMENTS.iter().any(|op| rest.starts_with(op))
                 });
                 let declared = keyword(before).is_some() || ends_with_word(before, "function");
-                member_of(before).is_some() || (!declared && (member || after.starts_with('(')))
+                // Another object's member is another name, the global
+                // object's is the built-in (`globalThis.JSON.stringify = …`).
+                let other = member_of(before).is_some_and(|o| !GLOBAL_OBJECTS.iter().any(|g| ends_with_word(o, g)));
+                other || (!declared && (member || after.starts_with('(')))
             })
         })
     }
 
     /// Whether the program names the global object as a value (`this`,
     /// `globalThis`, `window`, `self`, `global`), not only its members.
-    fn globals(&self) -> bool {
-        GLOBAL_OBJECTS.iter().any(|g| {
-            self.idents.get(g).into_iter().flatten().any(|&i| {
+    fn globals(&mut self) -> Option<bool> {
+        let idents = self.idents;
+        'names: for g in GLOBAL_OBJECTS {
+            let places = idents.get(g).map_or(&[][..], Vec::as_slice);
+            // A program's own `window` or `self` (`(v, i, self) => …`) is not it.
+            if g != "this" {
+                for &i in places {
+                    if matches!(self.place(g, i)?, Place::Binds(..)) {
+                        continue 'names;
+                    }
+                }
+            }
+            for &i in places {
                 let after = self.bare[i + g.len()..].trim_start();
-                !after.starts_with('.') || after.starts_with("...")
-            })
-        })
+                let value = !after.starts_with('.') || after.starts_with("...");
+                // `this` in a function or a class is not the global object.
+                if value && (g != "this" || self.top_level_this(i)?) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    /// Whether `this` at `i` is outside every function (not an arrow's) and
+    /// class.
+    fn top_level_this(&mut self, i: usize) -> Option<bool> {
+        let mut at = i;
+        for _ in 0..64 {
+            let Some((open, _)) = self.around(at) else { return Some(true) };
+            if self.bare[open..].starts_with('{') {
+                if self.class_body(open)? != Some(false) {
+                    return Some(false);
+                }
+                let head = self.before(open)?;
+                if let Some((params, _)) = head.len().checked_sub(1).filter(|_| head.ends_with(')')).and_then(|k| self.around(k)) {
+                    let before = self.before(params)?;
+                    if self.function_parameters(params, before, &self.bare[open..])? != Some(false) {
+                        return Some(false);
+                    }
+                }
+            }
+            at = open;
+        }
+        Some(true)
     }
 
     /// Takes `work` from the budget; `None` once it runs out.
@@ -1955,7 +2025,7 @@ impl<'a> Constants<'a> {
         // A name no declaration reaches is the global object's, which other
         // code can set (`Object.prototype.t = …`, `Object.assign(this, …)`),
         // as may be one only a span too wide reaches.
-        if !declared || (!surely && self.globals()) {
+        if !declared || (!surely && self.globals()?) {
             return None;
         }
         if let Some(scope) = innermost {
@@ -2356,7 +2426,15 @@ impl<'a> Constants<'a> {
             Some(rest) => self.before(rest.len())?,
             None => head,
         };
-        let Some((_, close)) = self.around(start).filter(|_| head.ends_with(['(', ',', '['])) else {
+        // In arguments, a grouping or an array (not a block or a loop's head).
+        let enclosing = self.around(start).filter(|&(open, _)| {
+            matches!(self.bare.as_bytes()[open], b'(' | b'[')
+        });
+        let header = match enclosing {
+            Some((open, _)) if self.bare[open..].starts_with('(') => loop_head(self.before(open)?),
+            _ => false,
+        };
+        let Some((_, close)) = enclosing.filter(|_| head.ends_with(['(', ',', '[']) && !header) else {
             let within = self.within(start);
             return Some((within.end, false));
         };
@@ -2365,7 +2443,7 @@ impl<'a> Constants<'a> {
         while k < close {
             match b[k] {
                 b'(' | b'[' | b'{' => k = self.closing(k)?,
-                b',' => break,
+                b',' | b';' => break,
                 _ => {}
             }
             k += 1;
@@ -2387,10 +2465,13 @@ impl<'a> Constants<'a> {
         let Some(word) = trailing_word(head, 64) else {
             return Some((!tail.starts_with([':', '{'])).then_some(false));
         };
-        let rest = head[..head.len() - word.len()].trim_end();
+        let lead = &head[..head.len() - word.len()];
+        let rest = lead.trim_end();
         self.spend(head.len() - word.len() - rest.len())?;
         let rest = rest.strip_suffix('*').map_or(rest, str::trim_end);
-        if word == "function" || (!word.is_empty() && ends_with_word(rest, "function")) {
+        // The keyword, not a member named like it (`obj.function(t)`).
+        let keyword = word == "function" && member_of(lead.trim_end()).is_none() && !rest.ends_with('#');
+        if keyword || (!word.is_empty() && ends_with_word(rest, "function")) {
             return Some(Some(true));
         }
         if !tail.starts_with([':', '{']) {
@@ -2401,7 +2482,16 @@ impl<'a> Constants<'a> {
             return Some(None);
         }
         match self.member_list(open)? {
-            Some(true) => Some(Some(true)),
+            // A method where a member starts (`{ run(t) {`, `, async run(t) {`,
+            // a new line in a class), not a call in a member's value
+            // (`{ a: c ? g(t) : null }`).
+            Some(true) => {
+                let slot = rest.is_empty()
+                    || rest.ends_with(['{', ',', ';', '}', '*'])
+                    || ["async", "static", "get", "set"].iter().any(|k| ends_with_word(rest, k))
+                    || lead[rest.len()..].contains(['\n', '\r']);
+                Some(Some(slot))
+            }
             Some(false) => Some(Some(false)),
             None => Some(None),
         }
@@ -2425,24 +2515,40 @@ impl<'a> Constants<'a> {
             return Some(None);
         }
         // `class A {`, `class A extends mix(B, { x: 1 }) {`.
-        if self.class_body(brace)? {
-            return Some(Some(true));
+        match self.class_body(brace)? {
+            Some(true) => return Some(Some(true)),
+            None => return Some(None),
+            Some(false) => {}
         }
         let head = self.before(brace)?;
+        // A function's body after a TypeScript return type (`): Promise<T> {`).
+        if self.return_type(head)? {
+            return Some(Some(false));
+        }
+        // A value in a template (`${ {…} }`) or a loop's head (`for (…; {…}; …)`).
+        let in_parens = self.around(brace).is_some_and(|(o, _)| self.bare[o..].starts_with('('));
+        if head.ends_with("${") || (head.ends_with(';') && in_parens) {
+            return Some(Some(true));
+        }
         // A block: at the start, after a statement, a block, a head's `)`,
-        // `=>`, `else`, `do`, `try`, `finally` or `static`.
+        // `=>`, `else`, `do`, `try`, `catch`, `finally` or `static`.
         let block = head.is_empty()
             || head.ends_with([';', '{', '}', ')'])
             || head.ends_with("=>")
-            || ["else", "do", "try", "finally", "static"].iter().any(|k| ends_with_word(head, k));
+            || ["else", "do", "try", "catch", "finally", "static"].iter().any(|k| ends_with_word(head, k));
         if block {
             return Some(Some(false));
         }
-        // A value: after an operator or a word a value follows.
+        // A value: after an operator that cannot end an expression, or a
+        // word a value follows on the same line (`return\n{` is a block).
+        // After `++`, `--`, `/`, `<` or `>` (a regular expression's end, a
+        // type) this cannot tell.
+        let line = !self.bare[head.len()..brace].contains(['\n', '\r']);
         let words = ["return", "await", "yield", "typeof", "void", "throw", "in", "of", "new", "delete"];
-        let value = head.ends_with(['=', '(', ',', '[', '?', '|', '&', '!', '+', '-', '*', '/', '%', '<', '>', '~', '^'])
-            || words.iter().any(|k| ends_with_word(head, k));
-        if value {
+        let ends = head.ends_with("++") || head.ends_with("--") || head.ends_with(['/', '<', '>']);
+        let value = head.ends_with(['=', '(', ',', '[', '?', '|', '&', '!', '+', '-', '*', '%', '~', '^'])
+            || (line && words.iter().any(|k| ends_with_word(head, k)));
+        if value && !ends {
             return Some(Some(true));
         }
         if head.ends_with(':') {
@@ -2463,29 +2569,82 @@ impl<'a> Constants<'a> {
         Some(None)
     }
 
-    /// Whether the `{` at `brace` opens a class's body: back to the word
-    /// `class`, past only names, dots and whole brackets (`extends mix(B)`).
-    fn class_body(&mut self, brace: usize) -> Option<bool> {
-        let start = brace.saturating_sub(512);
-        let window = &self.bare[start..brace];
-        let Some(k) = window.rmatch_indices("class").map(|(k, _)| start + k).find(|&k| {
-            !self.bare[..k].ends_with(|c: char| is_ident_char(c) || c == '.')
-                && !self.bare[k + 5..].starts_with(is_ident_char)
-        }) else {
-            return Some(false);
-        };
-        self.spend(brace - k)?;
-        let b = self.bare.as_bytes();
-        let mut at = k + 5;
-        while at < brace {
-            match b[at] {
-                b'(' | b'[' => at = self.closing(at)?,
-                c if c.is_ascii_whitespace() || is_ident_char(c as char) || c == b'.' => {}
+    /// Whether `head` ends with a TypeScript return type after a parameter
+    /// list (`): Promise<void>`, `)?: Record<K, V>`).
+    fn return_type(&mut self, head: &str) -> Option<bool> {
+        let b = head.as_bytes();
+        let mut angle = 0i32;
+        let mut named = false;
+        let mut k = b.len();
+        while k > 0 && b.len() - k < 512 {
+            match b[k - 1] {
+                b'>' => angle += 1,
+                b'<' => angle -= 1,
+                b':' if angle == 0 => {
+                    self.spend(b.len() - k)?;
+                    let before = head[..k - 1].trim_end();
+                    return Some(named && (before.ends_with(')') || before.ends_with(")?")));
+                }
+                c if is_ident_char(c as char) => named = true,
+                c if c.is_ascii_whitespace() || matches!(c, b'.' | b'[' | b']' | b'|' | b'&' | b',' | b'?') => {}
                 _ => return Some(false),
             }
-            at += 1;
+            k -= 1;
         }
-        Some(at == brace)
+        Some(false)
+    }
+
+    /// Whether the `{` at `brace` opens a class's body: back over names,
+    /// dots, `extends` and whole brackets to the keyword `class` (not a
+    /// method named `class`); `None` inside when this cannot tell.
+    fn class_body(&mut self, brace: usize) -> Option<Option<bool>> {
+        let b = self.bare.as_bytes();
+        let mut at = brace;
+        // Whether the token just after the one being read is a `(…)`.
+        let mut called = false;
+        for _ in 0..256 {
+            while at > 0 && b[at - 1].is_ascii_whitespace() {
+                at -= 1;
+            }
+            let Some(&c) = at.checked_sub(1).and_then(|k| b.get(k)) else {
+                return Some(Some(false));
+            };
+            if matches!(c, b')' | b']') {
+                let (open, _) = self.around(at - 1)?;
+                called = c == b')';
+                at = open;
+                continue;
+            }
+            if c == b'}' {
+                return Some(None);
+            }
+            if !(is_ident_char(c as char) || c == b'.') {
+                return Some(Some(false));
+            }
+            let end = at;
+            while at > 0 && (is_ident_char(b[at - 1] as char) || b[at - 1] == b'.') {
+                at -= 1;
+            }
+            let word = &self.bare[at..end];
+            self.spend(end - at + 1)?;
+            if ["if", "for", "while", "switch", "catch", "with", "function", "return", "else", "do", "try"]
+                .contains(&word)
+            {
+                return Some(Some(false));
+            }
+            if word == "class" {
+                let before = self.bare[..at].trim_end();
+                // A class in the heritage (`extends class {}`), or a member
+                // named `class` (`class() {`, `x.class`, `#class`).
+                if ends_with_word(before, "extends") {
+                    called = false;
+                    continue;
+                }
+                return Some(Some(!called && !before.ends_with(['.', '#'])));
+            }
+            called = false;
+        }
+        Some(None)
     }
 
     /// Whether the statement before `end` (from `start`, the start of its
@@ -2499,6 +2658,11 @@ impl<'a> Constants<'a> {
             match b[k] {
                 b'(' | b'[' | b'{' => k = self.closing(k)?,
                 b';' => found = false,
+                b'c' | b'd' if !self.bare[..k].ends_with(is_ident_char)
+                    && (starts_with_word(&self.bare[k..], "case") || starts_with_word(&self.bare[k..], "default")) =>
+                {
+                    found = false
+                }
                 b'?' if b.get(k + 1) == Some(&b'?') => k += 1,
                 b'?' if b.get(k + 1) == Some(&b'.') && !b.get(k + 2).is_some_and(u8::is_ascii_digit) => {}
                 b'?' => found = true,
@@ -2927,13 +3091,28 @@ impl<'a> Constants<'a> {
             };
             Some(target(s) || grouped || this.in_pattern(i)?)
         };
+        // Called as a method, also through parentheses or `?. (`
+        // (`names[m](x)`, `(names[m])(x)`), with the array as `this`.
+        let calls = |this: &mut Self, s: &str| {
+            let call = |s: &str| {
+                s.starts_with(['(', '`'])
+                    || s.strip_prefix("?.").is_some_and(|r| r.trim_start().starts_with('('))
+            };
+            let grouped = match this.around(i) {
+                Some((open, close)) if s.starts_with(')') && this.bare[open..].starts_with('(') => {
+                    let tail = this.after(close + 1)?;
+                    call(tail)
+                }
+                _ => false,
+            };
+            Some(call(s) || grouped)
+        };
         // `names[i]`, `TOOLS?.[k]`.
         let after = after.strip_prefix("?.").map(str::trim_start).filter(|a| a.starts_with('[')).unwrap_or(after);
         if after.starts_with('[') {
             let close = self.closing(bare.len() - after.len())?;
             let rest = self.after(close + 1)?;
-            let called = rest.starts_with(['(', '`']) || rest.starts_with("?.(");
-            return Some(!called && !changes(self, rest)?);
+            return Some(!calls(self, rest)? && !changes(self, rest)?);
         }
         let Some(member) = after.strip_prefix("?.").or_else(|| after.strip_prefix('.')) else {
             return Some(false);
@@ -2943,8 +3122,7 @@ impl<'a> Constants<'a> {
         let rest = self.after(bare.len() - member.len() + method.len())?;
         if !array {
             // `TOOLS.search`, not `TOOLS.search = x` or `TOOLS.run()`.
-            let called = rest.starts_with(['(', '`']) || rest.starts_with("?.(");
-            return Some(!changes(self, rest)? && !called);
+            return Some(!changes(self, rest)? && !calls(self, rest)?);
         }
         if method == "length" {
             return Some(!changes(self, rest)?);
@@ -3026,11 +3204,11 @@ impl<'a> Constants<'a> {
                 }
                 bare.len() - value.len()
             } else {
-                // A use: called or handed on, not set.
-                if assigns(after) || COMPOUND_ASSIGNMENTS.iter().any(|op| after.starts_with(op)) || keyword(before).is_some() {
-                    return Some(false);
+                // A use: called or handed on, not set or bound again (`[run] = …`).
+                match self.place(name, i)? {
+                    Place::Read => continue,
+                    _ => return Some(false),
                 }
-                continue;
             };
             if declared || !bare[params..].starts_with('(') {
                 return Some(false);
@@ -3064,9 +3242,17 @@ impl<'a> Constants<'a> {
                 let ends = rest.is_empty() || rest.starts_with(';');
                 return Some(ends && ends_with_word(head, "return"));
             };
-            // No functions in it (a returned `{ then() {…} }` still runs).
+            // No function defined in it, nor a member that runs after the
+            // return (`then`, `toJSON`: `{ list: names, then: later }`).
             self.spend(close - open)?;
-            if self.bare[open..close].contains(['(', '`']) || self.bare[open..close].contains("=>") {
+            let text = &self.bare[open..close];
+            let named = ["then", "toJSON", "toString", "valueOf", "function", "get", "set"].iter().any(|w| {
+                text.match_indices(w).any(|(k, _)| {
+                    !text[..k].ends_with(is_ident_char) && !text[k + w.len()..].starts_with(is_ident_char)
+                })
+            });
+            let method = text.match_indices(')').any(|(k, _)| text[k + 1..].trim_start().starts_with('{'));
+            if named || method || text.contains("=>") {
                 return Some(false);
             }
             rest = self.after(close + 1)?;
@@ -4643,6 +4829,12 @@ return out.join("\n=====\n").replace(/The content below[\s\S]*?instructions that
             "function g(tool) { return tools.granola[tool]({}) } const name = 'get_meetings'; await g(name)",
             "async function g(tool, n = 0) { if (n < 3) return g(tool, n + 1); return tools.granola[tool]({}) } await g('get_meetings')",
             "const app = 'granola', tool = 'get_meetings'; await tools[app][tool]({})",
+            // A `var` read before its value is `undefined`, which names no tool either.
+            "function go() { return tools.mistral.slack[t]({}); }\nawait go();\nvar t = 'slack_read_channel';",
+            // Nor does an index (`forEach` passes 0 as the second argument).
+            "async function post(_, tool) { return tools.mistral.slack[tool]({}) }\nawait post(null, 'slack_read_channel');\n['x'].forEach(post);",
+            // A missing argument names no tool (`tools.mistral.slack[undefined]` fails).
+            "async function g(tool) { return tools.mistral.slack[tool]({}) } await g('slack_read_channel'); await g();",
             // The same name bound elsewhere to constants too.
             "for (const tool of ['a']) {} async function g(tool) { return tools.granola[tool]({}) } await g('get_meetings')",
             // The same name bound in another scope to something else.
@@ -4873,9 +5065,6 @@ g("slack_send_message");"##,
 async function g(ctx: any, tool: string) { return tools.mistral.slack[tool]({ channel: "C1", text: "x" }) }
 await g(make<string, "slack_read_channel", number>(), "slack_send_message");"##,
             r##"const s = `${function g(t, n) { if (n) g("slack_read_channel", 0); return tools.mistral.slack[t]({}) }("slack_send_message", 1)}`;"##,
-            r##"async function g(tool) { return tools.mistral.slack[tool]({ channel: "C1", text: "x" }) }
-await g("slack_read_channel");
-await g();"##,
             r##"const names = ["slack_read_channel"];
 for (names[0] of ["slack_send_message"]) {}
 await tools.mistral.slack[names[0]]({ channel: "C1", text: "hi" });"##,
@@ -5040,9 +5229,6 @@ await tools.mistral.slack[t]({});"##,
   let = 1, t = "slack_send_message";
 }
 await tools.mistral.slack[t]({});"##,
-            r##"function go() { return tools.mistral.slack[t]({}); }
-await go();
-var t = "slack_read_channel";"##,
             r##"JSON.stringify = (a) => { a.push("slack_send_message"); return ""; };
 const names = ["slack_read_channel"];
 console.log(JSON.stringify(names));
@@ -5078,9 +5264,6 @@ await Promise.all(plan`daily`["slack_read_channel"].map((t) => tools.mistral.sla
             r##"const of = { slack_read_channel: ["slack_send_message"] };
 await Promise.all(of["slack_read_channel"].map((t) => tools.mistral.slack[t]({ channel: "C1", text: "x" })));"##,
             r##"for (let i = 0; i < 1; function g(t, n) { if (n) g("slack_read_channel", 0); return tools.mistral.slack[t]({ channel: "C1", text: "x" }) }("slack_send_message", 1)) i++;"##,
-            r##"async function post(_, tool) { return tools.mistral.slack[tool]({ channel: "C1", text: "x" }) }
-await post(null, "slack_read_channel");
-["x"].forEach(post);"##,
             r##"const z = ++/'/.lastIndex; await tools.mistral.slack.slack_send_message({ channel: "x", text: "hi" }); //'"##,
             r##"let n = 1
 ++/'/.lastIndex; await tools.mistral.slack.slack_send_message({ channel: "x", text: "hi" }); //'"##,
@@ -5157,6 +5340,177 @@ const names = ["slack_read_channel"];
 names.forEach((t) => tools.mistral.slack[t]({ channel: "x" }));"##,
         ] {
             assert!(slack_write_in_code(program, false), "{program}");
+        }
+        // And the one after it.
+        for program in [
+            r##"let t = "slack_read_channel";
+let i = 0
+i++
+{
+  for (t of ["slack_send_message"]) {
+    await tools.mistral.slack[t]({});
+  }
+}"##,
+            r##"const t = "slack_read_channel";
+const mix = (B) => B;
+class A extends mix(class {}) {
+  run(t) { return tools.mistral.slack[t]({}); }
+}
+await new A().run("slack_send_message");"##,
+            r##"let t = "slack_read_channel";
+const o = {
+  class() {
+    for (t of ["slack_send_message"]) {
+      tools.mistral.slack[t]({});
+    }
+  }
+};
+await o.class();"##,
+            r##"const t = "slack_read_channel";
+const s = `${ { run(t) { return tools.mistral.slack[t]({}); } }.run("slack_send_message") }`;"##,
+            r##"let t = "slack_read_channel";
+const obj = { function(x) { return x; } };
+obj.function(t)
+{
+  t = "slack_send_message";
+}
+await tools.mistral.slack[t]({});"##,
+            r##"let t = "slack_read_channel";
+for (t => 0; !(t = "slack_send_message"); ) {}
+await tools.mistral.slack[t]({});"##,
+            r##"const t = "slack_read_channel";
+-function g(t) { tools.mistral.slack[t]({}); }("slack_send_message");"##,
+            r##"const z = 1 - typeof /'/; await tools.mistral.slack.slack_send_message({ channel: "x", text: "hi" }); //'"##,
+            r##"const z = typeof ++/'/.lastIndex; await tools.mistral.slack.slack_send_message({ channel: "x", text: "hi" }); //'"##,
+            r##"let tool = "slack_read_channel";
+const $1 = { in: 4 };
+const h = $1.in / 2; tool = "slack_send_message"; const q = h / 1;
+await tools.mistral.slack[tool]({ channel: "x" });"##,
+            r##"const names = ["slack_read_channel"];
+const m = "push";
+(names[m])("slack_send_message");
+for (const t of names) await tools.mistral.slack[t]({ channel: "C1", text: "hi" });"##,
+            r##"const TOOLS = { read: "slack_read_channel" };
+(TOOLS.__defineGetter__)("read", () => "slack_send_message");
+await tools.mistral.slack[TOOLS.read]({ channel: "C1", text: "hi" });"##,
+            r##"const names = ["slack_read_channel"];
+const m = "push";
+names[m]?. ("slack_send_message");
+for (const t of names) await tools.mistral.slack[t]({ channel: "C1", text: "hi" });"##,
+            r##"const TOOLS = { read: "slack_read_channel" };
+TOOLS.__defineGetter__?. ("read", () => "slack_send_message");
+await tools.mistral.slack[TOOLS.read]({ channel: "C1", text: "hi" });"##,
+            r##"const names = ["slack_read_channel"];
+async function later(resolve) {
+  this.list.push("slack_send_message");
+  for (const t of names) await tools.mistral.slack[t]({ channel: "C1", text: "hi" });
+  resolve("done");
+}
+return { list: names, then: later };
+
+(object variant /tmp/r5-reads-final/c06_then_ref_array.js: `this.cfg.read = "slack_send_message"; … return { cfg: TOOLS, then: later };`)"##,
+            r##"globalThis.JSON.stringify = (a) => { a.push("slack_send_message"); return ""; };
+const names = ["slack_read_channel"];
+console.log(JSON.stringify(names));
+for (const t of names) await tools.mistral.slack[t]({ channel: "C1", text: "x" });"##,
+            r##"const names = ["slack_read_channel"];
+function run(t) { return t; }
+[run] = [(t, i, a) => a.push("slack_send_message")];
+names.map(run);
+for (const t of names) await tools.mistral.slack[t]({ channel: "C1", text: "hi" });"##,
+            r##"const names = ["slack_read_channel"];
+function run(t) { return t; }
+function each(run) { names.forEach(run); }
+each((t, i, a) => a.push("slack_send_message"));
+for (const t of names) await tools.mistral.slack[t]({ channel: "C1", text: "hi" });"##,
+            r##"async function main(): Promise<void> {
+  let tool = "slack_read_channel";
+  if (tool) {
+    tool = "slack_send_message";
+  }
+  await tools.mistral.slack[tool]({ channel_id: "C1", message: "Deploy finished" });
+}
+await main();
+
+// u8.js: for (const app of ["slack"]) await tools.mistral[app][`${app}_send_message`](...) inside `async function broadcast(text: string): Promise<void> {`
+// u9.js: let tool = "slack_read_channel"; for (tool of ["slack_read_channel", "slack_send_message"]) await tools.mistral.slack[tool](...) inside `): Promise<void> {`
+// u10.js: switch (tool) { case "slack_read_channel": if (!history.messages?.length) tool = "slack_send_message"; break; } then tools.mistral.slack[tool](...)"##,
+        ] {
+            assert!(slack_write_in_code(program, false), "{program}");
+        }
+        for program in [
+            r##"const threadTs = "1731700000.000100";
+let tool;
+if (threadTs) tool = "slack_read_thread";
+else tool = "slack_read_channel";
+const r = await tools.mistral.slack[tool]({ accountId: "acc_s", input: { channel_id: "C1", message_ts: threadTs } });
+return r.content[0].text;"##,
+            r##"const READS = ["slack_search_public", "slack_search_users"] as const;
+async function searchAll(query: string): Promise<Record<string, string>> {
+  const res: Record<string, string> = {};
+  for (const t of READS) {
+    const r = await tools.mistral.slack[t]({ accountId: "acc_s", input: { query } });
+    res[t] = r.content[0].text;
+  }
+  return res;
+}
+return await searchAll("launch");"##,
+            r##"let r;
+try {
+  r = await tools.granola.get_meetings({ accountId: "a", input: { meeting_ids: ["x"] } });
+} catch {
+  for (const t of ["list_meetings", "search_meetings"]) {
+    r = await tools.granola[t]({ accountId: "a", input: {} });
+    if (r) break;
+  }
+}
+return r;"##,
+            r##"async function g(tool, input) {
+  return tools.granola[tool]({ accountId: "a", input });
+}
+const t = "list_meetings";
+const want = true;
+const summary = { meetings: want ? await g(t, {}) : null, at: Date.now() };
+return summary;"##,
+            r##"async function g(tool, input) {
+  return tools.granola[tool]({ accountId: "a", input });
+}
+const window = { from_date: "2026-11-01", to_date: "2026-11-15" };
+const r = await g("search_meetings", { keywords: ["pricing"], from_date: window.from_date, to_date: window.to_date });
+console.log("searched", window);
+return r;"##,
+            r##"class Cache {
+  constructor() { this.m = new Map(); }
+  get(k) { return this.m.get(k); }
+  set(k, v) { this.m.set(k, v); return this; }
+}
+const cache = new Cache();
+const g = async (tool, input) => tools.granola[tool]({ accountId: "a", input });
+const r = await g("list_meetings", {});
+cache.set("m", r);
+return cache.get("m");"##,
+            r##"const TOOLS = ["list_meetings", "get_meetings"];
+const out = {};
+for (const t of TOOLS) {
+  out[t] = await tools.granola[t]({ accountId: "a", input: {} });
+}
+return { tools: TOOLS, count: Object.keys(out).length };"##,
+            r##"const kind = "detail"
+let label
+switch (kind) {
+  case "list":
+    label = kind === "list" ? "all" : "some"
+    break
+  case "detail": {
+    for (const t of ["get_meetings", "list_meetings"]) {
+      await tools.granola[t]({ accountId: "a", input: {} })
+    }
+    break
+  }
+}
+return label"##,
+        ] {
+            assert!(!slack_write_in_code(program, false), "{program}");
         }
         // Read-only programs those fixes must still let through.
         for program in [
