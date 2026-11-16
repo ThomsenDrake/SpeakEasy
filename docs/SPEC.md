@@ -726,17 +726,27 @@ payload on stdin. The mode:
    its tool's name: one that writes gates, one that reads passes, and one
    that says neither (`tools.mistral.slack`) gates unless it is declared
    (its uses are judged instead) or only looked at (`Object.keys(…)`,
-   `!…`, `typeof …`). A computed key that is a variable only ever holding
-   constant names stands for each of them (`async function g(tool) {
-   …tools.granola[tool](…)… }` called only as `g("get_meetings")` is
-   `tools.granola.get_meetings`): every place in the program that gives a
-   variable of that name a value — a declaration or assignment, `for (… of
-   ["a", "b"])`, an element callback (`["a", "b"].map((t) => …)`), or the
-   calls of the named function it is a parameter of, which is only ever
-   called directly — gives a constant name or another such variable; a
-   pattern, `catch`, a changed value (`t += x`), a function passed on,
-   `arguments`, `with` or a global property of that name leaves it
-   computed. Also gating: any other computed tool name (`tools…[name]`,
+   `!…`, `typeof …`). A computed key that only ever holds constant names
+   stands for each of them (`async function g(tool) { …tools.granola[tool](…)… }`
+   called only as `g("get_meetings")` is `tools.granola.get_meetings`; a
+   name bound to several tools is followed only when each of them reads).
+   Such a key is a constant name of at most 128 characters; a conditional
+   or `??`/`||` between such keys (`full ? "notion-fetch" :
+   "notion-search"`); a template of them (`` `notion-get-${kind}` ``); with
+   a trailing `as`/`satisfies` cast; an element or key of a `const` array or
+   object literal of them that is only read (`names[i]`, `TOOLS.search`; no
+   getters, methods, spreads, computed keys or `__proto__`); or a variable
+   every value of which is one: the declarations whose block, function or
+   loop can reach the key (the innermost one whose span is exactly its scope
+   hides everything outside it) and assignments, through `for (… of …)` or
+   an element callback with at most the element and index parameters
+   (`names.map((t) => …)`, `names.map(g)`) over such an array, or the calls
+   of the named function it is a parameter of, which is only ever called
+   directly. A pattern, `catch`, a changed value (`t += x`), a function
+   passed on or a method, `arguments`, `with`, a global property of that
+   name, prototypes or symbols named in code or as a name in a string (for
+   arrays and objects), or a program that needs more work than a fixed
+   budget to read leaves the key computed. Also gating: any other computed tool name (`tools…[name]`,
    `globalThis[…]`, `window[…]`, `this[…]`; not `[0]`); a call or value of `eval` or a `Function`
    constructor, or a constructor taken (not `.constructor.name` or a
    comparison); a function named for a Slack write that the program calls
