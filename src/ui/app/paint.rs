@@ -483,16 +483,22 @@ impl ApprovalApp {
 
         // ---- Events -------------------------------------------------------
         for ev in events.drain(..) {
-            match ev {
-                AppEvent::Approve => self.decide_click(&ctx, Decision::Approve),
-                AppEvent::Deny => self.decide_click(&ctx, Decision::Deny),
+            let (decision, button) = match ev {
+                AppEvent::Approve => (Decision::Approve, FocusId::Approve),
+                AppEvent::Deny => (Decision::Deny, FocusId::Deny),
                 AppEvent::SubmitFeedback(text) => {
-                    self.decide_click(&ctx, Decision::Feedback(text))
+                    (Decision::Feedback(text), FocusId::SubmitFeedback)
                 }
                 AppEvent::ToggleFeedback => {
                     self.feedback_open = !self.feedback_open;
                     ctx.request_repaint();
+                    continue;
                 }
+            };
+            // An ignored click (aimed at what was there before) leaves no
+            // focus behind on the button it landed on.
+            if !self.decide_click(&ctx, decision) && focus.focused == Some(button) {
+                focus.blur();
             }
         }
 

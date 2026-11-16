@@ -8,7 +8,8 @@
 //! - the "reduce motion" accessibility preference (CFPreferences), plus an
 //!   env override for testing;
 //! - the Dock-reopen observer (NSNotificationCenter);
-//! - which of the keyboard shortcut keys are down (CGEventSourceKeyState).
+//! - which of the keyboard shortcut keys are down (CGEventSourceKeyState),
+//!   and the OS key-repeat flag of their key-downs (an NSEvent monitor).
 //!
 //! Non-macOS builds get stubs; the tray icon and the clipboard bridge are
 //! macOS-only in this app.
@@ -221,16 +222,8 @@ mod imp {
     /// down is not listed.
     pub fn shortcut_keys_down() -> Vec<egui::Key> {
         const HID_SYSTEM_STATE: i32 = 1;
-        // Virtual key codes (HIToolbox `Events.h`): kVK_Return,
-        // kVK_ANSI_KeypadEnter, kVK_Escape, kVK_Space.
-        const KEYS: [(u16, egui::Key); 4] = [
-            (36, egui::Key::Enter),
-            (76, egui::Key::Enter),
-            (53, egui::Key::Escape),
-            (49, egui::Key::Space),
-        ];
         let mut down = Vec::new();
-        for (code, key) in KEYS {
+        for (code, key) in SHORTCUT_KEY_CODES {
             // SAFETY: a pure query of the keyboard state; any key code is
             // valid input.
             if unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, code) } && !down.contains(&key) {
@@ -238,6 +231,83 @@ mod imp {
             }
         }
         down
+    }
+
+    /// Virtual key codes (HIToolbox `Events.h`) of the keyboard shortcut
+    /// keys: kVK_Return, kVK_ANSI_KeypadEnter, kVK_Escape, kVK_Space.
+    const SHORTCUT_KEY_CODES: [(u16, egui::Key); 4] = [
+        (36, egui::Key::Enter),
+        (76, egui::Key::Enter),
+        (53, egui::Key::Escape),
+        (49, egui::Key::Space),
+    ];
+
+    /// The shortcut key-downs the app received since the last
+    /// [`take_shortcut_key_downs`], oldest first, with the OS key-repeat flag
+    /// (bounded: the oldest are dropped if no frame takes them).
+    static KEY_DOWNS: std::sync::Mutex<Vec<(egui::Key, bool)>> = std::sync::Mutex::new(Vec::new());
+    const KEY_DOWNS_MAX: usize = 64;
+
+    /// Keeps the shortcut key-down monitor installed; dropping it removes
+    /// the monitor.
+    pub struct KeyDownMonitor {
+        token: objc2::rc::Retained<objc2::runtime::AnyObject>,
+        _block:
+            block2::RcBlock<dyn Fn(NonNull<objc2_app_kit::NSEvent>) -> *mut objc2_app_kit::NSEvent>,
+    }
+
+    impl Drop for KeyDownMonitor {
+        fn drop(&mut self) {
+            // SAFETY: `token` is the object `addLocalMonitorForEvents…`
+            // returned, removed once.
+            unsafe { objc2_app_kit::NSEvent::removeMonitor(&self.token) };
+        }
+    }
+
+    /// Record every Enter (Return, keypad Enter), Escape and Space key-down
+    /// the app receives, with `NSEvent.isARepeat` (an `NSEvent` local
+    /// monitor; the events go on to the window unchanged). egui-winit drops
+    /// that flag, so without it the first auto-repeat of a key whose
+    /// key-down went elsewhere (an open menu, the Cmd+Tab switcher, a
+    /// screenshot selection) while the window kept the focus would look
+    /// like a fresh press. Call on the main thread.
+    pub fn monitor_shortcut_key_downs() -> Option<KeyDownMonitor> {
+        use objc2_app_kit::{NSEvent, NSEventMask};
+        let block: block2::RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
+            block2::RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
+                // SAFETY: AppKit passes a valid key-down event (the mask)
+                // for the duration of the call.
+                let e = unsafe { event.as_ref() };
+                let code = e.keyCode();
+                if let Some(&(_, key)) = SHORTCUT_KEY_CODES.iter().find(|(c, _)| *c == code) {
+                    if let Ok(mut downs) = KEY_DOWNS.lock() {
+                        if downs.len() >= KEY_DOWNS_MAX {
+                            downs.remove(0);
+                        }
+                        downs.push((key, e.isARepeat()));
+                    }
+                }
+                // Dispatch the event as usual.
+                event.as_ptr()
+            });
+        // SAFETY: the block returns the event it was given (a valid
+        // pointer); the monitor is removed when `KeyDownMonitor` drops.
+        let token = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block)
+        }?;
+        Some(KeyDownMonitor {
+            token,
+            _block: block,
+        })
+    }
+
+    /// The shortcut key-downs received since the last call, oldest first:
+    /// `(key, the OS reported a key-repeat)`.
+    pub fn take_shortcut_key_downs() -> Vec<(egui::Key, bool)> {
+        KEY_DOWNS
+            .lock()
+            .map(|mut downs| std::mem::take(&mut *downs))
+            .unwrap_or_default()
     }
 
     /// Fallback (only if CFDateFormatter fails, which should not happen).
@@ -292,6 +362,18 @@ mod imp {
     /// Non-macOS: the keyboard state is not queried (no key is reported
     /// down).
     pub fn shortcut_keys_down() -> Vec<egui::Key> {
+        Vec::new()
+    }
+
+    /// Non-macOS: the OS key-repeat flag is not recorded (only the app's
+    /// own held-key tracking applies).
+    pub struct KeyDownMonitor;
+
+    pub fn monitor_shortcut_key_downs() -> Option<KeyDownMonitor> {
+        None
+    }
+
+    pub fn take_shortcut_key_downs() -> Vec<(egui::Key, bool)> {
         Vec::new()
     }
 

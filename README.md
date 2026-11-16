@@ -156,16 +156,21 @@ menu-bar icon.
 
 On the keyboard, Enter approves and Escape denies, the same as clicking.
 They work only after the request has been in the focused window for one
-second, and one second after you last typed. So a key you were pressing in
-another app when the window came up does nothing, and neither does a key you
-meant for a request that was just replaced. In the feedback field, Enter
-adds a line and Escape leaves the field. Press Tab to move between the
-buttons; Enter or Space then presses the highlighted button, with the same
-waiting time. If a request is withdrawn while you are typing feedback for it
-or have one of its buttons highlighted, Enter and Escape do nothing on the
-request that replaces it until you press Escape or Tab, or click in the
-window. A click on Approve, Deny or Submit feedback does nothing in the first
-half second after a request appears or the window comes up.
+second, and one second after you last typed or a new request brought the
+window to the front. So a key you were pressing in another app when the
+window came up does nothing, and neither does a key you meant for a request
+that was just replaced. In the feedback field, Enter adds a line and Escape
+leaves the field. Press Tab to move between the buttons; Enter or Space then
+presses the highlighted button, with the same waiting time. With VoiceOver,
+Enter presses the button VoiceOver is on. A button you clicked is not
+highlighted: Enter still approves and Space scrolls. If a request is
+withdrawn while you are typing feedback for it or have one of its buttons
+selected, Enter and Escape do nothing on the request that replaces it until
+you press Escape or Tab, or click in the window. That key or click does
+nothing else, and the keys work again one second later. A click on Approve,
+Deny or Submit feedback does nothing in the first half second after a
+request appears, the window comes up, a new request brings it to the front,
+or such a key or click gives the keys back.
 
 All your agents share one SpeakEasy. Requests from every agent queue in the
 same window, and the header shows how many are waiting.

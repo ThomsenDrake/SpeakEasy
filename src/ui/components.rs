@@ -253,8 +253,9 @@ pub enum FocusId {
 
 /// Focus tracker implementing the browser's focus model: Tab/Shift+Tab move
 /// focus (and show the ring), clicking focuses without the ring, Enter/Space
-/// activate (the app reads those keys in order and gates them; see
-/// `ApprovalApp::extract_keys`).
+/// activate a button focused with the keyboard (the app reads those keys in
+/// order and gates them; see `ApprovalApp::extract_keys` and
+/// [`FocusTracker::key_target`]).
 #[derive(Default)]
 pub struct FocusTracker {
     /// Controls in DOM order, rebuilt each frame.
@@ -281,6 +282,18 @@ impl FocusTracker {
     /// The keyboard focus ring is only drawn for keyboard focus.
     pub fn ring_visible(&self, id: FocusId) -> bool {
         self.focused == Some(id) && self.keyboard
+    }
+
+    /// The control Enter, Escape and Space act on: the textarea when it
+    /// has the focus, a button only when it was focused with the keyboard
+    /// (its ring is visible). A button focused by a click is no focus for
+    /// the keys: Enter approves and Space scrolls, as with nothing focused.
+    pub fn key_target(&self) -> Option<FocusId> {
+        match self.focused {
+            Some(FocusId::Textarea) => Some(FocusId::Textarea),
+            Some(button) if self.keyboard => Some(button),
+            _ => None,
+        }
     }
 
     pub fn focus(&mut self, id: FocusId, keyboard: bool) {
@@ -384,7 +397,12 @@ impl<'a> Ctx<'a> {
     fn focusable(&mut self, id: FocusId, response: &Response) -> bool {
         self.focus.register(id);
         if response.clicked_by(egui::PointerButton::Primary) {
+            // A click focuses without the ring, and the keys do not act on
+            // a button focused that way (`FocusTracker::key_target`). The
+            // keys follow egui's focus, which only the keyboard (or an
+            // assistive technology) puts on a button: take it off.
             self.focus.focus(id, false);
+            response.surrender_focus();
         }
         // A press that starts on the control is consumed by it (the browser
         // keeps the focus). `is_pointer_button_down_on` is unreliable when
