@@ -1279,8 +1279,15 @@ fn slack_write_in_code(code: &str, namespaces: bool) -> bool {
         let chain = at..end;
         let head = bare[at..at + len].to_string();
         let bound = binding(&bare, &chain);
-        // One name bound to several tools is not followed.
-        if spellings.len() > 1 && bound.is_some() {
+        // One name bound to several tools (`const fn = tools.notion[t]`) is
+        // followed only when each of them reads.
+        let reads = |spelled: &Vec<String>| {
+            let mut names = sources.get(&head).cloned().unwrap_or_else(|| vec![head.clone()]);
+            names.extend(spelled.iter().cloned());
+            let other = |n: &String| is_slack_name(n) || has_word(n, &RAW_WORDS);
+            write_verdict(chain_tool(&names)) == Some(false) && !names.iter().any(other)
+        };
+        if spellings.len() > 1 && bound.is_some() && !spellings.iter().all(reads) {
             return true;
         }
         let looked_at = inspected(&bare, &chain);
@@ -1429,10 +1436,14 @@ fn spelled_chain(
 ) -> Option<(usize, Vec<Vec<String>>)> {
     let mut spellings = vec![Vec::new()];
     let mut start = from;
-    loop {
+    // A few computed keys and names at most; longer chains are not followed.
+    for _ in 0..=8 {
         let (end, computed) = member_chain(bare, start);
         let names = chain_names(&bare[start..end]);
         spellings.iter_mut().for_each(|s| s.extend(names.iter().cloned()));
+        if spellings.iter().any(|s| s.len() > 64) {
+            return None;
+        }
         if !computed {
             return Some((end, spellings));
         }
@@ -1440,7 +1451,10 @@ fn spelled_chain(
         let key = rest.strip_prefix("?.").unwrap_or(rest).trim_start().strip_prefix('[')?.trim_start();
         let name = &key[..key.find(|c: char| !is_ident_char(c)).unwrap_or(key.len())];
         let after = key[name.len()..].trim_start().strip_prefix(']')?;
-        let values = constants.of(name)?;
+        let values = constants.of(name, bare.len() - key.len())?;
+        if spellings.len() * values.len() > 64 {
+            return None;
+        }
         spellings = spellings
             .iter()
             .flat_map(|s| {
@@ -1451,11 +1465,9 @@ fn spelled_chain(
                 })
             })
             .collect();
-        if spellings.len() > 64 {
-            return None;
-        }
         start = bare.len() - after.len();
     }
+    None
 }
 
 /// Compound assignments, which change a value to one that cannot be known.
@@ -1464,48 +1476,73 @@ const COMPOUND_ASSIGNMENTS: [&str; 15] = [
 ];
 
 /// Array methods whose callback's first parameter is each element in turn
-/// (`["a", "b"].map((t) => …)`).
+/// (`["a", "b"].map((t) => …)`); the third is the array itself.
 const ELEMENT_CALLBACKS: [&str; 10] = [
     "map", "forEach", "flatMap", "filter", "find", "findIndex", "findLast", "findLastIndex",
     "some", "every",
 ];
 
+/// Array methods that leave an array's elements among those it had.
+const KEEPING_METHODS: [&str; 16] = [
+    "includes", "indexOf", "lastIndexOf", "join", "slice", "at", "concat", "toString", "keys",
+    "values", "entries", "flat", "sort", "reverse", "pop", "shift",
+];
+
+/// The global object's names (`globalThis.t = x` sets a global `t`).
+const GLOBAL_OBJECTS: [&str; 4] = ["globalThis", "window", "self", "this"];
+
 /// The constant names a program's variables can hold, so that a computed key
-/// (`tools.granola[tool]`) can be read as the names it stands for. A variable
-/// holds constants when every place that gives it a value gives a constant
-/// name or another such variable: `const t = "get"`, `t = "get"`, `for (const
-/// t of ["a", "b"])`, `["a", "b"].map((t) => …)`, or a parameter of a named
-/// function that is only ever called, with such a value there (`async
-/// function g(tool) {…}` … `g("get_meetings")`). Every place that binds the
-/// name counts, whatever its scope. Anything else that binds or changes it (a
-/// pattern, `catch`, `t += x`, a parameter of a function passed on or of a
-/// method, `arguments`, `with`, `globalThis.t = x`) leaves its values unknown.
+/// (`tools.granola[tool]`) can be read as the names it stands for. A
+/// variable visible where it is read holds constants when every place that
+/// gives it a value gives a constant name, a conditional between such values
+/// (`c ? "a" : "b"`) or another such variable: its declaration (`const t =
+/// "get"`), `t = "get"` anywhere, `for (const t of ["a", "b"])` or over a
+/// variable that only ever holds such an array and is only read, an element
+/// callback (`["a", "b"].map((t) => …)`, at most the element and index
+/// parameters), or a parameter of a named function that is only ever called,
+/// with such a value there (`async function g(tool) {…}` …
+/// `g("get_meetings")`). A declaration counts where its block (or function,
+/// or loop) could reach the read; an assignment counts everywhere. Anything
+/// else that binds or changes it (a pattern, `catch`, `t += x`, a parameter of
+/// a function passed on or of a method, `arguments`, `with`, `globalThis.t =
+/// x`, changed prototypes for array loops) leaves its values unknown.
 struct Constants<'a> {
     /// The program with its strings, for the text of the constants.
     code: &'a str,
     /// The same program as code only (see [`code_only`]), offsets kept.
     bare: &'a str,
     idents: &'a HashMap<&'a str, Vec<usize>>,
-    /// Made when first needed; `None` inside when the brackets do not pair up.
+    /// Made when first needed; `None` inside when the program cannot be
+    /// followed at all (unpaired brackets, `with`, `arguments`, too long).
     brackets: Option<Option<Brackets>>,
-    /// The names being read, against cycles (`g(tool)` inside `g`).
-    visiting: Vec<String>,
-    known: HashMap<String, Option<Vec<String>>>,
-    /// Places left to look at: a program that needs more is not followed.
+    /// Whether the program may change how arrays are iterated
+    /// (`Array.prototype.map = …`, `Symbol.iterator`).
+    patched: bool,
+    /// What each place does with its name.
+    places: HashMap<usize, Place>,
+    /// The values each place gives, once read without meeting a cycle.
+    given: HashMap<usize, Option<Vec<String>>>,
+    /// The places being read, against cycles (`g(tool)` inside `g`).
+    visiting: Vec<usize>,
+    /// Whether the current read met a cycle (its result is then partial).
+    cycle: bool,
+    /// How deeply values are nested (`a ? (b ? …) : …`).
+    nesting: usize,
+    /// Work left; a program that needs more is not followed.
     budget: usize,
 }
 
-/// For each byte of a program, its innermost open bracket, and where each
-/// bracket closes.
+/// For each byte of a program, its innermost open bracket, and for each
+/// open bracket where it closes (`u32::MAX`: none).
 struct Brackets {
     inner: Vec<u32>,
-    close: HashMap<usize, usize>,
+    close: Vec<u32>,
 }
 
 impl Brackets {
     fn of(code: &str) -> Option<Brackets> {
         let mut inner = vec![u32::MAX; code.len()];
-        let mut close = HashMap::new();
+        let mut close = vec![u32::MAX; code.len()];
         let mut open: Vec<(usize, char)> = Vec::new();
         for (i, c) in code.char_indices() {
             // A closing bracket's innermost is its own opening one.
@@ -1517,7 +1554,7 @@ impl Brackets {
                     if !matches!((opened, c), ('(', ')') | ('[', ']') | ('{', '}')) {
                         return None;
                     }
-                    close.insert(o, i);
+                    close[o] = i as u32;
                 }
                 _ => {}
             }
@@ -1527,9 +1564,32 @@ impl Brackets {
 }
 
 /// What one place where a name is written does with it.
-enum Given {
+#[derive(Clone)]
+enum Place {
+    /// Reads it, or is another name spelled the same (`x.t`, `{ t: 1 }`).
     Read,
-    Values(Vec<String>),
+    /// Declares a variable of that name, visible within the span.
+    Binds(Range<usize>, Gives),
+    /// Gives whichever variable of that name is visible there a value.
+    Sets(Gives),
+}
+
+/// The value a place gives.
+#[derive(Clone, Copy)]
+enum Gives {
+    /// One this cannot know.
+    Unknown,
+    /// None yet (`let t;`).
+    Nothing,
+    /// The value after the `=` that ends here.
+    After(usize),
+    /// Each element of the array written between these positions (`for (t
+    /// of […])`).
+    Each(usize, usize),
+    /// What the function whose parameters these brackets hold is called with.
+    Parameter(usize, usize),
+    /// What an arrow function's only parameter (`t => …`) is called with.
+    Arrow,
 }
 
 impl<'a> Constants<'a> {
@@ -1539,111 +1599,160 @@ impl<'a> Constants<'a> {
             bare,
             idents,
             brackets: None,
+            patched: true,
+            places: HashMap::new(),
+            given: HashMap::new(),
             visiting: Vec::new(),
-            known: HashMap::new(),
-            budget: 100_000,
+            cycle: false,
+            nesting: 0,
+            budget: 2_000_000,
         }
     }
 
-    /// The constant names `name` can hold; `None` when it may hold anything else.
-    fn of(&mut self, name: &str) -> Option<Vec<String>> {
-        if let Some(known) = self.known.get(name) {
-            return known.clone();
-        }
+    /// The constant names the variable `name` read at `at` can hold; `None`
+    /// when it may hold anything else.
+    fn of(&mut self, name: &str, at: usize) -> Option<Vec<String>> {
         if self.brackets.is_none() {
+            // `with (o)` brings names into scope unseen, and `arguments[0] = x`
+            // changes a parameter.
+            let variable = |word: &str, then: &dyn Fn(&str) -> bool| {
+                self.idents.get(word).into_iter().flatten().any(|&i| {
+                    let before = self.bare[..i].trim_end();
+                    let after = self.bare[i + word.len()..].trim_start();
+                    let key = after.starts_with(':') && before.ends_with(['{', ',']);
+                    !before.ends_with('.') && !key && then(after)
+                })
+            };
+            let unseen =
+                variable("with", &|after| after.starts_with('(')) || variable("arguments", &|_| true);
             let small = self.bare.len() <= 1 << 22;
-            self.brackets = Some(if small { Brackets::of(self.bare) } else { None });
+            self.brackets = Some(if small && !unseen { Brackets::of(self.bare) } else { None });
+            let lower = self.code.to_ascii_lowercase();
+            self.patched = lower.contains("proto") || lower.contains("symbol");
         }
-        // `with (o)` brings names into scope unseen, and `arguments[0] = x`
-        // changes a parameter.
-        let variable = |word: &str, then: &dyn Fn(&str) -> bool| {
-            self.idents.get(word).into_iter().flatten().any(|&i| {
-                let before = self.bare[..i].trim_end();
-                let after = self.bare[i + word.len()..].trim_start();
-                !before.ends_with('.') && !(after.starts_with(':') && before.ends_with(['{', ',']))
-                    && then(after)
-            })
-        };
-        let unseen = variable("with", &|after| after.starts_with('('))
-            || variable("arguments", &|_| true);
-        let paired = matches!(self.brackets, Some(Some(_)));
-        let mut found = if paired && !unseen { self.values(name) } else { None };
-        if let Some(values) = found.as_mut() {
-            values.sort();
-            values.dedup();
-        }
-        let found = found.filter(|v| !v.is_empty());
-        self.known.insert(name.to_string(), found.clone());
-        found
+        self.brackets.as_ref()?.as_ref()?;
+        self.values(name, at).filter(|v| !v.is_empty())
     }
 
-    /// Every value `name` is given anywhere (none while it is already being
-    /// read: a cycle adds nothing new), or `None`.
-    fn values(&mut self, name: &str) -> Option<Vec<String>> {
-        if self.visiting.iter().any(|v| v == name) {
-            return Some(Vec::new());
-        }
-        let variable = name.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | '$'))
-            && name.chars().all(is_ident_char);
-        if !variable || self.visiting.len() >= 8 {
-            return None;
-        }
-        let places = self.idents.get(name)?.clone();
-        self.visiting.push(name.to_string());
-        let mut values = Vec::new();
-        // A name nothing binds is a global this cannot see.
-        let mut bound = false;
-        for i in places {
-            match self.given(name, i) {
-                Some(Given::Read) => {}
-                Some(Given::Values(v)) => {
-                    bound = true;
-                    values.extend(v);
-                }
-                None => {
-                    self.visiting.pop();
-                    return None;
-                }
-            }
-        }
-        self.visiting.pop();
-        bound.then_some(values)
+    /// Takes `work` from the budget; `None` once it runs out.
+    fn spend(&mut self, work: usize) -> Option<()> {
+        self.budget = self.budget.checked_sub(work)?;
+        Some(())
+    }
+
+    /// The program before `i`, without the space at its end.
+    fn before(&mut self, i: usize) -> Option<&'a str> {
+        let before = self.bare[..i].trim_end();
+        self.spend(1 + i - before.len())?;
+        Some(before)
+    }
+
+    /// The program from `i`, without the space at its start.
+    fn after(&mut self, i: usize) -> Option<&'a str> {
+        let after = self.bare[i..].trim_start();
+        self.spend(1 + self.bare.len() - i - after.len())?;
+        Some(after)
     }
 
     /// Where the bracket that opens at `open` closes.
     fn closing(&self, open: usize) -> Option<usize> {
-        self.brackets.as_ref()?.as_ref()?.close.get(&open).copied()
+        let close = *self.brackets.as_ref()?.as_ref()?.close.get(open)?;
+        (close != u32::MAX).then_some(close as usize)
     }
 
     /// The innermost bracket around byte `i`, as where it opens and closes.
     fn around(&self, i: usize) -> Option<(usize, usize)> {
-        let brackets = self.brackets.as_ref()?.as_ref()?;
-        let open = *brackets.inner.get(i)?;
-        (open != u32::MAX).then(|| (open as usize, brackets.close[&(open as usize)]))
+        let open = *self.brackets.as_ref()?.as_ref()?.inner.get(i)?;
+        (open != u32::MAX).then_some(open as usize).and_then(|o| Some((o, self.closing(o)?)))
     }
 
-    /// What the place at `i` where `name` is written does with it.
-    fn given(&mut self, name: &str, i: usize) -> Option<Given> {
-        self.budget = self.budget.checked_sub(1)?;
+    /// Every value a variable `name` visible at `at` can be given, or `None`.
+    fn values(&mut self, name: &str, at: usize) -> Option<Vec<String>> {
+        let variable = name.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | '$'))
+            && name.chars().all(is_ident_char);
+        if !variable {
+            return None;
+        }
+        let mut values = Vec::new();
+        // A name nothing gives a value is a global this cannot see.
+        let mut given = false;
+        for i in self.idents.get(name)?.clone() {
+            let gives = match self.place(name, i)? {
+                Place::Read => continue,
+                Place::Binds(scope, _) if !scope.contains(&at) => continue,
+                Place::Binds(_, gives) | Place::Sets(gives) => gives,
+            };
+            given = true;
+            values.extend(self.gives(name, i, gives)?);
+            values.sort();
+            values.dedup();
+            if values.len() > 64 {
+                return None;
+            }
+        }
+        given.then_some(values)
+    }
+
+    /// What the place at `i` gives `name`, read once.
+    fn gives(&mut self, name: &str, i: usize, gives: Gives) -> Option<Vec<String>> {
+        if let Some(known) = self.given.get(&i) {
+            return known.clone();
+        }
+        // A cycle adds nothing the places outside it do not give.
+        if self.visiting.contains(&i) {
+            self.cycle = true;
+            return Some(Vec::new());
+        }
+        if self.visiting.len() >= 8 {
+            return None;
+        }
+        self.visiting.push(i);
+        let outer = std::mem::take(&mut self.cycle);
+        let values = match gives {
+            Gives::Unknown => None,
+            Gives::Nothing => Some(Vec::new()),
+            Gives::After(at) => self.initializer(at),
+            Gives::Each(from, to) => self.each(from, to),
+            Gives::Parameter(open, close) => self.parameter(name, i, open, close),
+            Gives::Arrow => self.passed(i, true, 0, true),
+        };
+        self.visiting.pop();
+        if !self.cycle {
+            self.given.insert(i, values.clone());
+        }
+        self.cycle |= outer;
+        values
+    }
+
+    /// What the place at `i` where `name` is written does with it, read once.
+    fn place(&mut self, name: &str, i: usize) -> Option<Place> {
+        if let Some(place) = self.places.get(&i) {
+            return Some(place.clone());
+        }
+        let place = self.classify(name, i)?;
+        self.places.insert(i, place.clone());
+        Some(place)
+    }
+
+    fn classify(&mut self, name: &str, i: usize) -> Option<Place> {
         let bare = self.bare;
-        let before = bare[..i].trim_end();
-        let after = bare[i + name.len()..].trim_start();
+        let before = self.before(i)?;
+        let after = self.after(i + name.len())?;
         // Another object's member (`x.tool`) or a private name is another
         // name, unless the object is the global one (`globalThis.tool = x`).
         if before.ends_with('#') {
-            return Some(Given::Read);
+            return Some(Place::Read);
         }
         if let Some(object) = before.strip_suffix('.').filter(|_| !before.ends_with("...")) {
             let object = object.trim_end_matches('?').trim_end();
-            let global =
-                ["globalThis", "window", "self", "this"].iter().any(|g| ends_with_word(object, g));
-            return (!global).then_some(Given::Read);
+            self.spend(before.len() - object.len())?;
+            let global = GLOBAL_OBJECTS.iter().any(|g| ends_with_word(object, g));
+            return Some(if global { Place::Sets(Gives::Unknown) } else { Place::Read });
         }
-        let around = self.around(i);
         // An object key (`{ tool: 1 }`; `{ tool: t } = x` binds `t`) or a label.
-        let braced = around.is_some_and(|(open, _)| bare[open..].starts_with('{'));
+        let braced = self.around(i).is_some_and(|(open, _)| bare[open..].starts_with('{'));
         if braced && after.starts_with(':') && before.ends_with(['{', ',']) {
-            return Some(Given::Read);
+            return Some(Place::Read);
         }
         // Functions, classes and imports by this name, and values changed in place.
         let unstarred = before.strip_suffix('*').map_or(before, str::trim_end);
@@ -1654,70 +1763,155 @@ impl<'a> Constants<'a> {
             || after.starts_with("--")
             || COMPOUND_ASSIGNMENTS.iter().any(|op| after.starts_with(op))
         {
-            return None;
+            return Some(Place::Sets(Gives::Unknown));
         }
         // An arrow function's only parameter (`tool => …`).
         if after.starts_with("=>") {
-            return self.passed(i, true, 0, true).map(Given::Values);
+            let body = self.after(bare.len() - after.len() + 2)?;
+            let at = bare.len() - body.len();
+            let scope = match body.starts_with('{') {
+                true => i..self.closing(at)? + 1,
+                false => i..self.statement_end(at)?,
+            };
+            return Some(Place::Binds(scope, Gives::Arrow));
         }
         let mut at = i;
         let mut direct = true;
-        while let Some((open, close)) = self.around(at) {
-            let head = bare[..open].trim_end();
-            let tail = bare[close + 1..].trim_start();
+        for _ in 0..64 {
+            let Some((open, close)) = self.around(at) else {
+                return self.declared(i, before, after);
+            };
+            let head = self.before(open)?;
+            let tail = self.after(close + 1)?;
             if bare[open..].starts_with('(') {
                 if ends_with_word(head, "catch") {
-                    return None;
+                    return Some(Place::Binds(self.body(open, close)?, Gives::Unknown));
                 }
                 match function_parameters(head, tail) {
-                    Some(true) if direct => return self.parameter(name, i, open, close),
-                    Some(true) | None => return None,
+                    Some(true) => {
+                        let gives = if direct { Gives::Parameter(open, close) } else { Gives::Unknown };
+                        return Some(Place::Binds(self.body(open, close)?, gives));
+                    }
+                    None => return Some(Place::Sets(Gives::Unknown)),
                     Some(false) => {}
                 }
-                let awaited = head.strip_suffix("await").filter(|_| ends_with_word(head, "await"));
-                if direct && ends_with_word(awaited.map_or(head, str::trim_end), "for") {
-                    match leading_name(after) {
-                        "in" => return None,
-                        "of" => {
-                            let of = bare.len() - after.len();
-                            return self.elements(of + 2, close).map(Given::Values);
-                        }
-                        _ => {}
-                    }
+                let word = leading_name(after);
+                if direct && loop_head(head) && ["of", "in"].contains(&word) {
+                    let of = bare.len() - after.len();
+                    let gives = if word == "of" { Gives::Each(of + 2, close) } else { Gives::Unknown };
+                    return Some(match keyword(before) {
+                        Some(keyword) => Place::Binds(self.declared_over(i, keyword)?, gives),
+                        None => Place::Sets(gives),
+                    });
                 }
                 // `(tool) = x` assigns it, like `tool = x`.
                 if assigns(tail) || COMPOUND_ASSIGNMENTS.iter().any(|op| tail.starts_with(op)) {
-                    return None;
+                    return Some(Place::Sets(Gives::Unknown));
                 }
             } else if bare[open..].starts_with('[') && indexes(head) {
-                // `x[tool]` reads it, whatever is done with `x[tool]`.
-                break;
-            } else {
-                // `[a, tool] = …`, `({ tool } = …)`, `const { tool } = …`,
-                // `for (const [a, tool] of …)`: a pattern binds it.
-                let declared = ["const", "let", "var"].iter().any(|k| ends_with_word(head, k));
-                if declared || assigns(tail) || ["of", "in"].contains(&leading_name(tail)) {
-                    return None;
-                }
+                // `x[tool]` reads it (or `x[tool = "a"]` sets it), whatever
+                // is done with `x[tool]`.
+                return self.declared(i, before, after);
+            } else if let Some(keyword) = keyword(head) {
+                // `const { tool } = …`, `for (const [a, tool] of …)`: a pattern.
+                return Some(Place::Binds(self.declared_over(open, keyword)?, Gives::Unknown));
+            } else if assigns(tail) || ["of", "in"].contains(&leading_name(tail)) {
+                // `[a, tool] = …`, `({ tool } = …)`, `for ([a, tool] of …)`.
+                return Some(Place::Sets(Gives::Unknown));
             }
             at = open;
             direct = false;
         }
-        // `tool = "x"`, `const tool = "x"`, `let a, tool: T = "x"`.
-        let declared = ["const", "let", "var"].iter().any(|k| ends_with_word(before, k));
-        let typed = after.strip_prefix(':').filter(|_| declared || before.ends_with(','));
-        let rest = typed.map_or(after, past_type);
-        if assigns(rest) {
-            let at = bare.len() - rest.len() + 1;
-            return self.initializer(at).map(Given::Values);
+        // Too deep to tell.
+        Some(Place::Sets(Gives::Unknown))
+    }
+
+    /// What a place outside any pattern, parameter list or loop head does:
+    /// `const tool = "x"`, `tool = "x"`, `let a, tool: T = "x"`, `let tool;`,
+    /// or a read.
+    fn declared(&mut self, i: usize, before: &str, after: &str) -> Option<Place> {
+        let keyword = keyword(before);
+        let typed = after.strip_prefix(':').filter(|_| keyword.is_some() || before.ends_with(','));
+        if let Some(typed) = typed {
+            self.spend(typed.find(';').unwrap_or(typed.len()))?;
         }
-        Some(if declared { Given::Values(Vec::new()) } else { Given::Read })
+        let rest = typed.map_or(after, past_type);
+        let gives = match assigns(rest) {
+            true => Gives::After(self.bare.len() - rest.len() + 1),
+            false => Gives::Nothing,
+        };
+        Some(match keyword {
+            Some(keyword) => Place::Binds(self.declared_over(i, keyword)?, gives),
+            // An assignment, or a later declarator (`let a = 1, tool = "x"`).
+            None if assigns(rest) => Place::Sets(gives),
+            None => Place::Read,
+        })
+    }
+
+    /// Where a variable declared with `keyword` at `at` is visible: its block
+    /// (`let`, `const`; the whole loop for a loop head's), or everywhere
+    /// (`var`).
+    fn declared_over(&mut self, at: usize, keyword: &str) -> Option<Range<usize>> {
+        let whole = 0..self.bare.len();
+        if keyword == "var" {
+            return Some(whole);
+        }
+        match self.around(at) {
+            Some((open, close)) if self.bare[open..].starts_with('{') => Some(open..close + 1),
+            Some((open, close)) if self.bare[open..].starts_with('(') => {
+                let head = self.before(open)?;
+                if loop_head(head) {
+                    self.body(open, close)
+                } else {
+                    Some(whole)
+                }
+            }
+            _ => Some(whole),
+        }
+    }
+
+    /// From the brackets at `open` to the end of the function, loop or
+    /// `catch` they head: its braced body, or its statement or arrow's
+    /// expression.
+    fn body(&mut self, open: usize, close: usize) -> Option<Range<usize>> {
+        let tail = self.after(close + 1)?;
+        let body = match tail.strip_prefix("=>") {
+            Some(_) => self.after(self.bare.len() - tail.len() + 2)?,
+            None => tail,
+        };
+        let at = self.bare.len() - body.len();
+        if body.starts_with('{') {
+            return Some(open..self.closing(at)? + 1);
+        }
+        Some(open..self.statement_end(at)?)
+    }
+
+    /// Where the statement or expression from `at` ends at the latest: past
+    /// its `;`, or at the bracket that closes around it.
+    fn statement_end(&mut self, at: usize) -> Option<usize> {
+        let b = self.bare.as_bytes();
+        let mut k = at;
+        while k < b.len() {
+            match b[k] {
+                b'(' | b'[' | b'{' => k = self.closing(k)?,
+                b')' | b']' | b'}' => break,
+                b';' => {
+                    k += 1;
+                    break;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        self.spend(k - at)?;
+        Some(k)
     }
 
     /// The values a function's parameter can hold: its default, and what
     /// every call of the function passes there.
-    fn parameter(&mut self, name: &str, i: usize, open: usize, close: usize) -> Option<Given> {
+    fn parameter(&mut self, name: &str, i: usize, open: usize, close: usize) -> Option<Vec<String>> {
         let bare = self.bare;
+        self.spend(close - open)?;
         // `Map<K, V>` would split where no parameter ends.
         if bare[open + 1..close].contains('<') {
             return None;
@@ -1744,17 +1938,16 @@ impl<'a> Constants<'a> {
         let arrow = bare[close + 1..].trim_start().starts_with("=>");
         let simple = list.len() <= 2 && !list.iter().any(rest);
         values.extend(self.passed(open, arrow, p, simple)?);
-        Some(Given::Values(values))
+        Some(values)
     }
 
     /// The values parameter `p` of the function whose parameters start at
     /// `start` takes: what every call passes there, for a named function
     /// that is only ever called (`function g(…)`, `const g = (…) =>`); each
-    /// element, for a callback of an array method over an array literal with
-    /// at most the element and index parameters (`simple`).
+    /// element, for a callback of an array method with at most the element
+    /// and index parameters (`simple`).
     fn passed(&mut self, start: usize, arrow: bool, p: usize, simple: bool) -> Option<Vec<String>> {
-        let bare = self.bare;
-        let before = bare[..start].trim_end();
+        let before = self.before(start)?;
         let word = before.rsplit(|c: char| !is_ident_char(c)).next().unwrap_or("");
         let unasync = |s: &'a str| {
             let s = s.trim_end();
@@ -1768,6 +1961,7 @@ impl<'a> Constants<'a> {
             let lead = rest.strip_suffix("function").filter(|r| !r.ends_with(is_ident_char))?;
             let lead = lead.trim_end().strip_suffix("async").filter(|r| !r.ends_with(is_ident_char));
             let lead = lead.unwrap_or(&rest[..rest.len() - "function".len()]);
+            self.spend(before.len() - lead.len())?;
             if word.is_empty() || !statement_starts(lead) {
                 return None;
             }
@@ -1776,16 +1970,20 @@ impl<'a> Constants<'a> {
         // `const g = async (…) =>`, `const g = function (…)`, or a callback.
         let expression = if arrow { before } else { &before[..before.len() - word.len()] };
         let expression = unasync(expression);
+        self.spend(before.len() - expression.len())?;
         let assigned = expression.strip_suffix('=').filter(|lhs| {
             !lhs.ends_with(['=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', '^', '?'])
         });
         let Some(lhs) = assigned.map(str::trim_end) else {
             return if simple && p == 0 { self.callback(expression.len()) } else { None };
         };
+        self.spend(expression.len() - lhs.len())?;
         let function = lhs.rsplit(|c: char| !is_ident_char(c)).next().unwrap_or("");
         let declared = lhs[..lhs.len() - function.len()].trim_end();
-        let keyword = ["const", "let", "var"].iter().any(|k| ends_with_word(declared, k));
-        if function.is_empty() || function.starts_with(|c: char| c.is_ascii_digit()) || !keyword {
+        if function.is_empty()
+            || function.starts_with(|c: char| c.is_ascii_digit())
+            || keyword(declared).is_none()
+        {
             return None;
         }
         self.called_with(function, lhs.len() - function.len(), p)
@@ -1798,15 +1996,17 @@ impl<'a> Constants<'a> {
         let bare = self.bare;
         let mut values = Vec::new();
         for j in self.idents.get(function)?.clone() {
-            self.budget = self.budget.checked_sub(1)?;
-            let before = bare[..j].trim_end();
-            let after = bare[j + function.len()..].trim_start();
-            if j == declared || before.ends_with('#') {
+            if j == declared {
+                continue;
+            }
+            let before = self.before(j)?;
+            let after = self.after(j + function.len())?;
+            if before.ends_with('#') {
                 continue;
             }
             if let Some(object) = before.strip_suffix('.').filter(|_| !before.ends_with("...")) {
                 let object = object.trim_end_matches('?').trim_end();
-                if ["globalThis", "window", "self", "this"].iter().any(|g| ends_with_word(object, g)) {
+                if GLOBAL_OBJECTS.iter().any(|g| ends_with_word(object, g)) {
                     return None;
                 }
                 continue;
@@ -1821,6 +2021,7 @@ impl<'a> Constants<'a> {
             }
             let open = bare.len() - call.len();
             let close = self.closing(open)?;
+            self.spend(close - open)?;
             let arguments = entries(bare, open + 1, close);
             let spread = |r: &Range<usize>| bare[r.clone()].trim_start().starts_with("...");
             if arguments.iter().take(p + 1).any(spread) {
@@ -1828,98 +2029,309 @@ impl<'a> Constants<'a> {
             }
             if let Some(argument) = arguments.get(p).filter(|r| !bare[(*r).clone()].trim().is_empty()) {
                 values.extend(self.constant(argument.clone())?);
+                values.sort();
+                values.dedup();
             }
         }
         Some(values)
     }
 
-    /// The elements of the array literal the callback after `head` (the
-    /// position just before the callback) is the first argument of an array
-    /// method of (`["a", "b"].map(`).
+    /// The elements of the array whose method the callback after `head` (the
+    /// position just before the callback) is the first argument of
+    /// (`["a", "b"].map(`, `names.forEach(`).
     fn callback(&mut self, head: usize) -> Option<Vec<String>> {
-        let bare = self.bare;
-        let call = bare[..head].trim_end().strip_suffix('(')?.trim_end();
+        let call = self.before(head)?.strip_suffix('(')?.trim_end();
         let method = call.rsplit(|c: char| !is_ident_char(c)).next().unwrap_or("");
         if !ELEMENT_CALLBACKS.contains(&method) {
             return None;
         }
         let receiver = call[..call.len() - method.len()].trim_end().strip_suffix('.')?;
         let receiver = receiver.strip_suffix('?').unwrap_or(receiver).trim_end();
-        let end = receiver.len().checked_sub(1).filter(|_| receiver.ends_with(']'))?;
-        let (open, _) = self.around(end)?;
-        if indexes(bare[..open].trim_end()) {
+        self.spend(call.len() - receiver.len())?;
+        if receiver.ends_with(']') {
+            let (open, _) = self.around(receiver.len() - 1)?;
+            if indexes(self.before(open)?) {
+                return None;
+            }
+            return self.each(open, receiver.len());
+        }
+        let name = receiver.rsplit(|c: char| !is_ident_char(c)).next().unwrap_or("");
+        if name.is_empty() || receiver[..receiver.len() - name.len()].ends_with(['.', '#']) {
             return None;
         }
-        self.elements(open, end + 1)
+        self.each(receiver.len() - name.len(), receiver.len())
     }
 
-    /// The names an array literal that is all the text from `from` to `to`
-    /// holds (`["a", name]`).
-    fn elements(&mut self, from: usize, to: usize) -> Option<Vec<String>> {
+    /// The names each element of the array that is all the text from `from`
+    /// to `to` can be: an array literal (`["a", name]`), or a variable that
+    /// only ever holds one and is only read (see [`Constants::array`]).
+    fn each(&mut self, from: usize, to: usize) -> Option<Vec<String>> {
+        if self.patched {
+            return None;
+        }
         let bare = self.bare;
+        self.spend(to - from)?;
         let text = &bare[from..to];
         let open = from + text.len() - text.trim_start().len();
         let array = text.trim();
-        let close = self.closing(open).filter(|_| array.starts_with('['))?;
-        if close != open + array.len() - 1 {
+        if !array.starts_with('[') {
+            return self.array(array, open);
+        }
+        if self.closing(open)? != open + array.len() - 1 {
             return None;
         }
         let mut values = Vec::new();
-        for element in entries(bare, open + 1, close) {
+        for element in entries(bare, open + 1, open + array.len() - 1) {
             let text = bare[element.clone()].trim();
             if text.starts_with("...") {
                 return None;
             }
             if !text.is_empty() {
                 values.extend(self.constant(element)?);
+                values.sort();
+                values.dedup();
+                if values.len() > 64 {
+                    return None;
+                }
             }
         }
         Some(values)
     }
 
-    /// The value after the `=` that ends at `at`, when it is one whole
-    /// constant or name (`= "get";`, `= name` and a new line), not the start
-    /// of a longer expression (`= "get" + x`).
-    fn initializer(&mut self, at: usize) -> Option<Vec<String>> {
-        let bare = self.bare;
-        let value = bare[at..].trim_start();
-        let start = bare.len() - value.len();
-        let len = match value.chars().next()? {
-            q @ ('"' | '\'' | '`') => value[1..].find(q)? + 2,
-            _ => value.find(|c: char| !is_ident_char(c)).unwrap_or(value.len()),
-        };
-        let after = &value[len..];
-        let next = after.trim_start();
-        let new_line = after[..after.len() - next.len()].contains(['\n', '\r', '\u{2028}', '\u{2029}']);
-        let ends = next.is_empty()
-            || next.starts_with([';', ',', ')', ']', '}'])
-            || (new_line
-                && next.starts_with(is_ident_char)
-                && !["in", "instanceof", "as", "satisfies"].contains(&leading_name(next)));
-        if len == 0 || !ends {
-            return None;
+    /// The elements of the array a variable `name` visible at `at` holds,
+    /// when every declaration of it there gives an array literal, nothing
+    /// sets it, and every place it is used only reads it: `for (… of names)`,
+    /// `...names`, `names.length`, `names[i]`, `names.map((t, i) => …)`,
+    /// `names.join(…)` (see [`KEEPING_METHODS`]).
+    fn array(&mut self, name: &str, at: usize) -> Option<Vec<String>> {
+        let mut values = Vec::new();
+        let mut given = false;
+        for i in self.idents.get(name)?.clone() {
+            match self.place(name, i)? {
+                Place::Read if self.only_read(name, i)? => {}
+                Place::Binds(scope, _) if !scope.contains(&at) => {}
+                Place::Binds(_, Gives::After(eq)) => {
+                    let value = self.expression(eq)?;
+                    let whole = self.bare[value.start..].starts_with('[')
+                        && self.closing(value.start)? + 1 == value.end;
+                    if !whole {
+                        return None;
+                    }
+                    given = true;
+                    values.extend(self.each(value.start, value.end)?);
+                }
+                _ => return None,
+            }
         }
-        self.constant(start..start + len)
+        given.then_some(values)
+    }
+
+    /// Whether the read of the array variable `name` at `i` leaves its
+    /// elements among those it had.
+    fn only_read(&mut self, name: &str, i: usize) -> Option<bool> {
+        let bare = self.bare;
+        let before = self.before(i)?;
+        let after = self.after(i + name.len())?;
+        // A member of another object, or a key, is another name.
+        if before.ends_with('.') && !before.ends_with("...") {
+            return Some(true);
+        }
+        if ends_with_word(before, "of") || before.ends_with("...") {
+            return Some(true);
+        }
+        let consumed = ["JSON.stringify(", "new Set(", "Array.from("].iter().any(|f| before.ends_with(f));
+        if consumed && after.starts_with([')', ',']) {
+            return Some(true);
+        }
+        let changes = |s: &str| {
+            assigns(s) || s.starts_with("++") || s.starts_with("--")
+                || COMPOUND_ASSIGNMENTS.iter().any(|op| s.starts_with(op))
+        };
+        if after.starts_with('[') {
+            let close = self.closing(bare.len() - after.len())?;
+            return Some(!changes(self.after(close + 1)?));
+        }
+        let Some(member) = after.strip_prefix("?.").or_else(|| after.strip_prefix('.')) else {
+            return Some(false);
+        };
+        let method = leading_name(member.trim_start());
+        let rest = self.after(bare.len() - member.trim_start().len() + method.len())?;
+        if method == "length" {
+            return Some(!changes(rest));
+        }
+        let Some(arguments) = rest.strip_prefix('(') else {
+            return Some(false);
+        };
+        if KEEPING_METHODS.contains(&method) {
+            return Some(true);
+        }
+        // A callback that is not given the array itself.
+        if !ELEMENT_CALLBACKS.contains(&method) {
+            return Some(false);
+        }
+        let open = bare.len() - rest.len();
+        let callback = arguments.trim_start();
+        let callback = callback.strip_prefix("async").map_or(callback, str::trim_start);
+        let function = callback.strip_prefix("function");
+        let callback = function.map_or(callback, |f| {
+            f.trim_start().trim_start_matches(['*', ' ']).trim_start_matches(is_ident_char).trim_start()
+        });
+        self.spend(rest.len() - callback.len())?;
+        if !callback.starts_with('(') {
+            // `t => …`
+            let param = leading_name(callback);
+            return Some(!param.is_empty() && callback[param.len()..].trim_start().starts_with("=>"));
+        }
+        let params = bare.len() - callback.len();
+        let close = self.closing(params).filter(|&c| c < self.closing(open).unwrap_or(0))?;
+        let list = entries(bare, params + 1, close);
+        let rest_param = list.iter().any(|r| bare[r.clone()].trim_start().starts_with("..."));
+        // `(t, i) => …` or `function (t) {…}`, not a function passed in parentheses.
+        let body = self.after(close + 1)?;
+        let head = if function.is_some() { body.starts_with('{') } else { body.starts_with("=>") };
+        Some(head && list.len() <= 2 && !rest_param)
+    }
+
+    /// The names the value after the `=` that ends at `at` can be.
+    fn initializer(&mut self, at: usize) -> Option<Vec<String>> {
+        let value = self.expression(at)?;
+        self.constant(value)
+    }
+
+    /// Where the expression after `at` is written: up to its `;`, `,` or
+    /// closing bracket, or the end of its line when the next line starts a
+    /// statement (`= "get"\nconst r = …`).
+    fn expression(&mut self, at: usize) -> Option<Range<usize>> {
+        let text = self.after(at)?;
+        let start = self.bare.len() - text.len();
+        let mut depth = 0i32;
+        let mut end = text.len();
+        // Whether the code so far ends a value (a name, literal or bracket).
+        let mut ended = false;
+        let mut chars = text.char_indices().peekable();
+        while let Some((k, c)) = chars.next() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' | ';' | ',' if depth == 0 => {
+                    end = k;
+                    break;
+                }
+                ')' | ']' | '}' => depth -= 1,
+                '\n' | '\r' | '\u{2028}' | '\u{2029}' if depth == 0 && ended => {
+                    while chars.next_if(|&(_, n)| n.is_whitespace()).is_some() {}
+                    let next = &text[chars.peek().map_or(text.len(), |&(n, _)| n)..];
+                    let operator = ["in", "instanceof", "as", "satisfies"].contains(&leading_name(next));
+                    if next.starts_with(is_ident_char) && !operator {
+                        end = k;
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if !c.is_whitespace() {
+                ended = is_ident_char(c) || matches!(c, ')' | ']' | '}' | '"' | '\'' | '`');
+            }
+        }
+        self.spend(end)?;
+        let value = text[..end].trim_end();
+        Some(start..start + value.len())
     }
 
     /// The names the value written from `range` can be: one constant name
-    /// (`"get_meetings"`, `` `notion-search` ``), or a variable's.
+    /// (`"get_meetings"`, `` `notion-search` ``), a variable's, or either
+    /// branch's of a conditional (`full ? "notion-fetch" : "notion-search"`).
     fn constant(&mut self, range: Range<usize>) -> Option<Vec<String>> {
-        let text = &self.bare[range.clone()];
+        if self.nesting >= 32 {
+            return None;
+        }
+        self.nesting += 1;
+        let values = self.value(range);
+        self.nesting -= 1;
+        values
+    }
+
+    fn value(&mut self, range: Range<usize>) -> Option<Vec<String>> {
+        let bare = self.bare;
+        let text = &bare[range.clone()];
         let value = text.trim();
+        self.spend(1 + text.len() - value.len())?;
         let start = range.end - text.trim_start().len();
+        let end = start + value.len();
+        if let Some((yes, no)) = self.branches(start, end)? {
+            let mut values = self.constant(yes)?;
+            values.extend(self.constant(no)?);
+            return Some(values);
+        }
+        if value.starts_with('(') && self.closing(start) == Some(end - 1) {
+            return self.constant(start + 1..end - 1);
+        }
         let Some(quote) = value.chars().next().filter(|q| matches!(q, '"' | '\'' | '`')) else {
-            return self.values(value);
+            return self.values(value, start);
         };
         // One literal: its own text is blanked in `bare`.
         let inner = value.get(1..value.len().checked_sub(1)?)?;
         if !value.ends_with(quote) || inner.contains(quote) || inner.contains("${") {
             return None;
         }
-        let name = &self.code[start + 1..start + value.len() - 1];
+        let name = &self.code[start + 1..end - 1];
         let plain = !name.is_empty() && name.chars().all(|c| is_name_char(c) || c == '.');
         plain.then(|| vec![name.to_string()])
     }
+
+    /// The two branches of a conditional written from `start` to `end` (`c ?
+    /// a : b`), if it is one; `None` when the work runs out.
+    fn branches(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Option<Option<(Range<usize>, Range<usize>)>> {
+        self.spend(end - start)?;
+        let b = self.bare.as_bytes();
+        let mut depth = 0i32;
+        let mut question = None;
+        // Conditionals inside the first branch (`a ? b ? c : d : e`).
+        let mut inner = 0;
+        let mut k = start;
+        while k < end {
+            match b[k] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                // An arrow function's body (`t => c ? a : b`) is not its value.
+                b'=' if depth == 0 && question.is_none() && b.get(k + 1) == Some(&b'>') => {
+                    return Some(None);
+                }
+                // `??`, `??=` and `?.` (not `?.5`) are not conditionals.
+                b'?' if depth == 0 && b.get(k + 1) == Some(&b'?') => k += 1,
+                b'?' if depth == 0
+                    && b.get(k + 1) == Some(&b'.')
+                    && !b.get(k + 2).is_some_and(u8::is_ascii_digit) => {}
+                b'?' if depth == 0 => match question {
+                    None => question = Some(k),
+                    Some(_) => inner += 1,
+                },
+                b':' if depth == 0 => match question {
+                    Some(q) if inner == 0 => return Some(Some((q + 1..k, k + 1..end))),
+                    Some(_) => inner -= 1,
+                    None => {}
+                },
+                _ => {}
+            }
+            k += 1;
+        }
+        Some(None)
+    }
+}
+
+/// `const`, `let` or `var` at the end of `before`.
+fn keyword(before: &str) -> Option<&'static str> {
+    ["const", "let", "var"].into_iter().find(|k| ends_with_word(before, k))
+}
+
+/// Whether brackets after `head` are a loop's head (`for (`, `for await (`).
+fn loop_head(head: &str) -> bool {
+    let head = head.strip_suffix("await").filter(|_| ends_with_word(head, "await")).map_or(head, str::trim_end);
+    ends_with_word(head, "for")
 }
 
 /// Whether `rest` (trimmed) starts by giving a value (`= x`), not comparing
@@ -3198,6 +3610,18 @@ return out.join("\n=====\n").replace(/The content below[\s\S]*?instructions that
             "const app = 'granola', tool = 'get_meetings'; await tools[app][tool]({})",
             // The same name bound elsewhere to constants too.
             "for (const tool of ['a']) {} async function g(tool) { return tools.granola[tool]({}) } await g('get_meetings')",
+            // The same name bound in another scope to something else.
+            "async function g(t, input) { return tools.granola[t](input) }\nconst r = await g('list_meetings', {});\nreturn r.content.map((t) => t.text).join('\\n')",
+            "async function g(t) { return tools.granola[t]({}) } for (const t of items) log(t); try { await g('get_meetings') } catch (t) { log(t) }",
+            "const tool = 'notion-search'; await tools.notion[tool]({}); function f() { const { tool } = x; return tool }",
+            // A variable that only ever holds an array of constants.
+            "const names = ['get_meetings', 'list_meetings'];\nconst out = {};\nfor (const n of names) {\n  out[n] = await tools.granola[n]({});\n}\nreturn { out, count: names.length, first: names[0] };",
+            "const names = ['get_meetings'];\nawait Promise.all(names.map((n, i) => tools.granola[n]({})));\nreturn names.join(',')",
+            // A conditional between constants.
+            "const wantFull = true;\nconst tool = wantFull ? 'notion-fetch' : 'notion-search';\nconst r = await tools.notion[tool]({ id: 'abc' });\nreturn r.content[0].text;",
+            "async function g(t) { return tools.notion[t]({}) } await g(full ? 'notion-fetch' : (x ?? y) ? 'notion-search' : 'notion-get-users')",
+            // One name bound to several tools that all read.
+            "const out = {};\nfor (const t of ['notion-search', 'notion-get-users']) {\n  const fn = tools.notion[t];\n  out[t] = await fn({ query: 'x' });\n}\nreturn out;",
         ] {
             assert!(!slack_write_in_code(program, false), "{program}");
         }
@@ -3240,8 +3664,49 @@ return out.join("\n=====\n").replace(/The content below[\s\S]*?instructions that
             "await tools.granola[`get_${what}`]({})",
             "function g(tool) { return tools.granola[tool]({}) } function g(other) {} await g('get_meetings')",
             "const g = (tool: string): Promise<any> => tools.granola[tool]({}); await g(name)",
+            // Scopes: an assignment anywhere counts, a declaration where it is visible.
+            "const t = 'get_meetings'; function f() { t = pick() } await tools.granola[t]({})",
+            "let t = 'get_meetings'; { let u = 1; t = name } await tools.granola[t]({})",
+            "function f(t) { return tools.granola[t]({}) } const t = 'get_meetings'; await f(t); await f(other)",
+            "await tools.granola[x[t = name]]({}); const t = 'a'; await tools.granola[t]({})",
+            "const t = 'get_meetings'; xs.map(t => tools.granola[t]({}))",
+            // Arrays that change, or loops that may be changed.
+            "const names = ['get_meetings']; names.push(other); for (const n of names) await tools.granola[n]({})",
+            "const names = ['get_meetings']; names[0] = other; for (const n of names) await tools.granola[n]({})",
+            "const names = ['get_meetings']; helper(names); for (const n of names) await tools.granola[n]({})",
+            "const names = ['get_meetings']; names.forEach((n, i, all) => all.push(x)); for (const n of names) await tools.granola[n]({})",
+            "const names = ['get_meetings']; names.map((fn)); for (const n of names) await tools.granola[n]({})",
+            "let names = ['get_meetings']; names = more; for (const n of names) await tools.granola[n]({})",
+            "Array.prototype.map = function (cb) { return [cb('slack_send_message', 0)] };\nawait Promise.all(['slack_read_channel'].map((t) => tools.mistral.slack[t]({})))",
+            "const it = Symbol.iterator; for (const t of ['slack_read_channel']) await tools.mistral.slack[t]({})",
+            // Conditionals that are not only constants.
+            "const t = full ? 'notion-fetch' : other; await tools.notion[t]({})",
+            "const t = full ? 'notion-fetch' : 'notion-search' + x; await tools.notion[t]({})",
+            "const t = full ? 'slack_read_channel' : 'slack_send_message'; await tools.mistral.slack[t]({})",
+            "const t = (x) => full ? 'a' : 'b'; await tools.granola[t]({})",
+            // One name bound to several tools, one of which writes or reaches Slack.
+            "for (const t of ['notion-search', 'notion-update-page']) { const fn = tools.notion[t]; await fn({}) }",
+            "for (const t of ['notion-search', 'slack']) { const fn = tools.mistral[t]; await fn.post({}) }",
         ] {
             assert!(slack_write_in_code(program, false), "{program}");
+        }
+        // Programs built to make the check slow still finish quickly.
+        let nested = format!("const t = 'get_meetings';\nlet a;\n{}{}{};\nawait tools.granola[a]({{}});\n",
+            "[".repeat(2000), vec!["a = t"; 315].join(", "), "]".repeat(2000));
+        let comment = format!("const t = 'get_meetings';\nlet a;\nconsole.log([{}])\n{}await tools.granola[a]({{}});\n",
+            vec!["a = t"; 315].join(", "), "// notes about the meetings we fetched above\n".repeat(852));
+        let chained = format!("for (var t of [{}]) {{}}\nlet x1, x2, x3, x4, x5, x6, x7;\n{}{}{}{}{}{}{}await tools.granola[x7]({{}});\n",
+            vec!["'a'"; 6000].join(","), "x1 = t;\n".repeat(3), "x2 = x1;\n".repeat(3), "x3 = x2;\n".repeat(2),
+            "x4 = x3;\n".repeat(3), "x5 = x4;\n".repeat(5), "x6 = x5;\n".repeat(7), "x7 = x6;\n".repeat(7));
+        let dotted = format!("const a = '{}';\nawait tools.granola{}({{}});\n", vec!["x"; 1000].join("."), "[a]".repeat(1000));
+        let calls = format!("let x;\nfunction g(a, t) {{\n{}  return a;\n}}\n{}0{};\nawait tools.granola[x]({{}});\n",
+            "  x = t;\n".repeat(90), "g(".repeat(1000), ",'get_meetings')".repeat(1000));
+        let walk = format!("const t = 'get_meetings'; await tools.granola[t]({{}});\n{}{}{};\n",
+            "[".repeat(2000), "t,".repeat(2000), "]".repeat(2000));
+        for program in [nested, comment, chained, dotted, calls, walk] {
+            let started = std::time::Instant::now();
+            slack_write_in_code(&program, false);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "{}", &program[..80]);
         }
     }
 
