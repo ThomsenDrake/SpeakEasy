@@ -509,7 +509,7 @@ fn a_click_pressed_on_a_withdrawn_card_does_not_decide_the_next() {
     let ctx = egui::Context::default();
     let p = Pos2::new(10.0, 10.0);
     let frame = |time: f64, pressed: bool, app: &mut ApprovalApp, decide: bool| {
-        let input = RawInput {
+        let mut input = RawInput {
             time: Some(time),
             events: vec![
                 Event::PointerMoved(p),
@@ -517,8 +517,11 @@ fn a_click_pressed_on_a_withdrawn_card_does_not_decide_the_next() {
             ],
             ..Default::default()
         };
+        // The raw-input hook: it times the batches a press is known by.
+        app.extract_keys(&ctx, &mut input, true, Vec::new, Vec::new());
         let mut out = ctx.run_ui(input, |ui| {
             app.track_press(ui.ctx());
+            app.track_current(ui.ctx());
             if decide {
                 app.decide(ui.ctx(), Decision::Approve);
             }

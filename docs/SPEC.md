@@ -621,6 +621,85 @@ transport with typed Rust calls):
   window hides it and never approves a message; SpeakEasy keeps running
   (menu-bar icon to reopen or quit). If SpeakEasy quits, pending requests
   fail and the agent is told nothing was sent."
+- Keyboard (`app/shortcuts.rs`): plain Enter approves and plain Escape
+  denies the front request through the same `decide` path as the buttons.
+  They arm only `ARM_DELAY` (1 s) after the latest of: the request became
+  the front card, the window (on screen) got the focus, the last text
+  input or key press other than Enter/Escape/Tab (typing re-arms), new
+  requests brought the window forward (`sync_queue` → `reveal`, stamped as
+  `revealed_at`; the user's own Dock or menu-bar reveal is not), and the
+  user re-established the focus (`refocused_at`: after an orphaned focus,
+  stray typing, or a withdrawal of the front card; below). Only a fresh
+  press acts: a key-repeat (a key seen down already, or one the OS flags
+  as a repeat, recorded by an `NSEvent` local key-down monitor because
+  egui-winit drops the flag: `sys::monitor_shortcut_key_downs`), a key
+  that went down before arming, and a key the OS reports down when the
+  window gets the focus (`sys::shortcut_keys_down`) do nothing. A press is
+  known only to have gone down after the previous input batch was taken,
+  so it counts as armed only when that batch was taken at or after arming;
+  the app asks for a frame at each arming time (`schedule_arming`,
+  `request_repaint_after`) so that such a batch exists. Neither key decides
+  with an empty queue, a hidden window, or a decision being submitted. In
+  the feedback textarea Enter types a newline and Escape only leaves the
+  field. A button focused with the keyboard (Tab, ring visible) is
+  activated by Enter, or by Space on release, gated the same way (Escape
+  still denies); a button focused by a click is no focus for the keys
+  (Enter approves, Space scrolls; `FocusTracker::key_target`). The keys act
+  on the control egui's focus is on, which VoiceOver and Full Keyboard
+  Access move (AccessKit focus requests, also read in event order within a
+  batch); with egui's focus on any other widget, Enter and Escape do
+  nothing. egui's own arrow-key focus navigation (a plain arrow in the
+  textarea before the TextEdit locks the arrows: in the batch that gave it
+  the focus, or the one after a click in it) is not followed: a move of
+  egui's focus after the app's pass (`egui_focus_after_pass`) to anything
+  but the tracker's control is undone (`adopt_egui_focus`).
+  `track_current` clears egui's focus with the tracker's, since
+  the controls keep their ids from card to card. `ApprovalApp::extract_keys`
+  reads the keys in event order, so a Tab earlier in the same input batch
+  moves the focus that later keys are judged against. A card that takes the
+  front in a pass (a key decided the one before it) is tracked before
+  anything can decide it, and a click pressed no later than that pass is
+  ignored. If the front card is withdrawn while one of its controls has the
+  focus (the textarea, or a button focused with Tab or a click), the focus
+  is orphaned: nothing decides and no button activates
+  (`shortcuts::while_orphaned`) until Tab/Shift+Tab, a primary press in the
+  window, or a fresh plain Escape. That key or press decides nothing itself
+  (a click on a decision button is ignored) and restarts both arming delays
+  (`refocused_at`). This outlives a window focus loss and ends when the
+  queue empties; a decision by the user never orphans the focus. Text
+  typed while no text field has the focus (text, paste or IME input that
+  is not only whitespace, or a letter, digit, punctuation, Backspace or
+  Delete key without Cmd/Ctrl: `shortcuts::is_text`,
+  `shortcuts::is_typing_key`) was meant for another app, and so may the
+  keys after it be (`stray_typing`): they are held back the same way until
+  Tab/Shift+Tab or a primary press in the window (not an Escape, which may
+  be meant for the other app too), which decides nothing itself and
+  restarts both arming delays. This ends when the window loses the focus
+  or the queue empties. Typing while the focus is orphaned counts as meant
+  for the field that vanished, not as stray. In one
+  input batch, every Enter/Escape/Space press after a queued decision or
+  button activation, or after a primary pointer press or release, is judged
+  as not armed (it can still type in or leave the textarea); Enter or Space
+  on Give feedback updates the tab order at once for the controls the panel
+  adds or removes, so a later Tab in the batch follows the order the next
+  paint builds.
+- Clicks on Approve, Deny and Submit feedback decide only when pressed
+  `CLICK_ARM` (0.5 s) after the latest of: the request became the front
+  card, the window came on screen, focused or not, new requests brought the
+  window forward, and the user re-established the focus (an orphaned focus,
+  stray typing, or the first press after a withdrawal, below)
+  (`shortcuts::click_armed`). As for keys, the press counts from the
+  previous input batch. After the front card is withdrawn (not decided by
+  the user), the next primary press in the window decides nothing and
+  restarts both arming delays (`orphaned_clicks`), however late it comes:
+  the next card's controls lie where the withdrawn card's were, and the
+  user may not have seen the swap. This outlives a window focus loss and
+  an empty queue. A click aimed at a card that was just withdrawn, at the
+  app the window appeared over or came in front of, or at a control that
+  vanished with its card, decides nothing and changes no focus: it leaves
+  none on the button it landed on, and a control focused before it (a
+  button focused with the keyboard, the textarea) keeps the focus, egui's
+  too.
 - Closing the window only **hides** it (egui `CloseRequested` → hide); the
   gateway process keeps serving MCP for every agent. Quitting happens only
   via **Quit SpeakEasy** in the tray menu or the app menu (⌘Q)
@@ -640,13 +719,14 @@ transport with typed Rust calls):
 |---|---|
 | `app.rs` | eframe app: window lifecycle (720×780 default, min 520×560, centered, initially hidden), tray menu, keyboard/focus model, decision dispatch, reduced-motion handling |
 | `app/paint.rs` | frame layout + painting (fixed header / scrolling main / fixed footer), scrollbar |
+| `app/shortcuts.rs` | the keyboard decision gate (Enter/Escape shortcuts, Enter/Space on a button focused with the keyboard): arming delay (and its restarts), typing re-arm, key-repeat and pre-arm presses, focused textarea/buttons, orphaned focus, stray typing; the click arming delay |
 | `components.rs` | Once UI-style controls: `Tag`, `Button`, `Textarea`, section labels, selectable text |
 | `theme.rs` | light/dark palettes + responsive metrics (rem root 15px ≤768px viewport, else 16px) |
 | `text.rs` | SF Pro / SF Mono installation + CSS-exact `TextSpec`s (size, weight, line-height, letter-spacing) |
 | `anim.rs` | Motion-matched animation: spring physics (stiffness 100 / damping 10 / mass 1), cubic-bezier tweens, `TextEffect` fade-in-blur, `AnimatedNumber` |
 | `icons.rs` | Lucide SVG path parser + flattener/renderer (Slack, inbox, hash, person, chat, …) |
 | `shaders.rs` | the title reveal's gaussian blur + premultiplied text draw as small wgpu paint callbacks |
-| `sys.rs` | macOS integration: NSPasteboard copy, dock/reveal, reduced-motion + on-screen queries |
+| `sys.rs` | macOS integration: NSPasteboard copy, dock/reveal, reduced-motion, on-screen and keys-down queries, the key-repeat flag of Enter/Escape/Space key-downs (NSEvent monitor) |
 | `demo.rs` | `--demo` synthetic fixtures (isolated state dir, mock Slack — never sends) |
 
 ### `src/hook.rs` — pre-tool hook mode (`--hook <agent> [--wait SECS]`)
@@ -674,9 +754,70 @@ payload on stdin. The mode:
    Executor, recognized by its server or by "executor" in the full name
    (`executor-call`, `mcp_executor_call`), is gated through its `call`
    (by `path`) and `execute` (the program); goose's `execute_typescript`
-   likewise. Programs are checked after undoing `\u`/`\x` escapes and
-   `'a' + 'b'` joins: a Slack tool that writes, a computed tool name
-   (`tools…[…]`, `globalThis[…]`), `eval(` or `Function(` gates.
+   likewise; a `call` whose path names no Slack tool is also checked as
+   the program `path(input)`; each string of a call's input is checked on
+   its own. Programs are checked after undoing `\u`/`\x` escapes that spell
+   a name and joins of same-quote literals (`'a' + 'b'`), and names are read
+   with the text of strings, regular expressions (and their flags) and comments set aside; a
+   quote or regular expression still open at the end of its line (not a
+   string continued with `\`) was misread and counts as code. A quoted key made of name characters
+   (`tools.notion["notion-search"]`, Executor's spelling of hyphenated
+   tools) is a name, not a computed one. Every member chain from `tools`
+   (in goose, from a namespace such as `Slack` or `slack`), and from a
+   name declared from one, which stands for the chain it was declared from
+   (`const s = tools.mistral.slack; s.post(…)` is
+   `tools.mistral.slack.post(…)`; also destructured, annotated, `as`-cast
+   and `?? other` declarations; a name declared twice stands for Slack's
+   tools if either declaration does), is judged when it reaches a Slack app, by
+   its tool's name: one that writes gates, one that reads passes, and one
+   that says neither (`tools.mistral.slack`) gates unless it is declared
+   (its uses are judged instead) or only looked at (`Object.keys(…)`,
+   `!…`, `typeof …`). A computed key that only ever holds constant names
+   stands for each of them (`async function g(tool) { …tools.granola[tool](…)… }`
+   called only as `g("get_meetings")` is `tools.granola.get_meetings`; a
+   name bound to several tools is followed only when each of them reads).
+   Such a key is a constant name of at most 128 characters; a conditional
+   or `??`/`||` between such keys (`full ? "notion-fetch" :
+   "notion-search"`); a template of them (`` `notion-get-${kind}` ``); with
+   a trailing `as`/`satisfies` cast; an element or key of a `const` array or
+   object literal of them that is only read (`names[i]`, `TOOLS.search`; no
+   getters, methods, spreads, computed keys or `__proto__`); or a variable
+   every value of which is one: the declarations whose block, function or
+   loop can reach the key (the innermost one whose span is exactly its scope
+   hides everything outside it) and assignments, through `for (… of …)` or
+   an element callback with at most the element and index parameters
+   (`names.map((t) => …)`, `names.map(g)`) over such an array, or the calls
+   of the named function it is a parameter of, which is only ever called
+   directly or handed to such an array's element callback. A pattern,
+   `catch`, a changed value (`t += x`), a function passed on otherwise, a
+   name no declaration reaches (a global), `arguments`, `with`, `import()`,
+   a global property of that name, prototypes, symbols or reflection named
+   in code or in a string's value (for arrays and objects), text that
+   JavaScript may read differently (a `/` after `}` or a statement's `)`, a
+   quote or regular expression left open, names or spaces outside ASCII,
+   HTML-like comments), or a program that needs more work than a fixed
+   budget to read leaves the key computed. Also gating: any other computed tool name (`tools…[name]`,
+   `globalThis[…]`, `window[…]`, `this[…]`; not `[0]`); a call or value of `eval` or a `Function`
+   constructor, or a constructor taken (not `.constructor.name` or a
+   comparison); a function named for a Slack write that the program calls
+   but does not declare (`slackSendMessage(`); goose's `server__tool` names
+   that do not read; korotovsky's tool names that write, anywhere; a Slack
+   Web API write method or webhook URL as a whole string
+   (`"/chat.postMessage"`, `"https://slack.com/api/chat.postMessage"`,
+   `"https://hooks.slack.com/…"`, also followed by `?`, `#` or `${`) in a
+   program that does more than read (calls a tool that does not read, or
+   `fetch`);
+   and, in a program that mentions Slack other than through a read,
+   `tools` passed on as a value (`reduce((o, k) => o[k], tools)`,
+   `{ ...tools }`), a global object taken as a value (`const root =
+   globalThis`), a declaration the check cannot read, or a dispatcher or
+   raw HTTP tool (`tools.executor.tools.call`, `call_tool`,
+   `execute_workflow`, `runNow`, `workflows.start`, `tools.http.request`,
+   goose's `invoke`; not a query such as `run_query` or `execute({ sql:
+   "…" })`, nor a raw request tool without a write verb in a program whose
+   requests are all `"GET"`). Slack in a query, a comment, a
+   URL, a variable or a helper's name (`slackResults`, `searchSlack(q)`)
+   does not gate.
 3. Builds the popup request: destination from `channel_id`/`channel`/
    `user_id`/… , the exact text from `message`/`text`/`payload`/…, a Slack
    `thread_ts`; other arguments are listed in the reason. The text is shown

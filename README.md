@@ -154,6 +154,30 @@ Closing the window doesn't approve or deny anything. It only hides the
 window, and the request keeps waiting. To bring it back, click SpeakEasy's
 menu-bar icon.
 
+On the keyboard, Enter approves and Escape denies, the same as clicking.
+They work only after the request has been in the focused window for one
+second, and one second after you last typed or a new request brought the
+window to the front. So a key you were pressing in another app when the
+window came up does nothing, and neither does a key you meant for a request
+that was just replaced. In the feedback field, Enter adds a line and Escape
+leaves the field. Press Tab to move between the buttons; Enter or Space then
+presses the highlighted button, with the same waiting time. With VoiceOver,
+Enter presses the button VoiceOver is on. A button you clicked is not
+highlighted: Enter still approves and Space scrolls. If a request is
+withdrawn while you are typing feedback for it or have one of its buttons
+selected, Enter and Escape do nothing on the request that replaces it until
+you press Escape or Tab, or click in the window. That key or click does
+nothing else, and the keys work again one second later. If you type in the
+window while no text field is selected, SpeakEasy takes it that you were
+typing in another app: Enter and Escape do nothing until you press Tab,
+click in the window, or switch away and back. A click on Approve, Deny or
+Submit feedback does nothing in the first half second after a request
+appears, the window comes up, a new request brings it to the front, or such
+a key or click gives the keys back. After a request is withdrawn, your first
+click in the window does nothing either, since the next request's buttons
+may be where you meant to click. A click that does nothing leaves the
+highlighted button or the feedback field as it was.
+
 All your agents share one SpeakEasy. Requests from every agent queue in the
 same window, and the header shows how many are waiting.
 
@@ -542,9 +566,15 @@ agents. It honors `CODEX_HOME`,
   reason and your feedback don't reach it.
 - goose doesn't hook the tools a Code Mode program calls, and Executor's
   `execute` runs a whole program, so for those the hook reads the program.
-  It asks when the program names a Slack tool that writes, or reaches tools
-  by a computed name. A program can still hide a Slack call well enough to
-  get past it.
+  It asks when the program calls a Slack tool that writes, uses a Slack
+  app's tools in a way it can't follow, or reaches tools by a computed
+  name it can't trace back to fixed names (a helper called as
+  `g("get_meetings")` that runs `tools.granola[tool]` is traced), and, in
+  a program that mentions Slack, when it passes `tools`
+  around or runs a tool, an automation or an HTTP request by name. A
+  search, comment, URL or variable that only mentions Slack doesn't count
+  on its own. A program can still hide a Slack call well enough to get
+  past it.
 - Zed's built-in agent and Claude Desktop have no hooks. Zed asks before
   each MCP tool call unless you chose **Always allow** for it; in Claude
   Desktop, set the Slack connector's send tools to **Needs approval**.
@@ -680,9 +710,10 @@ and Mistral connectors, as far as each agent's hook system holds:
   `~/.slack-approval-gateway/`. An agent that can run commands as you could
   stop SpeakEasy and answer in its place.
 - The hooks gate MCP tools. Posting with `curl` and a token, a webhook, or a
-  browser isn't a Slack tool call. Claude Code's Slack plugin keeps its
-  login in Claude Code's credential store, which an agent can't read
-  through its tools without your permission.
+  browser isn't a Slack tool call, and an automation that posts later,
+  such as a Mistral workflow, may start without asking. Claude Code's
+  Slack plugin keeps its login in Claude Code's credential store, which an
+  agent can't read through its tools without your permission.
 
 Two more gaps come from agents running as your macOS user:
 
