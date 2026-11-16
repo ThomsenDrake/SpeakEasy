@@ -13,6 +13,21 @@
 //! when the window got the focus. The gate itself is the pure
 //! [`key_action`]; `ApprovalApp::extract_keys` feeds it every raw key event
 //! in order, with the focus as moved by the Tab presses before it.
+//!
+//! Two more rules keep a key on the card it was meant for:
+//! - When the front card is withdrawn while one of its controls has the
+//!   focus, the keys the user is pressing were meant for that control.
+//!   Until the user moves the focus again (Tab, a click, or a plain Escape,
+//!   which only does that), nothing decides or activates
+//!   ([`while_orphaned`]).
+//! - In one input batch, a key after a queued decision or button
+//!   activation, or after a click, is judged as not armed: the focus and
+//!   the controls it would act on change only in the logic and paint
+//!   passes.
+//!
+//! Clicks on the decision buttons have their own, shorter delay
+//! ([`click_armed`]): a click that was aimed at the card before this one,
+//! or at another app the window just appeared over, decides nothing.
 
 use std::collections::HashMap;
 
@@ -113,6 +128,36 @@ pub(crate) fn key_action(
         },
         _ => KeyAction::PassThrough,
     }
+}
+
+/// What a key does while the focus is orphaned: the front card was
+/// withdrawn while one of its controls had the focus, and the user has not
+/// moved the focus since. Nothing decides and no button activates; Enter in
+/// a textarea, Escape leaving it, and Space scrolling are left as they are.
+pub(crate) fn while_orphaned(action: KeyAction) -> KeyAction {
+    match action {
+        KeyAction::Approve
+        | KeyAction::Deny
+        | KeyAction::Activate(_)
+        | KeyAction::PressButton(_) => KeyAction::Swallow,
+        other => other,
+    }
+}
+
+/// Seconds after the card became the front card, and after the window came
+/// on screen, before a click on Approve, Deny or Submit feedback decides it.
+/// A click pressed sooner was aimed at what was there before: the card that
+/// was just withdrawn or decided, or the app the window appeared over. No
+/// one reads a request and clicks in this time.
+pub(crate) const CLICK_ARM: f64 = 0.5;
+
+/// Whether a click whose press started at `pressed_at` may decide the front
+/// card: [`CLICK_ARM`] after the latest of `front_since` (it became the
+/// front card) and `on_screen_since` (the window came on screen; `None`:
+/// not known to be on screen, which adds no delay of its own).
+pub(crate) fn click_armed(pressed_at: f64, front_since: f64, on_screen_since: Option<f64>) -> bool {
+    let since = on_screen_since.map_or(front_since, |t| t.max(front_since));
+    pressed_at >= since + CLICK_ARM
 }
 
 /// When each gated key (Enter, Escape, Space) went down (absent: up).
@@ -839,20 +884,27 @@ mod tests {
         pass(&ctx, &mut app, 3.2, true, vec![typed(" ")]);
         assert_eq!(app.current_id.as_deref(), Some("b"));
         assert_eq!(app.focus.focused, None);
+        assert!(app.orphaned_focus);
         // The user keeps typing, and more than a second after B appeared
-        // presses Enter for a new line, then Escape.
+        // presses Enter for a new line.
         for (t, text) in [(3.6, "please"), (4.0, ".")] {
             pass(&ctx, &mut app, t, true, vec![typed(text)]);
         }
         pass(&ctx, &mut app, 4.3, true, tap(Key::Enter));
-        pass(&ctx, &mut app, 4.4, true, tap(Key::Escape));
+        // A pause, then another new line, a second after the last
+        // keystroke: still nothing (the field it is meant for is gone).
+        pass(&ctx, &mut app, 5.1, true, tap(Key::Enter));
         assert!(
             undecided(&rx_b),
             "keys meant for A's feedback must not decide B"
         );
         assert!(undecided(&rx_a));
-        // A second after the last keystroke, Enter approves B.
-        pass(&ctx, &mut app, 5.1, true, tap(Key::Enter));
+        // Escape (to leave that field) only gives the keys back.
+        pass(&ctx, &mut app, 5.2, true, tap(Key::Escape));
+        assert!(undecided(&rx_b), "Escape must only leave the lost field");
+        assert!(!app.orphaned_focus);
+        // Then a deliberate Enter approves B.
+        pass(&ctx, &mut app, 5.4, true, tap(Key::Enter));
         assert!(approved(&rx_b));
     }
 
@@ -1117,5 +1169,482 @@ mod tests {
             rx.try_recv(),
             Ok(Ok(Decision::Feedback(text))) if text == "Shorter, please"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // The front card withdrawn under a focused control (orphaned focus).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn while_orphaned_nothing_decides_or_activates() {
+        for action in [
+            KeyAction::Approve,
+            KeyAction::Deny,
+            KeyAction::Activate(FocusId::Deny),
+            KeyAction::PressButton(FocusId::Approve),
+        ] {
+            assert_eq!(while_orphaned(action), KeyAction::Swallow);
+        }
+        // A newline or a space in a textarea, leaving it, and scrolling
+        // stay as they are.
+        for action in [
+            KeyAction::PassThrough,
+            KeyAction::Swallow,
+            KeyAction::BlurTextarea,
+        ] {
+            assert_eq!(while_orphaned(action), action);
+        }
+    }
+
+    /// A is withdrawn while the user writes feedback for it; B takes the
+    /// front at t=2.2.
+    fn withdrawn_while_writing_feedback() -> (Context, ApprovalApp, Reply, Reply) {
+        let (mut app, rx_a) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        open_feedback(&ctx, &mut app, 1.1, "");
+        focus_textarea(&ctx, &mut app);
+        pass(&ctx, &mut app, 2.0, true, vec![typed("Too long")]);
+        assert_eq!(app.feedback_text, "Too long");
+        assert!(app.state.withdraw("a"));
+        let rx_b = enqueue(&app.state, "b");
+        pass(&ctx, &mut app, 2.2, true, vec![]);
+        assert_eq!(app.current_id.as_deref(), Some("b"));
+        assert_eq!(app.focus.focused, None);
+        assert!(app.orphaned_focus);
+        (ctx, app, rx_a, rx_b)
+    }
+
+    #[test]
+    fn enter_for_a_new_line_in_a_withdrawn_cards_field_never_approves_the_next() {
+        let (ctx, mut app, rx_a, rx_b) = withdrawn_while_writing_feedback();
+        // The user pauses to think, then presses Enter for a new line, well
+        // after B armed (t=3.2); and again much later.
+        pass(&ctx, &mut app, 3.4, true, tap(Key::Enter));
+        pass(&ctx, &mut app, 8.0, true, tap(Key::Enter));
+        assert!(undecided(&rx_b), "Enter meant for A's field must not approve B");
+        assert!(undecided(&rx_a));
+        assert_eq!(app.queue.len(), 1);
+        // Escape (to leave the field) only gives the keys back...
+        pass(&ctx, &mut app, 8.2, true, tap(Key::Escape));
+        assert!(undecided(&rx_b), "Escape must only leave the lost field");
+        // ...then a deliberate Enter approves B.
+        pass(&ctx, &mut app, 8.4, true, tap(Key::Enter));
+        assert!(approved(&rx_b));
+    }
+
+    #[test]
+    fn escape_to_leave_a_withdrawn_cards_field_never_denies_the_next() {
+        let (ctx, mut app, _rx_a, rx_b) = withdrawn_while_writing_feedback();
+        pass(&ctx, &mut app, 3.4, true, tap(Key::Escape));
+        assert!(undecided(&rx_b), "Escape meant to leave A's field must not deny B");
+        assert!(!app.orphaned_focus);
+        // A key-repeat of an Escape held down since before does not count
+        // as that Escape.
+        let (ctx, mut app, _rx_a, rx_b) = withdrawn_while_writing_feedback();
+        app.held_keys.hold(Key::Escape, 2.2);
+        pass(&ctx, &mut app, 3.4, true, vec![press(Key::Escape)]);
+        assert!(app.orphaned_focus);
+        assert!(undecided(&rx_b));
+        pass(&ctx, &mut app, 3.5, true, vec![release(Key::Escape)]);
+        // A fresh Escape leaves the lost field; the next, deliberate one
+        // denies B.
+        pass(&ctx, &mut app, 3.6, true, tap(Key::Escape));
+        assert!(!app.orphaned_focus);
+        assert!(undecided(&rx_b));
+        pass(&ctx, &mut app, 3.7, true, tap(Key::Escape));
+        assert!(denied(&rx_b));
+    }
+
+    /// Deny is focused with Tab on A; A is withdrawn and B takes the front
+    /// at t=2.0.
+    fn withdrawn_with_deny_focused() -> (Context, ApprovalApp, Vec<Reply>) {
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab(), tab()]);
+        assert_eq!(app.focus.focused, Some(FocusId::Deny));
+        assert!(app.state.withdraw("a"));
+        pass(&ctx, &mut app, 2.0, true, vec![]);
+        assert_eq!(app.current_id.as_deref(), Some("b"));
+        assert_eq!(app.focus.focused, None);
+        assert!(app.orphaned_focus);
+        (ctx, app, rx)
+    }
+
+    #[test]
+    fn enter_meant_for_a_withdrawn_cards_focused_deny_never_approves_the_next() {
+        let (ctx, mut app, rx) = withdrawn_with_deny_focused();
+        // Enter (to deny A, through the Deny button that vanished).
+        pass(&ctx, &mut app, 3.1, true, tap(Key::Enter));
+        assert!(undecided(&rx[1]), "Enter meant for A's Deny must not approve B");
+        // A Space would have pressed that Deny: it only scrolls now.
+        pass(&ctx, &mut app, 3.2, true, space());
+        assert!(undecided(&rx[1]));
+        assert!(undecided(&rx[0]));
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[test]
+    fn tab_or_a_click_gives_the_keys_back_after_an_orphaning_withdrawal() {
+        // Tab: Give feedback, then Deny; Enter on the Deny the user tabbed
+        // to denies B.
+        let (ctx, mut app, rx) = withdrawn_with_deny_focused();
+        pass(&ctx, &mut app, 3.1, true, vec![tab()]);
+        assert!(!app.orphaned_focus);
+        pass(&ctx, &mut app, 3.2, true, vec![tab()]);
+        pass(&ctx, &mut app, 3.3, true, tap(Key::Enter));
+        assert!(denied(&rx[1]));
+
+        // A click in the window (on the card's text): then Enter approves.
+        let (ctx, mut app, rx) = withdrawn_with_deny_focused();
+        let body = app.main_rect.left_top() + vec2(30.0, 30.0);
+        pass(&ctx, &mut app, 3.1, true, click_at(body));
+        assert!(!app.orphaned_focus);
+        assert!(undecided(&rx[1]));
+        pass(&ctx, &mut app, 3.3, true, tap(Key::Enter));
+        assert!(approved(&rx[1]));
+    }
+
+    #[test]
+    fn the_keys_stay_held_back_through_a_trip_to_another_app() {
+        let (ctx, mut app, rx_a, rx_b) = withdrawn_while_writing_feedback();
+        // The user switches away and back, then (armed again at t=6)
+        // presses Enter for a new line in A's field.
+        pass(&ctx, &mut app, 3.0, false, vec![Event::WindowFocused(false)]);
+        pass(&ctx, &mut app, 5.0, true, vec![Event::WindowFocused(true)]);
+        pass(&ctx, &mut app, 6.5, true, tap(Key::Enter));
+        assert!(undecided(&rx_b));
+        assert!(undecided(&rx_a));
+        assert!(app.orphaned_focus);
+    }
+
+    #[test]
+    fn a_withdrawal_while_away_holds_the_keys_back_too() {
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab(), tab()]);
+        // Away with Deny focused; A is withdrawn meanwhile.
+        pass(&ctx, &mut app, 2.0, false, vec![Event::WindowFocused(false)]);
+        assert!(app.state.withdraw("a"));
+        pass(&ctx, &mut app, 3.0, false, vec![]);
+        assert!(app.orphaned_focus);
+        // Back at t=5; Enter (for the Deny that was focused) at t=6.5.
+        pass(&ctx, &mut app, 5.0, true, vec![Event::WindowFocused(true)]);
+        pass(&ctx, &mut app, 6.5, true, tap(Key::Enter));
+        assert!(undecided(&rx[1]));
+    }
+
+    #[test]
+    fn the_users_own_decision_or_nothing_focused_does_not_hold_the_keys_back() {
+        // Enter on a Deny focused with Tab denies A: B is the user's next
+        // card, and Enter approves it once armed.
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab(), tab()]);
+        pass(&ctx, &mut app, 2.5, true, tap(Key::Enter));
+        assert!(denied(&rx[0]));
+        assert!(!app.orphaned_focus);
+        pass(&ctx, &mut app, 3.6, true, tap(Key::Enter));
+        assert!(approved(&rx[1]));
+
+        // A click on Approve with the textarea focused: the same.
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        open_feedback(&ctx, &mut app, 1.1, "");
+        focus_textarea(&ctx, &mut app);
+        pass(&ctx, &mut app, 1.2, true, vec![]);
+        let approve = button_center(&ctx, FocusId::Approve);
+        pass(&ctx, &mut app, 2.0, true, click_at(approve));
+        assert!(approved(&rx[0]));
+        pass(&ctx, &mut app, 2.1, true, vec![]);
+        assert!(!app.orphaned_focus);
+
+        // A withdrawn with nothing focused: only the arming delay applies.
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        assert!(app.state.withdraw("a"));
+        pass(&ctx, &mut app, 2.0, true, vec![]);
+        assert!(!app.orphaned_focus);
+        pass(&ctx, &mut app, 3.1, true, tap(Key::Enter));
+        assert!(approved(&rx[1]));
+
+        // A card behind the front one withdrawn: the focus stays.
+        let (mut app, _rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab(), tab()]);
+        assert!(app.state.withdraw("b"));
+        pass(&ctx, &mut app, 2.0, true, vec![]);
+        assert!(!app.orphaned_focus);
+        assert_eq!(app.focus.focused, Some(FocusId::Deny));
+    }
+
+    // -----------------------------------------------------------------------
+    // One input batch: keys after an effect that only the logic or paint
+    // pass applies.
+    // -----------------------------------------------------------------------
+
+    /// One frame, checking that the tab order the key reading predicted is
+    /// the one the paint pass built.
+    fn pass_predicting_order(
+        ctx: &Context,
+        app: &mut ApprovalApp,
+        time: f64,
+        events: Vec<Event>,
+    ) {
+        let input = hook(ctx, app, time, true, events, &[]);
+        let predicted = app.focus.order.clone();
+        run(ctx, app, input);
+        assert_eq!(predicted, app.focus.order, "the tab order the keys used");
+    }
+
+    #[test]
+    fn enter_on_give_feedback_then_shift_tab_then_enter_in_one_batch_types_a_newline() {
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab()]);
+        assert_eq!(app.focus.focused, Some(FocusId::GiveFeedback));
+        // Enter opens the panel, Shift+Tab goes back into the textarea now
+        // before Give feedback, Enter types a new line there.
+        pass_predicting_order(
+            &ctx,
+            &mut app,
+            2.6,
+            [tap(Key::Enter), vec![shift_tab()], tap(Key::Enter)].concat(),
+        );
+        assert!(app.feedback_open);
+        assert_eq!(app.focus.focused, Some(FocusId::Textarea));
+        assert_eq!(app.feedback_text, "\n");
+        assert!(undecided(&rx));
+        // Tab to Give feedback, Enter, Shift+Tab, Enter: the same.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass_predicting_order(
+            &ctx,
+            &mut app,
+            2.5,
+            [vec![tab()], tap(Key::Enter), vec![shift_tab()], tap(Key::Enter)].concat(),
+        );
+        assert!(app.feedback_open);
+        assert_eq!(app.focus.focused, Some(FocusId::Textarea));
+        assert!(undecided(&rx));
+    }
+
+    #[test]
+    fn a_key_after_an_activation_in_one_batch_never_decides_or_activates() {
+        // The panel reopens with its text: Shift+Tab lands on Submit
+        // feedback, and the Enter after it waits for its own frame.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        app.feedback_text = "Shorter, please".to_string();
+        pass(&ctx, &mut app, 1.5, true, vec![tab()]);
+        pass_predicting_order(
+            &ctx,
+            &mut app,
+            2.6,
+            [tap(Key::Enter), vec![shift_tab()], tap(Key::Enter)].concat(),
+        );
+        assert!(app.feedback_open);
+        assert_eq!(app.focus.focused, Some(FocusId::SubmitFeedback));
+        assert!(undecided(&rx), "the Enter must not submit in the same batch");
+        pass(&ctx, &mut app, 2.7, true, tap(Key::Enter));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Ok(Decision::Feedback(text))) if text == "Shorter, please"
+        ));
+
+        // Closing the panel: Shift+Tab from Give feedback (now the first
+        // control) goes to the page, and the Enter after it does nothing.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        open_feedback(&ctx, &mut app, 1.1, "");
+        app.focus.focus(FocusId::GiveFeedback, true);
+        pass_predicting_order(
+            &ctx,
+            &mut app,
+            2.6,
+            [tap(Key::Enter), vec![shift_tab()], tap(Key::Enter)].concat(),
+        );
+        assert!(!app.feedback_open);
+        assert_eq!(app.focus.focused, None);
+        assert!(undecided(&rx), "the Enter must not approve in the same batch");
+
+        // Space released on Give feedback, then Escape: no deny.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        pass(&ctx, &mut app, 1.5, true, vec![tab()]);
+        pass(&ctx, &mut app, 2.6, true, vec![press(Key::Space)]);
+        pass(
+            &ctx,
+            &mut app,
+            3.7,
+            true,
+            [vec![release(Key::Space)], tap(Key::Escape)].concat(),
+        );
+        assert!(app.feedback_open);
+        assert!(undecided(&rx), "the Escape must not deny in the same batch");
+    }
+
+    /// The window center of a painted button.
+    fn button_center(ctx: &Context, id: FocusId) -> Pos2 {
+        ctx.read_response(button_id(id))
+            .expect("the button is painted")
+            .rect
+            .center()
+    }
+
+    /// A click at `pos` (pointer moved there, pressed, released).
+    fn click_at(pos: Pos2) -> Vec<Event> {
+        vec![Event::PointerMoved(pos), pointer(pos, true), pointer(pos, false)]
+    }
+
+    /// The feedback panel open with nothing focused, armed; returns where
+    /// the textarea is.
+    fn panel_open_nothing_focused(ctx: &Context, app: &mut ApprovalApp) -> Pos2 {
+        pass(ctx, app, 1.0, true, vec![]);
+        open_feedback(ctx, app, 1.1, "");
+        assert_eq!(app.focus.focused, None);
+        ctx.read_response(app.ta_id.with("click"))
+            .expect("the textarea is painted")
+            .rect
+            .center()
+    }
+
+    #[test]
+    fn a_click_in_the_textarea_then_enter_or_escape_in_one_batch_decides_nothing() {
+        for k in [Key::Enter, Key::Escape] {
+            let (mut app, rx) = app_with_request();
+            let ctx = Context::default();
+            let field = panel_open_nothing_focused(&ctx, &mut app);
+            pass(&ctx, &mut app, 2.6, true, [click_at(field), tap(k)].concat());
+            assert!(undecided(&rx), "{k:?} after a click in the field must not decide");
+            assert_eq!(app.queue.len(), 1);
+            assert_eq!(app.focus.focused, Some(FocusId::Textarea));
+            // In the next frame, Enter types a new line in the field.
+            pass(&ctx, &mut app, 2.7, true, tap(Key::Enter));
+            assert_eq!(app.feedback_text, "\n");
+            assert!(undecided(&rx));
+        }
+    }
+
+    #[test]
+    fn a_click_then_a_key_in_one_batch_decides_nothing() {
+        // A click on Give feedback, then Enter: the panel opens, nothing
+        // is approved.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        let give = button_center(&ctx, FocusId::GiveFeedback);
+        pass(&ctx, &mut app, 2.6, true, [click_at(give), tap(Key::Enter)].concat());
+        assert!(app.feedback_open);
+        assert!(undecided(&rx), "Enter after a click must not approve");
+        // The release of a press from the frame before, then Enter.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        let field = panel_open_nothing_focused(&ctx, &mut app);
+        pass(
+            &ctx,
+            &mut app,
+            2.5,
+            true,
+            vec![Event::PointerMoved(field), pointer(field, true)],
+        );
+        pass(
+            &ctx,
+            &mut app,
+            2.6,
+            true,
+            [vec![pointer(field, false)], tap(Key::Enter)].concat(),
+        );
+        assert!(undecided(&rx), "Enter after a click's release must not approve");
+        assert_eq!(app.focus.focused, Some(FocusId::Textarea));
+    }
+
+    // -----------------------------------------------------------------------
+    // Clicks on the decision buttons.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clicks_arm_after_the_front_card_and_the_window_appear() {
+        assert!(!click_armed(5.4, 5.0, Some(1.0)));
+        assert!(click_armed(5.0 + CLICK_ARM, 5.0, Some(1.0)));
+        assert!(!click_armed(5.4, 1.0, Some(5.0)));
+        assert!(click_armed(5.6, 1.0, Some(5.0)));
+        assert!(click_armed(5.6, 5.0, None));
+        assert!((0.3..=0.5).contains(&CLICK_ARM));
+    }
+
+    #[test]
+    fn a_click_aimed_at_a_withdrawn_card_never_decides_the_next() {
+        let (mut app, rx) = app_with_requests(&["a", "b"]);
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        let approve = button_center(&ctx, FocusId::Approve);
+        // A is withdrawn; B is painted in its place at t=2.0. The click
+        // aimed at A's Approve is pressed at 2.05.
+        assert!(app.state.withdraw("a"));
+        pass(&ctx, &mut app, 2.0, true, vec![]);
+        pass(
+            &ctx,
+            &mut app,
+            2.05,
+            true,
+            vec![Event::PointerMoved(approve), pointer(approve, true)],
+        );
+        pass(&ctx, &mut app, 2.1, true, vec![pointer(approve, false)]);
+        assert!(undecided(&rx[1]), "a click aimed at A must not approve B");
+        // A deliberate click on B approves it.
+        pass(&ctx, &mut app, 2.6, true, click_at(approve));
+        assert!(approved(&rx[1]));
+    }
+
+    #[test]
+    fn a_click_right_after_the_window_appears_never_decides() {
+        // Where Approve is (every card has the same layout).
+        let (mut probe, _rx) = app_with_request();
+        let probe_ctx = Context::default();
+        pass(&probe_ctx, &mut probe, 1.0, true, vec![]);
+        let approve = button_center(&probe_ctx, FocusId::Approve);
+
+        // The card arrives while another app has the focus, and the window
+        // pops up over it: a click 100 ms later (macOS delivers it to the
+        // inactive window) does nothing.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 5.0, false, vec![]);
+        pass(&ctx, &mut app, 5.1, false, click_at(approve));
+        assert!(undecided(&rx), "a click aimed at another app must not approve");
+        // Half a second on, a click on the (still inactive) window does.
+        pass(&ctx, &mut app, 5.6, false, click_at(approve));
+        assert!(approved(&rx));
+
+        // The window comes on screen long after the card became the front
+        // card (it was hidden): clicks arm from then.
+        let (mut app, rx) = app_with_request();
+        let ctx = Context::default();
+        pass(&ctx, &mut app, 1.0, true, vec![]);
+        let mut input = RawInput {
+            time: Some(4.0),
+            screen_rect: Some(screen()),
+            ..Default::default()
+        };
+        app.extract_keys(&ctx, &mut input, false, Vec::new);
+        run(&ctx, &mut app, input);
+        assert_eq!(app.on_screen_since, None);
+        pass(&ctx, &mut app, 5.0, true, vec![]);
+        pass(&ctx, &mut app, 5.1, true, click_at(approve));
+        assert!(undecided(&rx));
+        pass(&ctx, &mut app, 5.6, true, click_at(approve));
+        assert!(approved(&rx));
     }
 }

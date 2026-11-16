@@ -636,7 +636,24 @@ transport with typed Rust calls):
   in event order, so a Tab earlier in the same input batch moves the focus
   that later keys are judged against. A card that takes the front in a pass
   (a key decided the one before it) is tracked before anything can decide
-  it, and a click pressed no later than that pass is ignored.
+  it, and a click pressed no later than that pass is ignored. If the front
+  card is withdrawn while one of its controls has the focus (the textarea,
+  or a button focused with Tab or a click), the focus is orphaned: nothing
+  decides and no button activates (`shortcuts::while_orphaned`) until
+  Tab/Shift+Tab, a primary press in the window, or a fresh plain Escape
+  (which does only that). This outlives a window focus loss and ends when
+  the queue empties; a decision by the user never orphans the focus. In one
+  input batch, every Enter/Escape/Space press after a queued decision or
+  button activation, or after a primary pointer press or release, is judged
+  as not armed (it can still type in or leave the textarea); Enter or Space
+  on Give feedback updates the tab order at once for the controls the panel
+  adds or removes, so a later Tab in the batch follows the order the next
+  paint builds.
+- Clicks on Approve, Deny and Submit feedback decide only when pressed
+  `CLICK_ARM` (0.5 s) after the latest of: the request became the front
+  card, and the window came on screen, focused or not
+  (`shortcuts::click_armed`). A click aimed at a card that was just
+  withdrawn, or at the app the window appeared over, decides nothing.
 - Closing the window only **hides** it (egui `CloseRequested` → hide); the
   gateway process keeps serving MCP for every agent. Quitting happens only
   via **Quit SpeakEasy** in the tray menu or the app menu (⌘Q)
@@ -656,7 +673,7 @@ transport with typed Rust calls):
 |---|---|
 | `app.rs` | eframe app: window lifecycle (720×780 default, min 520×560, centered, initially hidden), tray menu, keyboard/focus model, decision dispatch, reduced-motion handling |
 | `app/paint.rs` | frame layout + painting (fixed header / scrolling main / fixed footer), scrollbar |
-| `app/shortcuts.rs` | the keyboard decision gate (Enter/Escape shortcuts, Enter/Space on a focused button): arming delay, typing re-arm, key-repeat and pre-arm presses, focused textarea/buttons |
+| `app/shortcuts.rs` | the keyboard decision gate (Enter/Escape shortcuts, Enter/Space on a focused button): arming delay, typing re-arm, key-repeat and pre-arm presses, focused textarea/buttons, orphaned focus; the click arming delay |
 | `components.rs` | Once UI-style controls: `Tag`, `Button`, `Textarea`, section labels, selectable text |
 | `theme.rs` | light/dark palettes + responsive metrics (rem root 15px ≤768px viewport, else 16px) |
 | `text.rs` | SF Pro / SF Mono installation + CSS-exact `TextSpec`s (size, weight, line-height, letter-spacing) |

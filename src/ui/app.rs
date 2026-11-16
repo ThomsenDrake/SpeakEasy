@@ -189,8 +189,9 @@ pub struct ApprovalApp {
     focus: FocusTracker,
     current_id: Option<String>,
     /// Input time when the current request became the front card. A click
-    /// whose press started earlier was aimed at a previous card (one that
-    /// was withdrawn under the pointer) and is ignored.
+    /// whose press started earlier, or less than `shortcuts::CLICK_ARM`
+    /// later, was aimed at a previous card (one that was withdrawn under
+    /// the pointer) and is ignored.
     front_since: f64,
     /// Input time of the latest primary pointer press.
     pressed_at: f64,
@@ -204,6 +205,18 @@ pub struct ApprovalApp {
     /// Input time of the latest text input or key press other than
     /// Enter/Escape/Tab: typing re-arms the keys (see `shortcuts`).
     last_typed_at: f64,
+    /// Input time since when the window has been on screen (`None`:
+    /// hidden, minimized or fully covered). With `front_since`, it arms
+    /// clicks on the decision buttons (`shortcuts::click_armed`).
+    on_screen_since: Option<f64>,
+    /// The front card was withdrawn while one of its controls (the
+    /// feedback textarea, or a button focused with Tab or a click) had the
+    /// focus. The keys the user is pressing were meant for that control, so
+    /// Enter and Escape decide nothing, and no button activates, until the
+    /// user re-establishes the focus: Tab/Shift+Tab, a click in the window,
+    /// or a plain Escape (which only clears this, as it would only have left
+    /// the field). See `shortcuts::while_orphaned`.
+    orphaned_focus: bool,
     ta_id: Id,
 
     // Animation clock. The clock only advances while the window is actually
@@ -290,6 +303,8 @@ impl ApprovalApp {
             focused_since: None,
             held_keys: HeldKeys::default(),
             last_typed_at: f64::NEG_INFINITY,
+            on_screen_since: None,
+            orphaned_focus: false,
             ta_id: Id::unique("feedback"),
             clock: Instant::now(),
             frozen_now: 0.0,
@@ -417,6 +432,18 @@ impl ApprovalApp {
         let withdrawn = self.state.drain_withdrawn();
         if !withdrawn.is_empty() {
             self.queue.retain(|r| !withdrawn.contains(&r.id));
+            // The front card left under a focused control (`track_current`
+            // resets the focus for the next card): what Enter and Escape
+            // would now do is not what the user is pressing them for. Only
+            // a withdrawal does this; a decision by the user advances the
+            // queue without it.
+            let front_withdrawn = self
+                .current_id
+                .as_ref()
+                .is_some_and(|id| withdrawn.contains(id));
+            if front_withdrawn && self.focus.focused.is_some() && !self.queue.is_empty() {
+                self.orphaned_focus = true;
+            }
             // (The reveal hook shows the window without going through
             // `reveal`, so `window_visible` cannot tell whether it is up.)
             if self.queue.is_empty() {
@@ -447,6 +474,9 @@ impl ApprovalApp {
         self.focus = FocusTracker::default();
         if let Some(req) = self.queue.front() {
             self.ta_id = Id::unique("feedback").with(&req.id);
+        } else {
+            // No card is left for an orphaned key to decide.
+            self.orphaned_focus = false;
         }
         // The card height may have changed: clamp (never reset) the scroll.
         self.scroll_offset = self.scroll_offset.clamp(0.0, self.max_scroll);
@@ -545,6 +575,16 @@ impl ApprovalApp {
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// A click on Approve, Deny or Submit feedback: decide, unless the press
+    /// came too soon after the card became the front card or the window came
+    /// on screen to be aimed at this card (`shortcuts::click_armed`).
+    pub(crate) fn decide_click(&mut self, ctx: &Context, decision: Decision) {
+        if !shortcuts::click_armed(self.pressed_at, self.front_since, self.on_screen_since) {
+            return;
+        }
+        self.decide(ctx, decision);
     }
 
     /// Drive the pending-count badge from the queue length. The reference
@@ -1063,6 +1103,15 @@ impl ApprovalApp {
     /// `handle_keys`. Text input and key presses other than
     /// Enter/Escape/Tab re-arm the keys.
     ///
+    /// Some effects exist only after the logic and paint passes: a queued
+    /// decision or button activation, and a click (it moves the focus in
+    /// the paint pass). Once the batch has one, every later Enter, Escape
+    /// and Space press in the batch is judged as not armed: it can still
+    /// type in (or leave) the textarea it lands on, but it decides and
+    /// activates nothing. Tab still moves the focus; when Give feedback is
+    /// activated, the tab order is updated at once for the controls the
+    /// panel adds or removes (`queue_activate`).
+    ///
     /// `on_screen`: the window is actually shown. `keys_down`: the keys the
     /// OS reports down (`sys::shortcut_keys_down`), read when the window gets
     /// the focus.
@@ -1074,6 +1123,13 @@ impl ApprovalApp {
         keys_down: impl FnOnce() -> Vec<Key>,
     ) {
         let now = raw_input.time.unwrap_or_else(|| ctx.input(|i| i.time));
+        // Clicks arm from when the window came on screen (focused or not:
+        // macOS delivers the first click to an inactive window).
+        if !on_screen {
+            self.on_screen_since = None;
+        } else if self.on_screen_since.is_none() {
+            self.on_screen_since = Some(now);
+        }
         // The keys arm from when the window (on screen) got the focus.
         // Key-ups after a focus loss go to the other app, so held keys are
         // forgotten then (egui does the same with its own key state), and no
@@ -1112,9 +1168,13 @@ impl ApprovalApp {
             let keyboard = self.focus.keyboard;
             self.focus.focus(FocusId::Textarea, keyboard);
         }
+        // Set once an earlier event in this batch has an effect that only
+        // the logic or paint pass applies (see above).
+        let mut unsettled = false;
         let mut i = 0;
         while i < raw_input.events.len() {
-            if self.read_key_event(ctx, &raw_input.events[i], now, front.as_deref()) {
+            let event = &raw_input.events[i];
+            if self.read_key_event(ctx, event, now, front.as_deref(), &mut unsettled) {
                 raw_input.events.remove(i);
             } else {
                 i += 1;
@@ -1123,14 +1183,16 @@ impl ApprovalApp {
     }
 
     /// Read one raw input event (see `extract_keys`); `front`: the tracked
-    /// front card. Returns true when the app takes the event (egui never
-    /// sees it).
+    /// front card; `unsettled`: an earlier event in the batch has an effect
+    /// not applied yet (later keys are not armed). Returns true when the app
+    /// takes the event (egui never sees it).
     fn read_key_event(
         &mut self,
         ctx: &Context,
         event: &Event,
         now: f64,
         front: Option<&str>,
+        unsettled: &mut bool,
     ) -> bool {
         let &Event::Key {
             key,
@@ -1140,8 +1202,23 @@ impl ApprovalApp {
             ..
         } = event
         else {
-            if matches!(event, Event::Text(_) | Event::Ime(_) | Event::Paste(_)) {
-                self.last_typed_at = now;
+            match event {
+                Event::Text(_) | Event::Ime(_) | Event::Paste(_) => self.last_typed_at = now,
+                // A click (its press, or the release that completes it)
+                // moves the focus only in the paint pass. A press in the
+                // window also re-establishes the focus after an orphaning
+                // withdrawal.
+                Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    ..
+                } => {
+                    *unsettled = true;
+                    if *pressed {
+                        self.orphaned_focus = false;
+                    }
+                }
+                _ => {}
             }
             return false;
         };
@@ -1152,6 +1229,7 @@ impl ApprovalApp {
                 if !(pressed && (!modifiers.any() || modifiers.shift_only())) {
                     return false;
                 }
+                self.orphaned_focus = false;
                 self.focus.move_focus(!modifiers.shift);
                 self.sync_egui_focus(ctx);
                 ctx.request_repaint();
@@ -1166,23 +1244,26 @@ impl ApprovalApp {
                 // focused) activates it.
                 let down_on = self.focus.space_down.take();
                 if let (Some(button), Some(request)) = (down_on, front) {
-                    if focused == Some(button) {
-                        let request = request.to_owned();
-                        self.pending_keys
-                            .push(PendingKey::Activate { button, request });
+                    if focused == Some(button) && !*unsettled {
+                        self.queue_activate(button, request.to_owned());
+                        *unsettled = true;
                     }
                 }
                 true
             }
             Key::Enter | Key::Escape | Key::Space => {
                 let (held, down_at) = self.held_keys.press(key, now);
-                let armed_at = shortcuts::armed_at(
-                    front.map(|_| self.front_since),
-                    self.focused_since,
-                    self.last_typed_at,
-                    self.deciding,
-                );
-                let action = shortcuts::key_action(
+                let armed_at = if *unsettled {
+                    None
+                } else {
+                    shortcuts::armed_at(
+                        front.map(|_| self.front_since),
+                        self.focused_since,
+                        self.last_typed_at,
+                        self.deciding,
+                    )
+                };
+                let mut action = shortcuts::key_action(
                     key,
                     modifiers,
                     repeat || held,
@@ -1190,37 +1271,49 @@ impl ApprovalApp {
                     armed_at,
                     focused,
                 );
+                if self.orphaned_focus {
+                    action = shortcuts::while_orphaned(action);
+                    // A fresh plain Escape does what it would have done in
+                    // the field that vanished: it leaves it, nothing more.
+                    if key == Key::Escape && !modifiers.any() && !(repeat || held) {
+                        self.orphaned_focus = false;
+                    }
+                }
                 if key == Key::Space {
                     // Space is typing too (once the press itself is judged).
                     self.last_typed_at = now;
                 }
                 let request = front.map(str::to_owned);
-                let pending = match action {
+                match action {
                     KeyAction::PassThrough => return self.read_scroll_key(key, modifiers),
-                    KeyAction::Swallow => None,
+                    KeyAction::Swallow => {}
                     KeyAction::BlurTextarea => {
                         self.focus.blur();
                         self.sync_egui_focus(ctx);
                         ctx.request_repaint();
-                        None
                     }
-                    KeyAction::Approve => request.map(|request| PendingKey::Decide {
-                        decision: Decision::Approve,
-                        request,
-                    }),
-                    KeyAction::Deny => request.map(|request| PendingKey::Decide {
-                        decision: Decision::Deny,
-                        request,
-                    }),
+                    KeyAction::Approve | KeyAction::Deny => {
+                        if let Some(request) = request {
+                            let decision = if action == KeyAction::Approve {
+                                Decision::Approve
+                            } else {
+                                Decision::Deny
+                            };
+                            self.pending_keys
+                                .push(PendingKey::Decide { decision, request });
+                            *unsettled = true;
+                        }
+                    }
                     KeyAction::Activate(button) => {
-                        request.map(|request| PendingKey::Activate { button, request })
+                        if let Some(request) = request {
+                            self.queue_activate(button, request);
+                            *unsettled = true;
+                        }
                     }
                     KeyAction::PressButton(button) => {
                         self.focus.space_down = Some(button);
-                        None
                     }
-                };
-                self.pending_keys.extend(pending);
+                }
                 true
             }
             _ if pressed => {
@@ -1229,6 +1322,31 @@ impl ApprovalApp {
             }
             _ => false,
         }
+    }
+
+    /// Queue a keyboard activation of `button` on `request` (applied in
+    /// `handle_keys`). Give feedback toggles the panel, which adds (or
+    /// removes) the feedback textarea and an enabled Submit feedback before
+    /// it in the tab order. The paint pass rebuilds the order only after
+    /// this batch, so make the same change now: a later Tab or Shift+Tab in
+    /// the batch then moves through the controls that will be there.
+    fn queue_activate(&mut self, button: FocusId, request: String) {
+        if button == FocusId::GiveFeedback && !self.deciding {
+            let order = &mut self.focus.order;
+            order.retain(|&f| f != FocusId::Textarea && f != FocusId::SubmitFeedback);
+            if !self.feedback_open {
+                let at = order
+                    .iter()
+                    .position(|&f| f == FocusId::GiveFeedback)
+                    .unwrap_or(0);
+                let mut panel = vec![FocusId::Textarea];
+                if !self.feedback_text.trim().is_empty() {
+                    panel.push(FocusId::SubmitFeedback);
+                }
+                order.splice(at..at, panel);
+            }
+        }
+        self.pending_keys.push(PendingKey::Activate { button, request });
     }
 
     /// Queue a scroll key: arrows, Home/End, PageUp/PageDown, and Space

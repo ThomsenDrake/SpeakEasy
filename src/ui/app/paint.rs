@@ -484,9 +484,11 @@ impl ApprovalApp {
         // ---- Events -------------------------------------------------------
         for ev in events.drain(..) {
             match ev {
-                AppEvent::Approve => self.decide(&ctx, Decision::Approve),
-                AppEvent::Deny => self.decide(&ctx, Decision::Deny),
-                AppEvent::SubmitFeedback(text) => self.decide(&ctx, Decision::Feedback(text)),
+                AppEvent::Approve => self.decide_click(&ctx, Decision::Approve),
+                AppEvent::Deny => self.decide_click(&ctx, Decision::Deny),
+                AppEvent::SubmitFeedback(text) => {
+                    self.decide_click(&ctx, Decision::Feedback(text))
+                }
                 AppEvent::ToggleFeedback => {
                     self.feedback_open = !self.feedback_open;
                     ctx.request_repaint();
